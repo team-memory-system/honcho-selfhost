@@ -1,0 +1,11 @@
+{
+  "name": "honcho-codex-openai-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.70.2"
+  }
+}

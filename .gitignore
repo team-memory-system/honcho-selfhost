@@ -179,6 +179,11 @@ cython_debug/
 supabase/
 
 docs/node_modules
+node_modules/
+
+# Local self-host companion apps: keep source and lockfiles, never vendored deps.
+codex-openai-proxy/node_modules/
+local-dashboard/node_modules/
 
 timing_logs.csv
 

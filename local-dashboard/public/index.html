@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Honcho Local</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+          <div><strong>HONCHO</strong><small>LOCAL MEMORY</small></div>
+        </div>
+
+        <label class="workspace-picker">
+          <span>WORKSPACE</span>
+          <select id="workspace-select"><option value="">불러오는 중…</option></select>
+        </label>
+
+        <nav id="nav">
+          <button class="nav-item active" data-view="overview"><i>⌂</i><span>개요</span></button>
+          <button class="nav-item" data-view="peers"><i>◎</i><span>Peers</span><b id="peer-count">—</b></button>
+          <button class="nav-item" data-view="sessions"><i>≋</i><span>세션</span><b id="session-count">—</b></button>
+          <button class="nav-item" data-view="memory"><i>◇</i><span>기억 탐색</span></button>
+          <button class="nav-item" data-view="dialectic"><i>✦</i><span>Dialectic</span></button>
+          <button class="nav-item" data-view="mcp"><i>⚙</i><span>MCP 도구</span><b id="mcp-nav-count">—</b></button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="connection"><span id="connection-dot"></span><div><strong id="connection-label">확인 중</strong><small id="connection-url">—</small></div></div>
+        </div>
+      </aside>
+
+      <main>
+        <header class="topbar">
+          <div><p class="eyebrow" id="page-eyebrow">WORKSPACE OVERVIEW</p><h1 id="page-title">기억의 현재 상태</h1></div>
+          <div class="top-actions"><span id="last-updated">—</span><button id="refresh-button" class="icon-button" title="새로고침">↻</button></div>
+        </header>
+
+        <div id="flash" role="status"></div>
+
+        <section id="view-overview" class="view active">
+          <div class="metric-grid">
+            <article class="metric accent"><span>PEERS</span><strong id="metric-peers">—</strong><small>기억 속 주체</small></article>
+            <article class="metric"><span>SESSIONS</span><strong id="metric-sessions">—</strong><small>대화 묶음</small></article>
+            <article class="metric"><span>CONCLUSIONS</span><strong id="metric-conclusions">—</strong><small>추출된 사실과 추론</small></article>
+            <article class="metric"><span>QUEUE</span><strong id="metric-queue">—</strong><small id="metric-queue-detail">처리 상태</small></article>
+          </div>
+          <div class="overview-grid">
+            <article class="panel queue-panel">
+              <div class="panel-head"><div><p class="eyebrow">PROCESSING</p><h2>Deriver Queue</h2></div><span class="status-pill" id="queue-state">—</span></div>
+              <div class="queue-visual"><div class="ring" id="queue-ring"><div><strong id="queue-progress">—</strong><small>완료</small></div></div><div class="queue-legend"><p><span class="dot done"></span>완료 <b id="queue-completed">—</b></p><p><span class="dot working"></span>처리 중 <b id="queue-progressing">—</b></p><p><span class="dot pending"></span>대기 <b id="queue-pending">—</b></p></div></div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><div><p class="eyebrow">RECENT ACTIVITY</p><h2>최근 세션</h2></div><button class="text-button" data-go="sessions">전체 보기 →</button></div>
+              <div id="recent-sessions" class="stack-list skeleton-list"></div>
+            </article>
+            <article class="panel wide">
+              <div class="panel-head"><div><p class="eyebrow">MEMORY SIGNALS</p><h2>최근 결론</h2></div><button class="text-button" data-go="memory">기억 탐색 →</button></div>
+              <div id="recent-conclusions" class="conclusion-grid skeleton-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-peers" class="view">
+          <div class="split-view">
+            <article class="panel list-pane">
+              <div class="panel-head"><div><p class="eyebrow">ENTITIES</p><h2>Peers</h2></div><button class="primary small" data-dialog="peer">+ Peer</button></div>
+              <input id="peer-filter" class="search-input" placeholder="Peer 검색" />
+              <div id="peer-list" class="entity-list"></div>
+            </article>
+            <article class="panel detail-pane" id="peer-detail"><div class="empty-state"><span>◎</span><h2>Peer를 선택하세요</h2><p>카드와 표현, 기억의 관점을 한곳에서 확인합니다.</p></div></article>
+          </div>
+        </section>
+
+        <section id="view-sessions" class="view">
+          <div class="split-view sessions-split">
+            <article class="panel list-pane">
+              <div class="panel-head"><div><p class="eyebrow">TIMELINE</p><h2>Sessions</h2></div><button class="primary small" data-dialog="session">+ Session</button></div>
+              <input id="session-filter" class="search-input" placeholder="세션 검색" />
+              <div id="session-list" class="entity-list"></div>
+            </article>
+            <article class="panel detail-pane" id="session-detail"><div class="empty-state"><span>≋</span><h2>세션을 선택하세요</h2><p>메시지 흐름과 참여 Peer를 확인할 수 있습니다.</p></div></article>
+          </div>
+        </section>
+
+        <section id="view-memory" class="view">
+          <article class="search-hero">
+            <p class="eyebrow">HYBRID SEARCH</p><h2>기억에서 근거를 찾기</h2>
+            <form id="memory-search-form"><input id="memory-query" placeholder="메시지 전체에서 검색…" autocomplete="off" /><button class="primary">검색</button></form>
+          </article>
+          <div class="memory-grid">
+            <article class="panel"><div class="panel-head"><div><p class="eyebrow">RESULTS</p><h2>검색 결과</h2></div><span id="search-result-count" class="muted">질문을 입력하세요</span></div><div id="search-results" class="result-list"><div class="empty-inline">검색어와 가까운 실제 메시지를 보여줍니다.</div></div></article>
+            <article class="panel"><div class="panel-head"><div><p class="eyebrow">DERIVED MEMORY</p><h2>Conclusions</h2></div><span id="conclusion-total" class="muted">—</span></div><div id="conclusion-list" class="result-list"></div></article>
+          </div>
+        </section>
+
+        <section id="view-dialectic" class="view">
+          <div class="dialectic-layout">
+            <article class="dialectic-intro"><p class="eyebrow">HONCHO ↔ YOU</p><h2>기억에게 질문하세요.</h2><p>검색 결과를 나열하는 대신, Honcho가 축적한 표현과 결론을 탐색해 하나의 답을 만듭니다.</p><div class="prompt-chips"><button>최근 내가 중요하게 여기는 것은?</button><button>반복해서 나타나는 고민은?</button><button>내 의사결정 방식을 설명해줘</button></div></article>
+            <article class="panel chat-panel">
+              <div class="chat-toolbar"><label>MODE<select id="chat-mode"><option value="single">단일 Peer</option><option value="integrated">Peer 통합</option></select></label><label class="single-control">PEER<select id="chat-peer"></select></label><label class="integrated-control" hidden>FOCUS<select id="chat-focus"></select></label><label>REASONING<select id="reasoning-level"><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>max</option></select></label><label>SESSION<select id="chat-session"><option value="">전체 기억</option></select></label><button id="clear-chat" class="quiet-button">대화 지우기</button></div>
+              <div id="integrated-settings" class="integrated-settings" hidden><div><p class="eyebrow">OBSERVER PEERS</p><small>각 Peer가 Focus를 어떻게 이해하는지 묻고, Focus가 답을 하나로 종합합니다.</small></div><div id="observer-peers" class="observer-peers"></div><span id="observer-limit">선택 제한 없음</span></div>
+              <div id="chat-log" class="chat-log"><div class="chat-welcome"><span>✦</span><p>Dialectic은 선택한 Peer의 기억을 바탕으로 답합니다.</p></div></div>
+              <form id="chat-form" class="chat-compose"><textarea id="chat-query" rows="1" placeholder="Honcho에게 질문…"></textarea><button class="primary" aria-label="전송">↑</button></form>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-mcp" class="view">
+          <article class="mcp-hero">
+            <div><p class="eyebrow">TOOL ACCESS CONTROL</p><h2>에이전트에게 필요한 기억 도구만 허용하세요.</h2><p>OFF한 도구는 MCP의 도구 목록에서 완전히 사라집니다. 변경 시 Bridge만 잠깐 재연결되고 Honcho API와 외부 tunnel은 유지됩니다.</p></div>
+            <div class="mcp-hero-status"><strong id="mcp-tool-count">—</strong><small>도구 활성화</small><span id="mcp-bridge-label">Bridge 확인 중</span></div>
+          </article>
+          <div id="mcp-tool-list" class="mcp-tool-groups"><div class="empty-inline">도구 목록을 확인하는 중…</div></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="create-dialog"><form id="create-form" class="dialog-card"><div class="dialog-head"><div><p class="eyebrow" id="create-eyebrow">CREATE</p><h2 id="create-title">새 항목</h2></div><button type="button" data-close-dialog class="icon-button">×</button></div><div id="create-fields"></div><div class="dialog-actions"><button type="button" data-close-dialog class="quiet-button">취소</button><button class="primary">만들기</button></div></form></dialog>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
