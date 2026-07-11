@@ -180,7 +180,7 @@ class DialecticAgent:
                 run_id=self._run_id,
                 parent_category="dialectic",
             ):
-                query_embedding = await embedding_client.embed(query)
+                query_embedding = await embedding_client.embed_query(query)
 
             # search_memory manages its own short-lived DB sessions so no
             # connection is held during external vector-store calls.

@@ -607,9 +607,25 @@ class EmbeddingClient:
         """Embed a single query string."""
         return await self._get_client().embed(query)
 
+    @staticmethod
+    def _prepare_query(query: str) -> str:
+        instruction = settings.EMBEDDING.QUERY_INSTRUCTION
+        if not instruction:
+            return query
+        return f"Instruct: {instruction.strip()}\nQuery: {query}"
+
+    async def embed_query(self, query: str) -> list[float]:
+        """Embed a retrieval query, applying the configured instruction."""
+        return await self.embed(self._prepare_query(query))
+
     async def simple_batch_embed(self, texts: list[str]) -> list[list[float]]:
         """Batch embed a list of text strings (each must fit token limit)."""
         return await self._get_client().simple_batch_embed(texts)
+
+    async def simple_batch_embed_queries(self, queries: list[str]) -> list[list[float]]:
+        """Batch embed retrieval queries with the configured instruction."""
+        prepared = [self._prepare_query(query) for query in queries]
+        return await self.simple_batch_embed(prepared)
 
     def prepare_chunks(self, id_resource_dict: dict[str, str]) -> dict[str, list[str]]:
         """Chunk texts using the same rules as `batch_embed` (no network)."""

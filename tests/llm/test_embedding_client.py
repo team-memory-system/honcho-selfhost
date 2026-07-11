@@ -3,8 +3,11 @@ from typing import Any
 
 import pytest
 
-from src.config import EmbeddingModelConfig
-from src.embedding_client import _EmbeddingClient  # pyright: ignore[reportPrivateUsage]
+from src.config import EmbeddingModelConfig, settings
+from src.embedding_client import (  # pyright: ignore[reportPrivateUsage]
+    EmbeddingClient,
+    _EmbeddingClient,
+)
 
 
 class FakeOpenAIEmbeddingsAPI:
@@ -27,6 +30,52 @@ class FakeOpenAIEmbeddingsAPI:
         else:
             data = [SimpleNamespace(embedding=self.embedding)]
         return SimpleNamespace(data=data)
+
+
+@pytest.mark.asyncio
+async def test_embed_query_applies_configured_retrieval_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+
+    async def fake_embed(_self: EmbeddingClient, text: str) -> list[float]:
+        captured.append(text)
+        return [0.1, 0.2]
+
+    monkeypatch.setattr(
+        settings.EMBEDDING,
+        "QUERY_INSTRUCTION",
+        "retrieve relevant personal memories",
+    )
+    monkeypatch.setattr(EmbeddingClient, "embed", fake_embed)
+
+    result = await EmbeddingClient().embed_query("coffee preferences")
+
+    assert result == [0.1, 0.2]
+    assert captured == [
+        "Instruct: retrieve relevant personal memories\nQuery: coffee preferences"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_query_embedding_leaves_documents_unmodified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str]] = []
+
+    async def fake_batch(_self: EmbeddingClient, texts: list[str]) -> list[list[float]]:
+        captured.append(texts)
+        return [[0.1], [0.2]]
+
+    monkeypatch.setattr(settings.EMBEDDING, "QUERY_INSTRUCTION", "find memories")
+    monkeypatch.setattr(EmbeddingClient, "simple_batch_embed", fake_batch)
+
+    result = await EmbeddingClient().simple_batch_embed_queries(["one", "two"])
+
+    assert result == [[0.1], [0.2]]
+    assert captured == [
+        ["Instruct: find memories\nQuery: one", "Instruct: find memories\nQuery: two"]
+    ]
 
 
 @pytest.mark.asyncio

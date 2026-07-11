@@ -1225,7 +1225,9 @@ async def extract_preferences(
     # If batching fails, each search call will generate its own embedding.
     query_embeddings_by_query: dict[str, list[float]] | None = None
     try:
-        query_embeddings = await embedding_client.simple_batch_embed(semantic_queries)
+        query_embeddings = await embedding_client.simple_batch_embed_queries(
+            semantic_queries
+        )
         query_embeddings_by_query = dict(
             zip(semantic_queries, query_embeddings, strict=True)
         )
@@ -1668,7 +1670,7 @@ async def _handle_search_memory(
             run_id=ctx.run_id,
             parent_category=ctx.parent_category,
         ):
-            query_embedding = await embedding_client.embed(query)
+            query_embedding = await embedding_client.embed_query(query)
     except ValueError:
         return (
             "ERROR: Query exceeds maximum token limit of "
@@ -1787,7 +1789,7 @@ async def _handle_search_messages(
         run_id=ctx.run_id,
         parent_category=ctx.parent_category,
     ):
-        query_embedding = await embedding_client.embed(query)
+        query_embedding = await embedding_client.embed_query(query)
     snippets = await crud.search_messages(
         workspace_name=ctx.workspace_name,
         session_name=ctx.session_name,
@@ -1959,7 +1961,7 @@ async def _handle_search_messages_temporal(
         run_id=ctx.run_id,
         parent_category=ctx.parent_category,
     ):
-        query_embedding = await embedding_client.embed(query)
+        query_embedding = await embedding_client.embed_query(query)
     snippets = await crud.search_messages_temporal(
         workspace_name=ctx.workspace_name,
         session_name=ctx.session_name,

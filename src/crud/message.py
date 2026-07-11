@@ -790,7 +790,7 @@ async def search_messages(
             EmbeddingCallPurpose.SEARCH_MESSAGES.value,
             workspace_name=workspace_name,
         ):
-            query_embedding = await embedding_client.embed(query)
+            query_embedding = await embedding_client.embed_query(query)
     return await _semantic_search_messages(
         workspace_name,
         session_name,
@@ -990,7 +990,7 @@ async def search_messages_temporal(
             EmbeddingCallPurpose.SEARCH_MESSAGES.value,
             workspace_name=workspace_name,
         ):
-            query_embedding = await embedding_client.embed(query)
+            query_embedding = await embedding_client.embed_query(query)
     return await _semantic_search_messages(
         workspace_name,
         session_name,
