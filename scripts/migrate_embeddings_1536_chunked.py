@@ -121,14 +121,31 @@ def _fetch_messages(
 def _prepare_message_chunks(
     messages: list[SourceMessage],
 ) -> list[tuple[SourceMessage, int, str]]:
-    chunks_by_id = embedding_client.prepare_chunks(
-        {message.message_id: message.content for message in messages}
-    )
-    return [
-        (message, chunk_index, chunk)
-        for message in messages
-        for chunk_index, chunk in enumerate(chunks_by_id[message.message_id])
-    ]
+    prepared: list[tuple[SourceMessage, int, str]] = []
+    for message in messages:
+        # Honcho chunks token IDs and decodes them back to text. At a multibyte
+        # boundary, re-encoding that decoded text can very rarely add one token
+        # (for example 2048 -> 2049). Feed every result back through Honcho's
+        # own chunker until it considers the text stable; do not maintain a
+        # separate migration-specific chunking algorithm.
+        pending = [message.content]
+        stable_chunks: list[str] = []
+        while pending:
+            candidate = pending.pop(0)
+            chunks = embedding_client.prepare_chunks({"chunk": candidate})["chunk"]
+            if len(chunks) == 1 and chunks[0] == candidate:
+                stable_chunks.append(candidate)
+            else:
+                pending[0:0] = chunks
+            if len(stable_chunks) + len(pending) > 1000:
+                raise RuntimeError(
+                    f"Chunk stabilization exceeded safety limit for {message.message_id}"
+                )
+        prepared.extend(
+            (message, chunk_index, chunk)
+            for chunk_index, chunk in enumerate(stable_chunks)
+        )
+    return prepared
 
 
 async def _embed(texts: list[str]) -> list[list[float]]:
