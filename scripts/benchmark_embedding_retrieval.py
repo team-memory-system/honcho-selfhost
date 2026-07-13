@@ -29,8 +29,8 @@ QUERY_INSTRUCTION = (
     "Given a personal memory search query, retrieve relevant conversation "
     "passages that answer or contextualize the query"
 )
-SEARCH_LIMIT = 400
-SCORED_RANK_LIMIT = 50
+DEFAULT_EF_SEARCH = 40
+SCORED_RANK_LIMIT = 10
 
 
 @dataclass(frozen=True)
@@ -170,6 +170,7 @@ def retrieve_rank(
     vector: np.ndarray[Any, np.dtype[np.float32]],
     pair: Pair,
     overlap_ids: set[str],
+    search_limit: int,
 ) -> tuple[int | None, float]:
     if table not in {
         "message_embeddings",
@@ -187,7 +188,7 @@ def retrieve_rank(
         LIMIT %s
         """
         ).format(sql.Identifier(table)),
-        (vector, pair.query_id, vector, SEARCH_LIMIT),
+        (vector, pair.query_id, vector, search_limit),
     )
     rows = cursor.fetchall()
     elapsed = time.perf_counter() - started
@@ -212,7 +213,7 @@ def summarize(result: ArmResult) -> dict[str, float | int | str]:
     summary: dict[str, float | int | str] = {
         "name": result.name,
         "queries": count,
-        "mrr_at_50": statistics.fmean(reciprocal_ranks),
+        "mrr_at_10": statistics.fmean(reciprocal_ranks),
         "ndcg_at_10": statistics.fmean(
             0.0 if rank is None or rank > 10 else 1.0 / math.log2(rank + 1)
             for rank in result.ranks
@@ -223,7 +224,7 @@ def summarize(result: ArmResult) -> dict[str, float | int | str]:
         "search_p95_ms": 1000
         * sorted(result.search_seconds)[max(0, math.ceil(0.95 * count) - 1)],
     }
-    for cutoff in (1, 5, 10, 50):
+    for cutoff in (1, 5, 10):
         summary[f"recall_at_{cutoff}"] = (
             sum(rank is not None and rank <= cutoff for rank in result.ranks) / count
         )
@@ -293,10 +294,18 @@ def paired_comparison(
     }
 
 
-def run(sample_size: int, output: Path | None) -> dict[str, Any]:
+def run(
+    sample_size: int,
+    output: Path | None,
+    ef_search: int,
+) -> dict[str, Any]:
+    search_limit = max(ef_search, SCORED_RANK_LIMIT)
     with connect() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SET hnsw.ef_search = 400")
+            cursor.execute(
+                "SELECT set_config('hnsw.ef_search', %s, false)",
+                (str(ef_search),),
+            )
             pairs = fetch_pairs(cursor, sample_size)
             overlap_ids = fetch_overlap_ids(cursor)
 
@@ -350,6 +359,7 @@ def run(sample_size: int, output: Path | None) -> dict[str, Any]:
                         vectors[pair_index],
                         pair,
                         overlap_ids,
+                        search_limit,
                     )
                     result.ranks.append(rank)
                     result.search_seconds.append(elapsed)
@@ -364,7 +374,8 @@ def run(sample_size: int, output: Path | None) -> dict[str, Any]:
             "pair_definition": "real user message -> immediate assistant reply",
             "query_message_excluded": True,
             "candidate_universe": "message IDs present in both stores",
-            "hnsw_ef_search": 400,
+            "hnsw_ef_search": ef_search,
+            "search_limit": search_limit,
             "scored_rank_limit": SCORED_RANK_LIMIT,
             "query_instruction": QUERY_INSTRUCTION,
         },
@@ -389,11 +400,14 @@ def run(sample_size: int, output: Path | None) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample-size", type=int, default=200)
+    parser.add_argument("--ef-search", type=int, default=DEFAULT_EF_SEARCH)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if not 20 <= args.sample_size <= 1000:
         raise SystemExit("--sample-size must be between 20 and 1000")
-    report = run(args.sample_size, args.output)
+    if not 10 <= args.ef_search <= 1000:
+        raise SystemExit("--ef-search must be between 10 and 1000")
+    report = run(args.sample_size, args.output, args.ef_search)
     print(
         json.dumps(
             {
