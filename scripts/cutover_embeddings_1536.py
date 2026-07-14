@@ -21,6 +21,7 @@ from psycopg import sql
 REHEARSAL_SCHEMA: Final = "embedding_cutover_rehearsal"
 SHADOW_TABLE: Final = "message_embeddings_v1536_shadow"
 BACKUP_TABLE: Final = "message_embeddings_v768_backup"
+STATE_TABLE: Final = "embedding_cutover_1536_state"
 
 
 @dataclass(frozen=True)
@@ -355,6 +356,24 @@ def cutover(
                 qname(schema, "documents"),
             )
         )
+        cursor.execute(
+            sql.SQL(
+                "CREATE TABLE IF NOT EXISTS {} ("
+                " singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),"
+                " cutover_at timestamptz NOT NULL,"
+                " message_max_id bigint NOT NULL,"
+                " status text NOT NULL)"
+            ).format(qname(schema, STATE_TABLE))
+        )
+        cursor.execute(
+            sql.SQL(
+                "INSERT INTO {} (singleton, cutover_at, message_max_id, status) "
+                "SELECT true, now(), COALESCE(max(id), 0), 'qwen' FROM public.messages "
+                "ON CONFLICT (singleton) DO UPDATE SET"
+                " cutover_at=excluded.cutover_at,"
+                " message_max_id=excluded.message_max_id, status=excluded.status"
+            ).format(qname(schema, STATE_TABLE))
+        )
         for item in MESSAGE_CONSTRAINTS:
             rename_constraint(
                 cursor,
@@ -409,6 +428,45 @@ def rollback(connection: psycopg.Connection[Any], schema: str) -> None:
             raise RuntimeError("768 backup message table is missing")
         if vector_dim(cursor, schema, "documents", "embedding") != 1536:
             raise RuntimeError("Current document embedding column is not vector(1536)")
+        if not relation_exists(cursor, schema, STATE_TABLE):
+            raise RuntimeError("Cutover state marker is missing")
+        cursor.execute(
+            sql.SQL("SELECT cutover_at, message_max_id, status FROM {}").format(
+                qname(schema, STATE_TABLE)
+            )
+        )
+        state = cursor.fetchone()
+        if state is None or state[2] != "qwen":
+            raise RuntimeError("Cutover state is not rollback-ready")
+        cursor.execute(
+            sql.SQL(
+                "SELECT count(*) FROM public.messages m WHERE m.id > %s"
+                " AND NOT EXISTS (SELECT 1 FROM {} old"
+                " WHERE old.message_id=m.public_id)"
+            ).format(qname(schema, BACKUP_TABLE)),
+            (state[1],),
+        )
+        message_delta_row = cursor.fetchone()
+        if message_delta_row is None:
+            raise RuntimeError("Failed to inspect post-cutover message delta")
+        message_delta = int(message_delta_row[0])
+        cursor.execute(
+            sql.SQL(
+                "SELECT count(*) FROM {} WHERE created_at >= %s"
+                " AND embedding_v768_backup IS NULL"
+            ).format(qname(schema, "documents")),
+            (state[0],),
+        )
+        document_delta_row = cursor.fetchone()
+        if document_delta_row is None:
+            raise RuntimeError("Failed to inspect post-cutover document delta")
+        document_delta = int(document_delta_row[0])
+        if message_delta or document_delta:
+            raise RuntimeError(
+                "Unsafe rollback after new writes: "
+                f"messages={message_delta}, documents={document_delta}. "
+                "Backfill the 768 delta before rollback."
+            )
     with connection.transaction(), connection.cursor() as cursor:
         cursor.execute("SET LOCAL lock_timeout = '5s'")
         cursor.execute(
@@ -461,6 +519,11 @@ def rollback(connection: psycopg.Connection[Any], schema: str) -> None:
             sql.SQL(
                 "ALTER TABLE {} RENAME COLUMN embedding_v768_backup TO embedding"
             ).format(qname(schema, "documents"))
+        )
+        cursor.execute(
+            sql.SQL("UPDATE {} SET status='rolled_back'").format(
+                qname(schema, STATE_TABLE)
+            )
         )
 
 
