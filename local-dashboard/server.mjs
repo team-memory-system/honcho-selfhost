@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { createReadStream, existsSync, promises as fs } from "node:fs";
-import { extname, join, normalize } from "node:path";
+import { randomUUID } from "node:crypto";
+import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -17,6 +18,7 @@ const mcpControlMode = process.env.MCP_CONTROL_MODE || "launchd";
 const allowRemoteMcpControl = process.env.MCP_CONTROL_ALLOW_REMOTE === "1";
 let dryRunEnabled = true;
 let dryRunDisabledTools = new Set();
+let mcpToolConfigQueue = Promise.resolve();
 const mcpToolConfigPath = process.env.HONCHO_MCP_TOOL_CONFIG || join(process.env.HOME, ".hermes/local-honcho-mcp/tool-config.json");
 const mcpTools = [
   { name: "server_info", group: "상태", description: "MCP 브리지의 주소, 기본 Workspace·Peer, 읽기 전용 여부와 Honcho 연결 상태를 한 번에 확인합니다.", use_case: "연결 문제 진단이나 에이전트의 기본 조회 범위를 확인할 때", off_impact: "에이전트가 브리지 설정과 상태를 스스로 진단할 수 없습니다." },
@@ -129,6 +131,80 @@ function isLoopback(address = "") {
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
+function isLoopbackHostname(hostname = "") {
+  const value = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (value === "localhost" || value === "::1") return true;
+  if (value.startsWith("::ffff:")) return isLoopbackHostname(value.slice("::ffff:".length));
+  const octets = value.split(".");
+  return octets.length === 4
+    && octets.every(octet => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+    && Number(octets[0]) === 127;
+}
+
+function parseHostHeader(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = new URL(`http://${value.trim()}`);
+    if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) return null;
+    return { hostname: parsed.hostname, port: parsed.port };
+  } catch {
+    return null;
+  }
+}
+
+function validateLocalApiHost(req) {
+  const requestHost = parseHostHeader(req.headers.host);
+  if (!requestHost || !isLoopbackHostname(requestHost.hostname)) {
+    return { status: 403, error: "Dashboard API requires a localhost Host header." };
+  }
+  return null;
+}
+
+function requestHasBody(req) {
+  const transferEncoding = req.headers["transfer-encoding"];
+  if (typeof transferEncoding === "string" && transferEncoding.trim()) return true;
+  const contentLength = req.headers["content-length"];
+  if (typeof contentLength !== "string" || !/^\d+$/.test(contentLength.trim())) return false;
+  return Number(contentLength) > 0;
+}
+
+function validateJsonApiRequest(req, { requireJson = true } = {}) {
+  const requestHost = parseHostHeader(req.headers.host);
+  if (!requestHost || !isLoopbackHostname(requestHost.hostname)) return validateLocalApiHost(req);
+  const originHeader = req.headers.origin;
+  if (originHeader !== undefined) {
+    if (typeof originHeader !== "string") return { status: 403, error: "Invalid dashboard API Origin." };
+    try {
+      const origin = new URL(originHeader);
+      const isBareOrigin = origin.pathname === "/" && !origin.search && !origin.hash && !origin.username && !origin.password;
+      const expectedOrigin = new URL(`http://${req.headers.host}`).origin;
+      if (!isBareOrigin || !isLoopbackHostname(origin.hostname) || origin.origin !== expectedOrigin) {
+        return { status: 403, error: "Dashboard API only accepts same-origin localhost browser requests." };
+      }
+    } catch {
+      return { status: 403, error: "Invalid dashboard API Origin." };
+    }
+  }
+
+  if (requireJson && (req.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+    return { status: 415, error: "Dashboard API requests must use application/json." };
+  }
+  return null;
+}
+
+function validateMcpControlRequest(req) {
+  if (!allowRemoteMcpControl && !isLoopback(req.socket.remoteAddress)) {
+    return { status: 403, error: "MCP control is only available from localhost." };
+  }
+  return validateJsonApiRequest(req);
+}
+
+function serializeMcpToolConfig(operation) {
+  const result = mcpToolConfigQueue.then(operation, operation);
+  mcpToolConfigQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
 async function serviceLoaded(label) {
   if (mcpControlMode === "file") return true;
   try {
@@ -163,8 +239,8 @@ async function getMcpStatus() {
   return { enabled, state: enabled ? "running" : anyRunning ? "partial" : "stopped", dry_run: false, components };
 }
 
-async function readDisabledTools() {
-  if (mcpDryRun) return dryRunDisabledTools;
+async function readDisabledToolsUnlocked() {
+  if (mcpDryRun) return new Set(dryRunDisabledTools);
   try {
     const payload = JSON.parse(await fs.readFile(mcpToolConfigPath, "utf8"));
     return new Set(Array.isArray(payload.disabled_tools) ? payload.disabled_tools.filter(name => mcpToolNames.has(name)) : []);
@@ -172,6 +248,10 @@ async function readDisabledTools() {
     if (error.code === "ENOENT") return new Set();
     throw error;
   }
+}
+
+async function readDisabledTools() {
+  return serializeMcpToolConfig(readDisabledToolsUnlocked);
 }
 
 async function getMcpTools() {
@@ -190,18 +270,25 @@ async function getMcpTools() {
 
 async function setMcpToolEnabled(name, enabled) {
   if (!mcpToolNames.has(name)) throw new Error(`Unknown MCP tool: ${name}`);
-  const disabled = await readDisabledTools();
-  if (enabled) disabled.delete(name); else disabled.add(name);
-  if (mcpDryRun) {
-    dryRunDisabledTools = disabled;
-  } else {
-    const tempPath = `${mcpToolConfigPath}.${process.pid}.tmp`;
-    await fs.writeFile(tempPath, `${JSON.stringify({ version: 1, disabled_tools: [...disabled].sort() }, null, 2)}\n`, { mode: 0o600 });
-    await fs.rename(tempPath, mcpToolConfigPath);
-    if (mcpControlMode === "launchd" && await serviceLoaded("com.chenjing.honcho-external-mcp")) {
-      await execFileAsync("launchctl", ["kill", "SIGTERM", `${launchDomain}/com.chenjing.honcho-external-mcp`], { timeout: 5_000 });
+  await serializeMcpToolConfig(async () => {
+    const disabled = await readDisabledToolsUnlocked();
+    if (enabled) disabled.delete(name); else disabled.add(name);
+    if (mcpDryRun) {
+      dryRunDisabledTools = disabled;
+    } else {
+      await fs.mkdir(dirname(mcpToolConfigPath), { recursive: true, mode: 0o700 });
+      const tempPath = `${mcpToolConfigPath}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await fs.writeFile(tempPath, `${JSON.stringify({ version: 1, disabled_tools: [...disabled].sort() }, null, 2)}\n`, { mode: 0o600 });
+        await fs.rename(tempPath, mcpToolConfigPath);
+      } finally {
+        await fs.rm(tempPath, { force: true });
+      }
+      if (mcpControlMode === "launchd" && await serviceLoaded("com.chenjing.honcho-external-mcp")) {
+        await execFileAsync("launchctl", ["kill", "SIGTERM", `${launchDomain}/com.chenjing.honcho-external-mcp`], { timeout: 5_000 });
+      }
     }
-  }
+  });
   return getMcpTools();
 }
 
@@ -273,6 +360,20 @@ function staticFile(req, res) {
 }
 
 createServer(async (req, res) => {
+  if (req.url.startsWith("/api/")) {
+    const hostRejection = validateLocalApiHost(req);
+    if (hostRejection) return json(res, hostRejection.status, { error: hostRejection.error });
+    if (!["GET", "HEAD"].includes(req.method)) {
+      const requestRejection = validateJsonApiRequest(req, {
+        // POST is a CORS-safelisted method, so requiring JSON prevents form
+        // CSRF even when it has an empty body. Bodyless DELETE/PUT/PATCH are
+        // already preflighted by browsers and should remain valid Honcho API
+        // proxy requests.
+        requireJson: req.method === "POST" || requestHasBody(req),
+      });
+      if (requestRejection) return json(res, requestRejection.status, { error: requestRejection.error });
+    }
+  }
   if (req.url === "/api/dashboard/config") {
     return json(res, 200, { honcho_url: honchoUrl, has_server_api_key: Boolean(serverApiKey) });
   }
@@ -287,7 +388,8 @@ createServer(async (req, res) => {
     }
   }
   if (req.url === "/api/dashboard/mcp/tools" && req.method === "POST") {
-    if (!allowRemoteMcpControl && !isLoopback(req.socket.remoteAddress)) return json(res, 403, { error: "MCP control is only available from localhost." });
+    const rejection = validateMcpControlRequest(req);
+    if (rejection) return json(res, rejection.status, { error: rejection.error });
     try {
       const body = await readJson(req);
       if (typeof body.name !== "string" || typeof body.enabled !== "boolean") return json(res, 400, { error: "name and enabled are required." });
@@ -297,7 +399,8 @@ createServer(async (req, res) => {
     }
   }
   if (req.url === "/api/dashboard/mcp" && req.method === "POST") {
-    if (!allowRemoteMcpControl && !isLoopback(req.socket.remoteAddress)) return json(res, 403, { error: "MCP control is only available from localhost." });
+    const rejection = validateMcpControlRequest(req);
+    if (rejection) return json(res, rejection.status, { error: rejection.error });
     try {
       const body = await readJson(req);
       if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean." });

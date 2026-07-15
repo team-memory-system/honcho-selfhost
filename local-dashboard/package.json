@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check public/app.js"
+    "check": "node --check server.mjs && node --check public/app.js",
+    "test": "node --test server.test.mjs"
   },
   "engines": {
     "node": ">=20"
