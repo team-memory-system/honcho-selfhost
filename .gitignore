@@ -186,6 +186,7 @@ codex-openai-proxy/node_modules/
 local-dashboard/node_modules/
 
 timing_logs.csv
+.bench/
 
 config.json
 config.toml
