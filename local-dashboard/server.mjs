@@ -13,6 +13,8 @@ const serverApiKey = process.env.HONCHO_API_KEY || "";
 const execFileAsync = promisify(execFile);
 const launchDomain = `gui/${process.getuid()}`;
 const mcpDryRun = process.env.MCP_CONTROL_DRY_RUN === "1";
+const mcpControlMode = process.env.MCP_CONTROL_MODE || "launchd";
+const allowRemoteMcpControl = process.env.MCP_CONTROL_ALLOW_REMOTE === "1";
 let dryRunEnabled = true;
 let dryRunDisabledTools = new Set();
 const mcpToolConfigPath = process.env.HONCHO_MCP_TOOL_CONFIG || join(process.env.HOME, ".hermes/local-honcho-mcp/tool-config.json");
@@ -128,6 +130,7 @@ function isLoopback(address = "") {
 }
 
 async function serviceLoaded(label) {
+  if (mcpControlMode === "file") return true;
   try {
     await execFileAsync("launchctl", ["print", `${launchDomain}/${label}`], { timeout: 5_000 });
     return true;
@@ -143,6 +146,14 @@ async function getMcpStatus() {
       state: dryRunEnabled ? "running" : "stopped",
       dry_run: true,
       components: { bridge: dryRunEnabled, tunnel: dryRunEnabled },
+    };
+  }
+  if (mcpControlMode === "file") {
+    return {
+      enabled: true,
+      state: "host-managed",
+      dry_run: false,
+      components: { bridge: true, tunnel: false },
     };
   }
   const values = await Promise.all(mcpServices.map(async service => [service.id, await serviceLoaded(service.label)]));
@@ -165,7 +176,9 @@ async function readDisabledTools() {
 
 async function getMcpTools() {
   const disabled = await readDisabledTools();
-  const bridge = mcpDryRun ? true : await serviceLoaded("com.chenjing.honcho-external-mcp");
+  const bridge = mcpDryRun || mcpControlMode === "file"
+    ? true
+    : await serviceLoaded("com.chenjing.honcho-external-mcp");
   return {
     bridge_running: bridge,
     dry_run: mcpDryRun,
@@ -185,7 +198,7 @@ async function setMcpToolEnabled(name, enabled) {
     const tempPath = `${mcpToolConfigPath}.${process.pid}.tmp`;
     await fs.writeFile(tempPath, `${JSON.stringify({ version: 1, disabled_tools: [...disabled].sort() }, null, 2)}\n`, { mode: 0o600 });
     await fs.rename(tempPath, mcpToolConfigPath);
-    if (await serviceLoaded("com.chenjing.honcho-external-mcp")) {
+    if (mcpControlMode === "launchd" && await serviceLoaded("com.chenjing.honcho-external-mcp")) {
       await execFileAsync("launchctl", ["kill", "SIGTERM", `${launchDomain}/com.chenjing.honcho-external-mcp`], { timeout: 5_000 });
     }
   }
@@ -196,6 +209,9 @@ async function setMcpEnabled(enabled) {
   if (mcpDryRun) {
     dryRunEnabled = enabled;
     return getMcpStatus();
+  }
+  if (mcpControlMode === "file") {
+    throw new Error("The MCP process is managed by the agent host in this deployment.");
   }
   if (enabled) {
     for (const service of mcpServices) {
@@ -271,7 +287,7 @@ createServer(async (req, res) => {
     }
   }
   if (req.url === "/api/dashboard/mcp/tools" && req.method === "POST") {
-    if (!isLoopback(req.socket.remoteAddress)) return json(res, 403, { error: "MCP control is only available from localhost." });
+    if (!allowRemoteMcpControl && !isLoopback(req.socket.remoteAddress)) return json(res, 403, { error: "MCP control is only available from localhost." });
     try {
       const body = await readJson(req);
       if (typeof body.name !== "string" || typeof body.enabled !== "boolean") return json(res, 400, { error: "name and enabled are required." });
@@ -281,7 +297,7 @@ createServer(async (req, res) => {
     }
   }
   if (req.url === "/api/dashboard/mcp" && req.method === "POST") {
-    if (!isLoopback(req.socket.remoteAddress)) return json(res, 403, { error: "MCP control is only available from localhost." });
+    if (!allowRemoteMcpControl && !isLoopback(req.socket.remoteAddress)) return json(res, 403, { error: "MCP control is only available from localhost." });
     try {
       const body = await readJson(req);
       if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean." });
