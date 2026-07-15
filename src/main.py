@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src._version import HONCHO_VERSION
 from src.cache.client import close_cache, init_cache
@@ -190,6 +191,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=settings.TRUSTED_HOSTS,
 )
 
 
