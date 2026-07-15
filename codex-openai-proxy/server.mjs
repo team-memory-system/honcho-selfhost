@@ -1,18 +1,31 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { getModel, stream as piStream } from '@mariozechner/pi-ai';
 import { getOAuthApiKey } from '@mariozechner/pi-ai/oauth';
 
 const PORT = Number(process.env.PORT || 11435);
-const AUTH_PATH = process.env.CODEX_AUTH_PATH || `${process.env.HOME}/.codex/auth.json`;
+const HOST = process.env.HOST || '127.0.0.1';
+const AUTH_PATH = process.env.CODEX_AUTH_PATH || path.join(os.homedir(), '.codex', 'auth.json');
 const DEFAULT_MODEL = process.env.DEFAULT_CODEX_MODEL || 'gpt-5.5';
+const SHARED_SECRET = process.env.CODEX_PROXY_SHARED_SECRET || '';
+const MAX_BODY_BYTES = Number(process.env.CODEX_PROXY_MAX_BODY_BYTES || 8 * 1024 * 1024);
 const PROVIDER_ID = 'openai-codex';
+
+function isLoopbackHost(host) {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+}
+
+if (!isLoopbackHost(HOST) && !SHARED_SECRET) {
+  throw new Error('CODEX_PROXY_SHARED_SECRET is required when HOST is not loopback');
+}
 
 class CodexAuthManager {
   constructor(authPath) {
     this.authPath = authPath;
-    this.cached = null;
+    this.pendingAccessToken = null;
   }
 
   parseJwtPayload(token) {
@@ -45,40 +58,54 @@ class CodexAuthManager {
   }
 
   async persistCreds(updatedCreds, raw) {
+    const latest = await this.loadCreds().catch(() => ({ raw, creds: updatedCreds }));
+    if (latest.creds.refresh !== raw?.tokens?.refresh_token) {
+      return;
+    }
     const next = {
-      ...raw,
+      ...latest.raw,
       tokens: {
-        ...(raw.tokens || {}),
+        ...(latest.raw.tokens || {}),
         access_token: updatedCreds.access,
         refresh_token: updatedCreds.refresh,
-        account_id: updatedCreds.accountId || raw?.tokens?.account_id || null,
+        account_id: updatedCreds.accountId || latest.raw?.tokens?.account_id || null,
       },
       last_refresh: new Date().toISOString(),
     };
-    await fs.writeFile(this.authPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    const temporary = `${this.authPath}.tmp-${process.pid}-${randomUUID()}`;
+    await fs.writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    await fs.rename(temporary, this.authPath);
   }
 
-  async getAccessToken() {
-    if (!this.cached) {
-      this.cached = await this.loadCreds();
-    }
+  async refreshAccessToken() {
+    const loaded = await this.loadCreds();
     const result = await getOAuthApiKey(PROVIDER_ID, {
-      [PROVIDER_ID]: this.cached.creds,
+      [PROVIDER_ID]: loaded.creds,
     });
     if (!result?.apiKey) {
       throw new Error('Failed to obtain Codex access token from OAuth credentials');
     }
     const newCreds = result.newCredentials;
     const changed =
-      newCreds.access !== this.cached.creds.access ||
-      newCreds.refresh !== this.cached.creds.refresh ||
-      newCreds.expires !== this.cached.creds.expires ||
-      newCreds.accountId !== this.cached.creds.accountId;
-    this.cached = { raw: this.cached.raw, creds: newCreds };
+      newCreds.access !== loaded.creds.access ||
+      newCreds.refresh !== loaded.creds.refresh ||
+      newCreds.expires !== loaded.creds.expires ||
+      newCreds.accountId !== loaded.creds.accountId;
     if (changed) {
-      await this.persistCreds(newCreds, this.cached.raw);
+      await this.persistCreds(newCreds, loaded.raw);
     }
     return result.apiKey;
+  }
+
+  async getAccessToken() {
+    if (!this.pendingAccessToken) {
+      const pending = this.refreshAccessToken();
+      const tracked = pending.finally(() => {
+        if (this.pendingAccessToken === tracked) this.pendingAccessToken = null;
+      });
+      this.pendingAccessToken = tracked;
+    }
+    return this.pendingAccessToken;
   }
 }
 
@@ -91,9 +118,28 @@ function sendJson(res, statusCode, payload) {
 
 async function readJsonBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let received = 0;
+  for await (const chunk of req) {
+    received += chunk.length;
+    if (received > MAX_BODY_BYTES) {
+      const error = new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes`);
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString('utf8');
   return raw ? JSON.parse(raw) : {};
+}
+
+function authorized(req) {
+  if (!SHARED_SECRET) return true;
+  const header = String(req.headers.authorization || '');
+  const supplied = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const expectedBuffer = Buffer.from(SHARED_SECRET);
+  const suppliedBuffer = Buffer.from(supplied);
+  return expectedBuffer.length === suppliedBuffer.length
+    && timingSafeEqual(expectedBuffer, suppliedBuffer);
 }
 
 function extractTextFromContent(content) {
@@ -494,19 +540,22 @@ async function handleChatCompletions(req, res) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') {
-      return sendJson(res, 200, { status: 'ok', auth_path: AUTH_PATH, provider: PROVIDER_ID, default_model: DEFAULT_MODEL });
+      return sendJson(res, 200, { status: 'ok', provider: PROVIDER_ID, default_model: DEFAULT_MODEL });
     }
 
     if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      if (!authorized(req)) return sendJson(res, 401, { error: 'Unauthorized' });
       return await handleChatCompletions(req, res);
     }
 
     return sendJson(res, 404, { error: 'Not found' });
   } catch (error) {
-    return sendJson(res, 500, { error: String(error?.message || error) });
+    return sendJson(res, Number(error?.statusCode) || 500, { error: String(error?.message || error) });
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(JSON.stringify({ status: 'listening', port: PORT, auth_path: AUTH_PATH, default_model: DEFAULT_MODEL }));
+server.requestTimeout = Number(process.env.CODEX_PROXY_REQUEST_TIMEOUT_MS || 10 * 60 * 1000);
+
+server.listen(PORT, HOST, () => {
+  console.log(JSON.stringify({ status: 'listening', host: HOST, port: PORT, default_model: DEFAULT_MODEL }));
 });
