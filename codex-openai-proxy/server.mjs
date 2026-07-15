@@ -1,8 +1,10 @@
 import http from 'node:http';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { getModel, stream as piStream } from '@mariozechner/pi-ai';
 import { getOAuthApiKey } from '@mariozechner/pi-ai/oauth';
 
@@ -22,9 +24,18 @@ if (!isLoopbackHost(HOST) && !SHARED_SECRET) {
   throw new Error('CODEX_PROXY_SHARED_SECRET is required when HOST is not loopback');
 }
 
-class CodexAuthManager {
-  constructor(authPath) {
+const TRANSIENT_FILE_ERRORS = new Set(['EACCES', 'EBUSY', 'EPERM']);
+
+export class CodexAuthManager {
+  constructor(authPath, {
+    fileSystem = fs,
+    getOAuth = getOAuthApiKey,
+    sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  } = {}) {
     this.authPath = authPath;
+    this.fileSystem = fileSystem;
+    this.getOAuth = getOAuth;
+    this.sleep = sleep;
     this.pendingAccessToken = null;
   }
 
@@ -35,33 +46,208 @@ class CodexAuthManager {
     return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
   }
 
-  async loadCreds() {
-    const rawText = await fs.readFile(this.authPath, 'utf8');
-    const raw = JSON.parse(rawText);
-    const access = raw?.tokens?.access_token;
-    const refresh = raw?.tokens?.refresh_token;
-    const accountId = raw?.tokens?.account_id;
-    if (!access || !refresh) {
-      throw new Error(`Missing access_token/refresh_token in ${this.authPath}`);
+  async loadCreds(attempts = 4, authPath = this.authPath) {
+    let lastError;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const rawText = await this.fileSystem.readFile(authPath, 'utf8');
+        const raw = JSON.parse(rawText);
+        const access = raw?.tokens?.access_token;
+        const refresh = raw?.tokens?.refresh_token;
+        const accountId = raw?.tokens?.account_id;
+        if (!access || !refresh) {
+          throw new Error(`Missing access_token/refresh_token in ${authPath}`);
+        }
+        const payload = this.parseJwtPayload(access);
+        const expires = typeof payload.exp === 'number' ? payload.exp * 1000 : Date.now() + 30 * 60 * 1000;
+        return {
+          raw,
+          creds: {
+            access,
+            refresh,
+            expires,
+            accountId,
+          },
+        };
+      } catch (error) {
+        lastError = error;
+        if (attempt + 1 < attempts) await this.sleep(25 * (attempt + 1));
+      }
     }
-    const payload = this.parseJwtPayload(access);
-    const expires = typeof payload.exp === 'number' ? payload.exp * 1000 : Date.now() + 30 * 60 * 1000;
-    return {
-      raw,
-      creds: {
-        access,
-        refresh,
-        expires,
-        accountId,
-      },
-    };
+    throw lastError;
   }
 
-  async persistCreds(updatedCreds, raw) {
-    const latest = await this.loadCreds().catch(() => ({ raw, creds: updatedCreds }));
-    if (latest.creds.refresh !== raw?.tokens?.refresh_token) {
-      return;
+  async publishCredentialExclusive(source, label) {
+    try {
+      await this.fileSystem.link(source, this.authPath);
+    } catch (error) {
+      if (error?.code === 'EEXIST') return this.loadCreds();
+      const linkError = error;
+      try {
+        // Hard links are supported on the target APFS/NTFS filesystems. Keep
+        // an exclusive-copy fallback for unusual mount or policy failures.
+        await this.fileSystem.copyFile(source, this.authPath, fsConstants.COPYFILE_EXCL);
+      } catch (copyError) {
+        if (copyError?.code === 'EEXIST') return this.loadCreds();
+        throw new AggregateError(
+          [linkError, copyError],
+          `Could not publish ${label} auth credential: ${linkError.message}; ${copyError.message}`,
+          { cause: linkError },
+        );
+      }
     }
+    // A concurrent writer can replace or corrupt the canonical path after the
+    // exclusive create. Publication is not complete until that path parses as
+    // a full credential.
+    return this.loadCreds();
+  }
+
+  async restoreParkedCredential(parked) {
+    return this.publishCredentialExclusive(parked, 'parked');
+  }
+
+  async writeAuthFile(next, expectedRefresh) {
+    const temporary = `${this.authPath}.tmp-${process.pid}-${randomUUID()}`;
+    const parked = `${this.authPath}.parked-${process.pid}-${randomUUID()}`;
+    let ownsParked = false;
+    let needsRecovery = false;
+    let operationSucceeded = false;
+    let temporaryWritten = false;
+    let parkedCredential = null;
+    let primaryError;
+    try {
+      await this.fileSystem.writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      temporaryWritten = true;
+
+      let lastError;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          // Moving the canonical path out of the way reserves the publication
+          // slot. A concurrent atomic writer will either be captured in
+          // `parked`, or recreate authPath and make the hard-link below fail
+          // with EEXIST. Unlike check-then-rename, this never overwrites a
+          // credential that appeared after the comparison.
+          await this.fileSystem.rename(this.authPath, parked);
+          ownsParked = true;
+          needsRecovery = true;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (error?.code === 'ENOENT') {
+            // Another publisher may currently own the short reservation gap.
+            // Wait for its canonical file to reappear, then either yield to
+            // its rotated refresh token or retry reserving the unchanged one.
+            const latest = await this.loadCreds().catch(() => null);
+            if (latest && latest.creds.refresh !== expectedRefresh) {
+              operationSucceeded = true;
+              return latest.creds.access;
+            }
+          } else if (!TRANSIENT_FILE_ERRORS.has(error?.code)) {
+            throw error;
+          }
+          if (attempt === 4) throw lastError;
+          await this.sleep(50 * (attempt + 1));
+        }
+      }
+
+      if (!ownsParked) throw lastError;
+      const reserved = await this.loadCreds(4, parked);
+      parkedCredential = reserved;
+      if (reserved.creds.refresh !== expectedRefresh) {
+        // The external writer completed just before our reservation. Restore
+        // it only if no newer writer has already recreated the canonical path.
+        const winner = await this.restoreParkedCredential(parked);
+        if (winner.creds.refresh === expectedRefresh) {
+          throw new Error('Canonical auth credential did not preserve the externally rotated refresh token');
+        }
+        needsRecovery = false;
+        operationSucceeded = true;
+        return winner.creds.access;
+      }
+
+      // link() is an atomic create-if-absent on NTFS and APFS. EEXIST is only a
+      // candidate external winner: publishCredentialExclusive validates the
+      // canonical JSON before returning it.
+      const published = await this.publishCredentialExclusive(temporary, 'refreshed');
+      const isOurCandidate =
+        published.creds.access === next.tokens.access_token
+        && published.creds.refresh === next.tokens.refresh_token;
+      const isExternalWinner = published.creds.refresh !== expectedRefresh;
+      if (!isOurCandidate && !isExternalWinner) {
+        throw new Error('Canonical auth credential is valid but its refresh generation is ambiguous');
+      }
+      needsRecovery = false;
+      operationSucceeded = true;
+      return published.creds.access;
+    } catch (error) {
+      primaryError = error;
+    } finally {
+      let recoveryError;
+      let canonicalCredential = null;
+      if (ownsParked && needsRecovery) {
+        try {
+          // On a failed publication, put the known-good parked credential back
+          // only when the canonical path is still absent. Never overwrite a
+          // concurrent external writer during recovery.
+          canonicalCredential = await this.restoreParkedCredential(parked);
+        } catch (error) {
+          recoveryError = error;
+        }
+      }
+
+      if (primaryError && !canonicalCredential && !recoveryError) {
+        canonicalCredential = await this.loadCreds().catch(() => null);
+      }
+
+      const canonicalIsCandidate = canonicalCredential
+        && canonicalCredential.creds.access === next.tokens.access_token
+        && canonicalCredential.creds.refresh === next.tokens.refresh_token;
+      const canonicalIsExternalWinner = canonicalCredential
+        && canonicalCredential.creds.refresh !== expectedRefresh;
+      const canonicalIsSafeWinner = Boolean(canonicalIsCandidate || canonicalIsExternalWinner);
+      const canonicalMatchesParked = canonicalCredential && parkedCredential
+        && canonicalCredential.creds.access === parkedCredential.creds.access
+        && canonicalCredential.creds.refresh === parkedCredential.creds.refresh;
+
+      const cleanupTemporary = operationSucceeded || canonicalIsSafeWinner;
+      const cleanupParked = operationSucceeded || canonicalIsSafeWinner || canonicalMatchesParked;
+      const retained = [];
+      if (temporaryWritten) {
+        if (cleanupTemporary) {
+          await this.fileSystem.rm(temporary, { force: true }).catch(() => {});
+        } else {
+          retained.push(temporary);
+        }
+      } else {
+        await this.fileSystem.rm(temporary, { force: true }).catch(() => {});
+      }
+      if (ownsParked) {
+        if (cleanupParked) {
+          await this.fileSystem.rm(parked, { force: true }).catch(() => {});
+        } else {
+          retained.push(parked);
+        }
+      } else {
+        await this.fileSystem.rm(parked, { force: true }).catch(() => {});
+      }
+
+      if (primaryError) {
+        const errors = recoveryError ? [primaryError, recoveryError] : [primaryError];
+        const retainedMessage = retained.length
+          ? ` Recovery credential retained at: ${retained.join(', ')}`
+          : '';
+        throw new AggregateError(
+          errors,
+          `Auth publication failed: ${primaryError.message}.${retainedMessage}`,
+          { cause: primaryError },
+        );
+      }
+    }
+  }
+
+  async persistCreds(updatedCreds, loaded) {
+    const latest = await this.loadCreds();
+    if (latest.creds.refresh !== loaded.creds.refresh) return latest.creds.access;
     const next = {
       ...latest.raw,
       tokens: {
@@ -72,27 +258,35 @@ class CodexAuthManager {
       },
       last_refresh: new Date().toISOString(),
     };
-    const temporary = `${this.authPath}.tmp-${process.pid}-${randomUUID()}`;
-    await fs.writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    await fs.rename(temporary, this.authPath);
+    return this.writeAuthFile(next, loaded.creds.refresh);
+  }
+
+  async requestAccessToken(loaded) {
+    return this.getOAuth(PROVIDER_ID, { [PROVIDER_ID]: loaded.creds });
   }
 
   async refreshAccessToken() {
-    const loaded = await this.loadCreds();
-    const result = await getOAuthApiKey(PROVIDER_ID, {
-      [PROVIDER_ID]: loaded.creds,
-    });
+    let loaded = await this.loadCreds();
+    let result;
+    try {
+      result = await this.requestAccessToken(loaded);
+    } catch (error) {
+      const latest = await this.loadCreds();
+      if (latest.creds.refresh === loaded.creds.refresh) throw error;
+      loaded = latest;
+      result = await this.requestAccessToken(loaded);
+    }
     if (!result?.apiKey) {
       throw new Error('Failed to obtain Codex access token from OAuth credentials');
     }
-    const newCreds = result.newCredentials;
+    const newCreds = result.newCredentials || loaded.creds;
     const changed =
       newCreds.access !== loaded.creds.access ||
       newCreds.refresh !== loaded.creds.refresh ||
       newCreds.expires !== loaded.creds.expires ||
       newCreds.accountId !== loaded.creds.accountId;
     if (changed) {
-      await this.persistCreds(newCreds, loaded.raw);
+      return this.persistCreds(newCreds, loaded);
     }
     return result.apiKey;
   }
@@ -556,6 +750,10 @@ const server = http.createServer(async (req, res) => {
 
 server.requestTimeout = Number(process.env.CODEX_PROXY_REQUEST_TIMEOUT_MS || 10 * 60 * 1000);
 
-server.listen(PORT, HOST, () => {
-  console.log(JSON.stringify({ status: 'listening', host: HOST, port: PORT, default_model: DEFAULT_MODEL }));
-});
+const isMain = process.argv[1]
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  server.listen(PORT, HOST, () => {
+    console.log(JSON.stringify({ status: 'listening', host: HOST, port: PORT, default_model: DEFAULT_MODEL }));
+  });
+}
