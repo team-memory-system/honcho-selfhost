@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "disabled_tools": [
+    "add_messages_to_session",
+    "add_peers_to_session",
+    "clone_session",
+    "create_conclusions",
+    "create_peer",
+    "create_session",
+    "delete_conclusion",
+    "delete_session",
+    "get_queue_status",
+    "inspect_workspace",
+    "list_workspaces",
+    "remove_peers_from_session",
+    "schedule_dream",
+    "server_info",
+    "set_metadata",
+    "set_peer_card"
+  ]
+}

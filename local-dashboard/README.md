@@ -18,7 +18,7 @@ HONCHO_URL=http://127.0.0.1:8001 npm start
 - `DASHBOARD_PORT`: 대시보드 포트 (기본값 `4173`)
 - `DASHBOARD_HOST`: 바인딩 주소 (기본값 `127.0.0.1`)
 - `MCP_CONTROL_DRY_RUN`: `1`이면 launchd와 설정 파일을 건드리지 않고 MCP 도구 스위치 UI만 시험
-- `HONCHO_MCP_TOOL_CONFIG`: MCP 도구 설정 파일 경로 (기본값 `~/.hermes/local-honcho-mcp/tool-config.json`)
+- `HONCHO_MCP_TOOL_CONFIG`: MCP 도구 설정 파일 경로 (기본값 `~/.config/honcho/mcp-bridge/tool-config.json`)
 - `MCP_CONTROL_MODE=file`: Docker 배포처럼 MCP 프로세스는 호스트가 관리하고, 대시보드는 공유 설정 파일만 수정할 때 사용
 - `MCP_CONTROL_ALLOW_REMOTE=1`: 컨테이너에서 들어오는 도구 설정 요청을 허용합니다. 대시보드 포트가 `127.0.0.1`에만 공개된 경우에만 사용하세요.
 

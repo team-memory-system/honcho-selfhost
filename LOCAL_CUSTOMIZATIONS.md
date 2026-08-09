@@ -7,6 +7,8 @@ official Honcho release and a small set of local commits.
 
 - `upstream`: the official `plastic-labs/honcho` repository. Its push URL is
   deliberately disabled.
+- `origin`: the private self-host repository used to back up and publish local
+  commits. `custom/main` tracks `origin/custom/main`, never `upstream/main`.
 - `custom/main`: the production source branch with local commits.
 - `upstream-base/vX.Y.Z`: immutable pointers to official releases used by the
   local deployment.
@@ -20,13 +22,19 @@ official Honcho release and a small set of local commits.
 
 Keep local changes as narrow, independently revertible commits:
 
-1. Self-host companion applications (dashboard and Codex proxy).
+1. Self-host companion applications (dashboard, Codex proxy, and local MCP
+   bridge).
 2. Honcho core extensions that still differ from upstream.
 3. Operational migration tools.
 4. This release workflow.
 
 Runtime state does not belong in Git: `.env`, API keys, database data, MCP tool
 state, logs, generated dependencies, backups, and LaunchAgent-local secrets.
+
+The local MCP bridge source lives in `local-mcp-bridge/`. Its host-specific
+tool state belongs in `~/.config/honcho/mcp-bridge/`, and its logs belong in
+`~/Library/Logs/Honcho/`. The official upstream `mcp/` directory is a separate
+Cloudflare Worker and must not absorb the local Python bridge.
 
 ## Updating Honcho
 

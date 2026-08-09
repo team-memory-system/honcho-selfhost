@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Runtime state and secrets live outside the repository.
+tool-config.json
+bearer-token
+bearer_token*
+cloudflared*.yml
+!examples/cloudflared.yml

@@ -19,7 +19,7 @@ const allowRemoteMcpControl = process.env.MCP_CONTROL_ALLOW_REMOTE === "1";
 let dryRunEnabled = true;
 let dryRunDisabledTools = new Set();
 let mcpToolConfigQueue = Promise.resolve();
-const mcpToolConfigPath = process.env.HONCHO_MCP_TOOL_CONFIG || join(process.env.HOME, ".hermes/local-honcho-mcp/tool-config.json");
+const mcpToolConfigPath = process.env.HONCHO_MCP_TOOL_CONFIG || join(process.env.HOME, ".config/honcho/mcp-bridge/tool-config.json");
 const mcpTools = [
   { name: "server_info", group: "상태", description: "MCP 브리지의 주소, 기본 Workspace·Peer, 읽기 전용 여부와 Honcho 연결 상태를 한 번에 확인합니다.", use_case: "연결 문제 진단이나 에이전트의 기본 조회 범위를 확인할 때", off_impact: "에이전트가 브리지 설정과 상태를 스스로 진단할 수 없습니다." },
   { name: "get_queue_status", group: "상태", description: "메시지에서 사실과 추론을 만드는 Deriver 작업의 완료·진행·대기 수를 조회합니다.", use_case: "새 기억이 아직 처리 중인지, 추론 생성이 밀렸는지 확인할 때", off_impact: "에이전트가 기억 처리 완료 여부를 확인할 수 없습니다." },
