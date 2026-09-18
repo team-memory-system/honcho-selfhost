@@ -4,7 +4,27 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { CodexAuthManager } from './server.mjs';
+import { CodexAuthManager, resolveReasoningEffort } from './server.mjs';
+
+test('Astra defaults only image requests to low and honors explicit effort', () => {
+  const imageRequest = { messages: [{ role: 'user', content: [
+    { type: 'text', text: 'Read the image' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+  ] }] };
+  assert.equal(resolveReasoningEffort('gpt-6-astra', imageRequest), 'low');
+  for (const effort of ['low', 'medium', 'high', 'xhigh']) {
+    assert.equal(resolveReasoningEffort('gpt-6-astra', {
+      ...imageRequest, reasoning_effort: effort,
+    }), effort);
+  }
+  assert.equal(resolveReasoningEffort('gpt-5.5', imageRequest), undefined);
+  assert.equal(resolveReasoningEffort('gpt-6-astra', {
+    messages: [{ role: 'user', content: 'Summarize this text' }],
+  }), undefined);
+  assert.equal(resolveReasoningEffort('gpt-6-astra', {
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'image_url' }] }],
+  }), undefined);
+});
 
 async function authFixture(t, tokens = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-proxy-auth-'));

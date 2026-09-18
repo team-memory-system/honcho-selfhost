@@ -91,6 +91,36 @@ def test_auth_uses_configured_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
         server._require_auth()
 
 
+def test_stdio_transport_does_not_require_http_bearer_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "MCP_TRANSPORT", "stdio")
+    monkeypatch.setattr(server, "OPTIONAL_BEARER_TOKEN", "inherited-token")
+    monkeypatch.setattr(
+        server,
+        "get_http_request",
+        lambda: (_ for _ in ()).throw(RuntimeError("no request context")),
+    )
+
+    server._require_auth()
+
+
+def test_stdio_defaults_do_not_require_an_http_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "get_http_request",
+        lambda: (_ for _ in ()).throw(RuntimeError("no request context")),
+    )
+
+    assert server._resolve_defaults() == {
+        "workspace_id": "memory",
+        "user_name": "user_chen",
+        "assistant_name": "assistant",
+    }
+
+
 def test_request_passes_300_second_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
@@ -132,3 +162,62 @@ def test_request_passes_300_second_timeout(monkeypatch: pytest.MonkeyPatch) -> N
     assert server._request("GET", "/health") == {"status": "ok"}
     assert captured["timeout"] == 300
     assert captured["url"] == "http://127.0.0.1:8001/health"
+
+
+def test_read_limits_are_clamped_before_upstream_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        server,
+        "_resolve_defaults",
+        lambda **_kwargs: {
+            "workspace_id": "memory",
+            "user_name": "user_chen",
+            "assistant_name": "assistant_agy",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_request",
+        lambda method, path, **kwargs: requests.append(
+            {"method": method, "path": path, **kwargs}
+        ),
+    )
+
+    server.search("query", limit=500)
+    server.get_representation("user_chen", search_max_distance=1.5, max_conclusions=120)
+
+    assert requests[0]["body"]["limit"] == 100  # type: ignore[index]
+    assert requests[1]["body"]["search_max_distance"] == 1.0  # type: ignore[index]
+    assert requests[1]["body"]["max_conclusions"] == 100  # type: ignore[index]
+
+
+def test_message_pagination_is_not_sent_as_column_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        server,
+        "_resolve_defaults",
+        lambda **_kwargs: {
+            "workspace_id": "memory",
+            "user_name": "user_chen",
+            "assistant_name": "assistant_agy",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_request",
+        lambda method, path, **kwargs: captured.update(
+            {"method": method, "path": path, **kwargs}
+        ),
+    )
+
+    server.get_session_messages(
+        "session-1",
+        filters={"page": 2, "limit": 500, "peer_id": "user_chen"},
+    )
+
+    assert captured["body"] == {"filters": {"peer_id": "user_chen"}}
+    assert captured["params"] == {"reverse": "false", "page": 2, "size": 100}

@@ -48,7 +48,9 @@ REQUIRE_TOOL_CONFIG = _env_flag("HONCHO_MCP_REQUIRE_TOOL_CONFIG")
 LISTEN_HOST = os.environ.get("HONCHO_MCP_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("HONCHO_MCP_PORT", "8765"))
 MCP_PATH = os.environ.get("HONCHO_MCP_PATH", "/mcp")
+MCP_TRANSPORT = os.environ.get("HONCHO_MCP_TRANSPORT", "streamable-http")
 TIMEOUT_SECONDS = float(os.environ.get("HONCHO_MCP_TIMEOUT", "300"))
+HIDE_PEER_CARDS = _env_flag("HONCHO_MCP_HIDE_PEER_CARDS")
 
 TOOL_CONFIG_PATH = Path(
     os.environ.get("HONCHO_MCP_TOOL_CONFIG", DEFAULT_RUNTIME_DIR / "tool-config.json")
@@ -99,6 +101,8 @@ def _disabled_tool_names(
 
 
 DISABLED_TOOL_NAMES = _disabled_tool_names()
+if HIDE_PEER_CARDS:
+    DISABLED_TOOL_NAMES |= {"get_peer_card", "get_peer_context", "set_peer_card"}
 
 mcp = FastMCP(
     name="Local Honcho MCP",
@@ -121,6 +125,8 @@ def register_tool(*, name: str):
 
 
 def _require_auth() -> None:
+    if MCP_TRANSPORT == "stdio":
+        return
     if not OPTIONAL_BEARER_TOKEN:
         return
     request = get_http_request()
@@ -135,8 +141,11 @@ def _resolve_defaults(
     user_name: str | None = None,
     assistant_name: str | None = None,
 ) -> dict[str, str]:
-    request = get_http_request()
-    headers = request.headers
+    try:
+        headers = get_http_request().headers
+    except RuntimeError:
+        # Local stdio clients have no HTTP request context and use env defaults.
+        headers = {}
     return {
         "workspace_id": workspace_id
         or headers.get("x-honcho-workspace-id")
@@ -150,6 +159,22 @@ def _resolve_defaults(
     }
 
 
+def _require_card_access(path: str, params: dict[str, Any] | None) -> None:
+    if not HIDE_PEER_CARDS:
+        return
+    peer_card_route = "/peers/" in path and path.endswith(("/card", "/context"))
+    session_card_route = (
+        "/sessions/" in path
+        and path.endswith("/context")
+        and bool((params or {}).get("peer_target"))
+    )
+    if peer_card_route or session_card_route:
+        raise RuntimeError(
+            "Peer cards are disabled on this MCP server. "
+            "Use get_representation, or get_session_context without peer_target."
+        )
+
+
 def _request(
     method: str,
     path: str,
@@ -158,6 +183,7 @@ def _request(
     params: dict[str, Any] | None = None,
 ) -> Any:
     _require_auth()
+    _require_card_access(path, params)
     url = f"{HONCHO_BASE_URL}{path}"
     with httpx.Client(timeout=TIMEOUT_SECONDS) as client:
         resp = client.request(method, url, json=body, params=params)
@@ -173,6 +199,44 @@ def _request(
 
 def _clean_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _clamp(value: float | None, minimum: float, maximum: float) -> float | None:
+    if value is None:
+        return None
+    return max(minimum, min(value, maximum))
+
+
+def _normalize_message_list_options(
+    filters: dict[str, Any] | None,
+    *,
+    page: int | None,
+    size: int | None,
+    reverse: bool,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Keep pagination controls out of Honcho's database-column filters."""
+    cleaned_filters = dict(filters or {})
+    legacy_page = cleaned_filters.pop("page", None)
+    legacy_size = cleaned_filters.pop("size", cleaned_filters.pop("limit", None))
+    legacy_reverse = cleaned_filters.pop("reverse", None)
+    resolved_page = page if page is not None else legacy_page
+    resolved_size = size if size is not None else legacy_size
+    if legacy_reverse is None:
+        resolved_reverse = reverse
+    elif isinstance(legacy_reverse, str):
+        resolved_reverse = legacy_reverse.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        resolved_reverse = bool(legacy_reverse)
+    params = {
+        "reverse": str(resolved_reverse).lower(),
+        "page": int(_clamp(int(resolved_page), 1, 1_000_000))
+        if resolved_page is not None
+        else None,
+        "size": int(_clamp(int(resolved_size), 1, 100))
+        if resolved_size is not None
+        else None,
+    }
+    return cleaned_filters or None, _clean_none(params)
 
 
 def _find_item_by_id(items: list[dict[str, Any]], item_id: str) -> dict[str, Any]:
@@ -281,7 +345,9 @@ def search(
 ) -> Any:
     """Search messages at workspace scope, or scope to a peer or session."""
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
-    body = _clean_none({"query": query, "limit": limit, "filters": filters})
+    body = _clean_none(
+        {"query": query, "limit": int(_clamp(limit, 1, 100)), "filters": filters}
+    )
     if session_id:
         return _request(
             "POST", f"/v3/workspaces/{ws}/sessions/{session_id}/search", body=body
@@ -463,10 +529,10 @@ def get_peer_context(
         {
             "target": peer_id,
             "search_query": search_query,
-            "search_top_k": search_top_k,
-            "search_max_distance": search_max_distance,
+            "search_top_k": _clamp(search_top_k, 1, 100),
+            "search_max_distance": _clamp(search_max_distance, 0.0, 1.0),
             "include_most_frequent": include_most_frequent,
-            "max_conclusions": max_conclusions,
+            "max_conclusions": _clamp(max_conclusions, 1, 100),
         }
     )
     return _request(
@@ -496,10 +562,10 @@ def get_representation(
             "target": peer_id,
             "session_id": session_id,
             "search_query": search_query,
-            "search_top_k": search_top_k,
-            "search_max_distance": search_max_distance,
+            "search_top_k": _clamp(search_top_k, 1, 100),
+            "search_max_distance": _clamp(search_max_distance, 0.0, 1.0),
             "include_most_frequent": include_most_frequent,
-            "max_conclusions": max_conclusions,
+            "max_conclusions": _clamp(max_conclusions, 1, 100),
         }
     )
     return _request(
@@ -638,13 +704,20 @@ def get_session_messages(
     *,
     workspace_id: str | None = None,
     filters: dict[str, Any] | None = None,
+    page: int | None = None,
+    size: int | None = None,
+    reverse: bool = False,
 ) -> Any:
     """List messages in a session."""
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
+    normalized_filters, params = _normalize_message_list_options(
+        filters, page=page, size=size, reverse=reverse
+    )
     return _request(
         "POST",
         f"/v3/workspaces/{ws}/sessions/{session_id}/messages/list",
-        body=_clean_none({"filters": filters}),
+        body=_clean_none({"filters": normalized_filters}),
+        params=params,
     )
 
 
@@ -688,10 +761,10 @@ def get_session_context(
             "peer_target": peer_target,
             "peer_perspective": peer_perspective,
             "limit_to_session": str(limit_to_session).lower(),
-            "search_top_k": search_top_k,
-            "search_max_distance": search_max_distance,
+            "search_top_k": _clamp(search_top_k, 1, 100),
+            "search_max_distance": _clamp(search_max_distance, 0.0, 1.0),
             "include_most_frequent": str(include_most_frequent).lower(),
-            "max_conclusions": max_conclusions,
+            "max_conclusions": _clamp(max_conclusions, 1, 100),
         }
     )
     return _request(
@@ -805,10 +878,13 @@ def get_queue_status(
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http",
-        host=LISTEN_HOST,
-        port=LISTEN_PORT,
-        path=MCP_PATH,
-        show_banner=False,
-    )
+    if MCP_TRANSPORT == "stdio":
+        mcp.run(transport="stdio", show_banner=False)
+    else:
+        mcp.run(
+            transport="streamable-http",
+            host=LISTEN_HOST,
+            port=LISTEN_PORT,
+            path=MCP_PATH,
+            show_banner=False,
+        )

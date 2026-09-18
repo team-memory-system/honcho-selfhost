@@ -80,9 +80,33 @@ and operational-inspection tool that is disabled in production.
 | `HONCHO_MCP_BEARER_TOKEN_FILE` | empty | repo-external bearer file |
 | `HONCHO_MCP_REQUIRE_AUTH` | false | fail startup when bearer is unavailable |
 | `HONCHO_MCP_REQUIRE_TOOL_CONFIG` | false | fail startup when tool state is unavailable |
+| `HONCHO_MCP_HIDE_PEER_CARDS` | false | omit card tools and reject card inclusion in session context for this process |
 
 `X-Honcho-Workspace-ID`, `X-Honcho-User-Name`, and
 `X-Honcho-Assistant-Name` request headers override the corresponding defaults.
+
+## Separate coworker endpoint
+
+The dedicated `com.chenjing.honcho-coworker-mcp` LaunchAgent listens on
+`127.0.0.1:8767`, using its own tool configuration in
+`~/.config/honcho/coworker-mcp/tool-config.json`. Its public MCP URL is
+`https://honcho-coworker.chenjing.org/mcp`.
+
+This process sets `HONCHO_MCP_HIDE_PEER_CARDS=1`. The card tools are not
+registered, and session-context requests specifying `peer_target` are rejected.
+Ordinary session context, search, and representation remain available. Request
+headers cannot turn card tools back on. Search and representation still return
+personal information; this configuration restricts card endpoints, not facts.
+
+Cloudflare Access application `honcho-mcp-coworker` protects the new hostname.
+The existing coworker service token is accepted there; the owner's original
+MCP and API hosts retain their registered-device policy. Existing credentials
+remain valid at the new URL. The owner's bridge has no coworker-header rule.
+
+To migrate an existing client, change only the `honcho_chen` server URL to the
+new URL, preserve its authentication headers, and restart the client from a
+shell with its existing `HONCHO_CHEN_*` environment variables loaded. Verify
+using `get_representation(peer_id="user_chen", observer_id="user_chen")`.
 
 ## Upstream maintenance
 

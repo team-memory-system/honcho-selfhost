@@ -567,6 +567,15 @@ function createChunkBase(id, model, created) {
   };
 }
 
+export function resolveReasoningEffort(modelId, body) {
+  if (body.reasoning_effort != null) return body.reasoning_effort;
+  const hasImage = body.messages?.some(message =>
+    Array.isArray(message.content) && message.content.some(part =>
+      part.type === 'image_url' && typeof part.image_url?.url === 'string'
+      && part.image_url.url.length > 0));
+  return modelId === 'gpt-6-astra' && hasImage ? 'low' : undefined;
+}
+
 async function handleChatCompletions(req, res) {
   const body = await readJsonBody(req);
   const modelId = body.model || DEFAULT_MODEL;
@@ -586,8 +595,10 @@ async function handleChatCompletions(req, res) {
     apiKey,
     transport: 'sse',
     maxTokens: body.max_completion_tokens ?? body.max_tokens,
-    temperature: body.temperature,
-    reasoningEffort: body.reasoning_effort,
+    // Astra rejects temperature even when callers supply a conventional
+    // summarization default. Preserve sampling settings for other models.
+    temperature: modelId === 'gpt-6-astra' ? undefined : body.temperature,
+    reasoningEffort: resolveReasoningEffort(modelId, body),
     sessionId: req.headers['x-session-id'] || body.user || undefined,
   });
 
