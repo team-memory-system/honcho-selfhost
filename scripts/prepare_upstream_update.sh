@@ -4,13 +4,13 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-if [[ "$(git branch --show-current)" != "custom/main" ]]; then
-  echo "error: run this from the custom/main production checkout" >&2
+if [[ "$(git branch --show-current)" != "main" ]]; then
+  echo "error: run this from the main production checkout" >&2
   exit 1
 fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
-  echo "error: custom/main must be clean before preparing an update" >&2
+  echo "error: main must be clean before preparing an update" >&2
   exit 1
 fi
 
@@ -48,7 +48,7 @@ if [[ -e "$candidate_path" ]]; then
   exit 1
 fi
 
-git worktree add -b "$candidate_branch" "$candidate_path" custom/main
+git worktree add -b "$candidate_branch" "$candidate_path" main
 
 set +e
 git -C "$candidate_path" merge --no-ff --no-edit "$target_tag"

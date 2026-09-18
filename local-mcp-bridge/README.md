@@ -1,7 +1,7 @@
 # Honcho local MCP bridge
 
 This companion service exposes the self-hosted Honcho v3 API as a streamable
-HTTP MCP server. It is local customization source tracked on `custom/main`; it
+HTTP MCP server. It is local customization source tracked on `main`; it
 is not part of the official upstream `mcp/` Cloudflare Worker.
 
 ## Runtime path
@@ -112,6 +112,6 @@ using `get_representation(peer_id="user_chen", observer_id="user_chen")`.
 
 This directory is an independently revertible local companion commit. Official
 Honcho releases continue to arrive through the repository's existing
-`integration/vX.Y.Z` worktree and `custom/main` promotion workflow described in
+`integration/vX.Y.Z` worktree and `main` promotion workflow described in
 `../LOCAL_CUSTOMIZATIONS.md`. Do not move this bridge into upstream-owned
 `../mcp/`.

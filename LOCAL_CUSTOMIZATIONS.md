@@ -8,15 +8,15 @@ official Honcho release and a small set of local commits.
 - `upstream`: the official `plastic-labs/honcho` repository. Its push URL is
   deliberately disabled.
 - `origin`: the private self-host repository used to back up and publish local
-  commits. `custom/main` tracks `origin/custom/main`, never `upstream/main`.
-- `custom/main`: the production source branch with local commits.
+  commits. `main` tracks `origin/main`, never `upstream/main`.
+- `main`: the production source branch with local commits.
 - `upstream-base/vX.Y.Z`: immutable pointers to official releases used by the
   local deployment.
 - `integration/vX.Y.Z`: temporary update candidates created in an isolated Git
   worktree.
 
 `.honcho-upstream-version` records the official release currently merged into
-`custom/main`.
+`main`.
 
 ## What belongs in Git
 
@@ -51,7 +51,7 @@ scripts/prepare_upstream_update.sh v3.0.12
 ```
 
 The command fetches official history, creates `.worktrees/vX.Y.Z` from
-`custom/main`, and merges the new tag there. Resolve any conflicts and commit
+`main`, and merges the new tag there. Resolve any conflicts and commit
 them inside that worktree. Git `rerere` is enabled, so recurring resolutions
 are remembered.
 
@@ -75,7 +75,7 @@ After validation, promote the already-tested candidate without deploying it:
 scripts/promote_upstream_update.sh vX.Y.Z
 ```
 
-Promotion creates a backup branch, fast-forwards `custom/main`, and removes the
+Promotion creates a backup branch, fast-forwards `main`, and removes the
 temporary worktree. Building and restarting production remains a separate,
 explicit operation with the normal database backup and rollback checks.
 
