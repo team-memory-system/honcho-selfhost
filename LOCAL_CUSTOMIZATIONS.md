@@ -22,7 +22,7 @@ official Honcho release and a small set of local commits.
 
 Keep local changes as narrow, independently revertible commits:
 
-1. Self-host companion applications (dashboard, Codex proxy, and local MCP
+1. Self-host companion applications (dashboard and local MCP
    bridge).
 2. Honcho core extensions that still differ from upstream.
 3. Operational migration tools.
@@ -86,3 +86,10 @@ do not preserve the intent of separate custom features. Release merges keep an
 auditable history, use the true common ancestor even after many skipped
 versions, and allow the full candidate to be tested without modifying the live
 checkout.
+
+## Independent LLM proxy (2026-09-23)
+
+Codex and Claude proxy sources and LaunchAgents moved to `../llm-proxy`.
+Honcho consumes their OpenAI-compatible HTTP endpoints; it does not package or
+manage their lifecycle. Existing ports and private API keys remain unchanged.
+Use `python3 ../llm-proxy/proxyctl.py status` to inspect the host services.
