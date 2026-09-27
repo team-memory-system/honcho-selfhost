@@ -18,6 +18,24 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
+# `embedding_call_purpose` slugs whose input is a retrieval query rather than
+# stored content. Enumerated from every `with embedding_call_purpose(...)` site
+# upstream; the query and document sets do not overlap. Anything absent here —
+# including a purpose upstream adds later — is treated as content and embedded
+# verbatim. `tests/llm/test_embedding_client.py` fails if the upstream taxonomy
+# drifts, so the split gets re-checked at merge time instead of silently
+# degrading retrieval.
+QUERY_CALL_PURPOSES: frozenset[str] = frozenset(
+    {
+        "search_memory",
+        "search_messages",
+        "session_context_search",
+        "dialectic_prefetch",
+        "preference_extraction",
+        "generic_document_search",
+    }
+)
+
 
 async def _emit_embedding_call(
     *,
@@ -629,29 +647,37 @@ class EmbeddingClient:
             settings.EMBEDDING.resolve_send_dimensions(),
         )
 
-    async def embed(self, query: str) -> list[float]:
-        """Embed a single query string."""
-        return await self._get_client().embed(query)
-
     @staticmethod
-    def _prepare_query(query: str) -> str:
+    def _prepare(text: str) -> str:
+        """Prefix the configured retrieval instruction when this call embeds a
+        *query* rather than stored content.
+
+        Asymmetric models such as Qwen3-Embedding want the instruction on the
+        query side only; attaching it to documents cancels the effect out and
+        undoing that means re-embedding the corpus. We read the intent from the
+        `embedding_call_purpose` ContextVar the callers already set for
+        telemetry, so no call site has to change. An unset or unrecognized
+        purpose falls through unmodified — upstream behaviour — which keeps a
+        new document path from silently picking up the prefix.
+        """
         instruction = settings.EMBEDDING.QUERY_INSTRUCTION
         if not instruction:
-            return query
-        return f"Instruct: {instruction.strip()}\nQuery: {query}"
+            return text
+        from src.utils.types import get_embedding_call_purpose
 
-    async def embed_query(self, query: str) -> list[float]:
-        """Embed a retrieval query, applying the configured instruction."""
-        return await self.embed(self._prepare_query(query))
+        if get_embedding_call_purpose() not in QUERY_CALL_PURPOSES:
+            return text
+        return f"Instruct: {instruction.strip()}\nQuery: {text}"
+
+    async def embed(self, query: str) -> list[float]:
+        """Embed a single query string."""
+        return await self._get_client().embed(self._prepare(query))
 
     async def simple_batch_embed(self, texts: list[str]) -> list[list[float]]:
         """Batch embed a list of text strings (each must fit token limit)."""
-        return await self._get_client().simple_batch_embed(texts)
-
-    async def simple_batch_embed_queries(self, queries: list[str]) -> list[list[float]]:
-        """Batch embed retrieval queries with the configured instruction."""
-        prepared = [self._prepare_query(query) for query in queries]
-        return await self.simple_batch_embed(prepared)
+        return await self._get_client().simple_batch_embed(
+            [self._prepare(text) for text in texts]
+        )
 
     def prepare_chunks(self, id_resource_dict: dict[str, str]) -> dict[str, list[str]]:
         """Chunk texts using the same rules as `batch_embed` (no network)."""

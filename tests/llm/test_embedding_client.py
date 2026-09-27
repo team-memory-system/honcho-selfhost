@@ -1,3 +1,5 @@
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -5,8 +7,25 @@ import pytest
 
 from src.config import EmbeddingModelConfig, settings
 from src.embedding_client import (  # pyright: ignore[reportPrivateUsage]
+    QUERY_CALL_PURPOSES,
     EmbeddingClient,
     _EmbeddingClient,
+)
+from src.telemetry.events import EmbeddingCallPurpose
+from src.utils.types import embedding_call_purpose
+
+# Purposes whose embedding input is stored content. Kept here rather than in
+# src/ because production code only needs to know what a query looks like —
+# this set exists so a new upstream purpose trips
+# test_query_purposes_partition_upstream_taxonomy instead of being silently
+# treated as content.
+CONTENT_CALL_PURPOSES = frozenset(
+    {
+        "create_observations",
+        "message_create",
+        "vector_sync",
+        "summary",
+    }
 )
 
 
@@ -32,50 +51,198 @@ class FakeOpenAIEmbeddingsAPI:
         return SimpleNamespace(data=data)
 
 
-@pytest.mark.asyncio
-async def test_embed_query_applies_configured_retrieval_instruction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: list[str] = []
+class RecordingInnerClient:
+    """Stands in for the transport-level client so the tests see exactly the
+    text `EmbeddingClient` hands down."""
 
-    async def fake_embed(_self: EmbeddingClient, text: str) -> list[float]:
-        captured.append(text)
+    def __init__(self) -> None:
+        self.embedded: list[str] = []
+        self.batched: list[list[str]] = []
+
+    async def embed(self, query: str) -> list[float]:
+        self.embedded.append(query)
         return [0.1, 0.2]
 
-    monkeypatch.setattr(
-        settings.EMBEDDING,
-        "QUERY_INSTRUCTION",
-        "retrieve relevant personal memories",
-    )
-    monkeypatch.setattr(EmbeddingClient, "embed", fake_embed)
+    async def simple_batch_embed(self, texts: list[str]) -> list[list[float]]:
+        self.batched.append(list(texts))
+        return [[0.1] for _ in texts]
 
-    result = await EmbeddingClient().embed_query("coffee preferences")
+
+@pytest.fixture
+def recording_client(monkeypatch: pytest.MonkeyPatch) -> RecordingInnerClient:
+    inner = RecordingInnerClient()
+    monkeypatch.setattr(settings.EMBEDDING, "QUERY_INSTRUCTION", "find memories")
+    monkeypatch.setattr(EmbeddingClient, "_get_client", lambda _self: inner)
+    return inner
+
+
+@pytest.mark.asyncio
+async def test_query_purpose_applies_configured_retrieval_instruction(
+    recording_client: RecordingInnerClient,
+) -> None:
+    with embedding_call_purpose("search_memory"):
+        result = await EmbeddingClient().embed("coffee preferences")
 
     assert result == [0.1, 0.2]
-    assert captured == [
-        "Instruct: retrieve relevant personal memories\nQuery: coffee preferences"
+    assert recording_client.embedded == [
+        "Instruct: find memories\nQuery: coffee preferences"
     ]
 
 
 @pytest.mark.asyncio
-async def test_batch_query_embedding_leaves_documents_unmodified(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_document_purpose_embeds_content_verbatim(
+    recording_client: RecordingInnerClient,
 ) -> None:
-    captured: list[list[str]] = []
+    with embedding_call_purpose("message_create"):
+        await EmbeddingClient().embed("the user rides a Trek Madone")
 
-    async def fake_batch(_self: EmbeddingClient, texts: list[str]) -> list[list[float]]:
-        captured.append(texts)
-        return [[0.1], [0.2]]
+    assert recording_client.embedded == ["the user rides a Trek Madone"]
 
-    monkeypatch.setattr(settings.EMBEDDING, "QUERY_INSTRUCTION", "find memories")
-    monkeypatch.setattr(EmbeddingClient, "simple_batch_embed", fake_batch)
 
-    result = await EmbeddingClient().simple_batch_embed_queries(["one", "two"])
+@pytest.mark.asyncio
+async def test_absent_purpose_embeds_content_verbatim(
+    recording_client: RecordingInnerClient,
+) -> None:
+    """No purpose in scope means no instruction — upstream behaviour. Keeps a
+    new content path from picking up the prefix just because it wasn't tagged.
+    """
+    await EmbeddingClient().embed("untagged text")
 
-    assert result == [[0.1], [0.2]]
-    assert captured == [
+    assert recording_client.embedded == ["untagged text"]
+
+
+@pytest.mark.asyncio
+async def test_batch_embed_applies_instruction_to_each_query(
+    recording_client: RecordingInnerClient,
+) -> None:
+    with embedding_call_purpose("preference_extraction"):
+        result = await EmbeddingClient().simple_batch_embed(["one", "two"])
+
+    assert result == [[0.1], [0.1]]
+    assert recording_client.batched == [
         ["Instruct: find memories\nQuery: one", "Instruct: find memories\nQuery: two"]
     ]
+
+
+@pytest.mark.asyncio
+async def test_unset_instruction_embeds_content_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inner = RecordingInnerClient()
+    monkeypatch.setattr(settings.EMBEDDING, "QUERY_INSTRUCTION", None)
+    monkeypatch.setattr(EmbeddingClient, "_get_client", lambda _self: inner)
+
+    with embedding_call_purpose("search_memory"):
+        await EmbeddingClient().embed("coffee preferences")
+
+    assert inner.embedded == ["coffee preferences"]
+
+
+#: The only `EmbeddingClient` methods whose text is a caller's retrieval query.
+#: Everything else the class forwards is stored content, and must reach the
+#: provider untouched — attaching the instruction to documents cancels the effect
+#: out, and undoing that means re-embedding the whole corpus.
+QUERY_EMBEDDING_METHODS = frozenset({"embed", "simple_batch_embed"})
+
+#: Methods that hand stored content to the provider. Listed so that adding the
+#: prefix to one of them fails here.
+CONTENT_EMBEDDING_METHODS = frozenset({"batch_embed", "prepare_chunks"})
+
+
+def _embedding_client_methods() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Every method of `EmbeddingClient`, read from the file itself."""
+    source = Path("src/embedding_client.py").read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "EmbeddingClient":
+            return {
+                item.name: item
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+    raise AssertionError("EmbeddingClient is no longer a class in src/embedding_client.py")
+
+
+def _takes_caller_text(method: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True when the method receives something from the caller.
+
+    The property accessors also reach the inner client, but they pass nothing in,
+    so there is no text for the instruction to attach to.
+    """
+    arguments = method.args
+    names = [argument.arg for argument in [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]]
+    return [name for name in names if name not in {"self", "cls"}] != []
+
+
+def test_exactly_the_query_paths_route_through_prepare() -> None:
+    """Guard the wiring, not just the taxonomy.
+
+    `test_query_purposes_partition_upstream_taxonomy` checks that every upstream
+    purpose is classified. It says nothing about whether `_prepare` is still
+    called: dropping it from `embed` during an upstream merge would leave every
+    test green while retrieval quietly loses the instruction. So assert the call
+    sites by name, in both directions — a query path that stops wrapping fails
+    here, and so does a content path that starts.
+    """
+    methods = _embedding_client_methods()
+    forwarding = {
+        name: ast.unparse(method)
+        for name, method in methods.items()
+        if not name.startswith("_") and _takes_caller_text(method)
+        and "_get_client()" in ast.unparse(method)
+    }
+    wrapping = {name for name, body in forwarding.items() if "_prepare(" in body}
+
+    assert wrapping == QUERY_EMBEDDING_METHODS, {
+        "stopped wrapping": sorted(QUERY_EMBEDDING_METHODS - wrapping),
+        "started wrapping": sorted(wrapping - QUERY_EMBEDDING_METHODS),
+    }
+
+    unclassified = set(forwarding) - QUERY_EMBEDDING_METHODS - CONTENT_EMBEDDING_METHODS
+    assert not unclassified, (
+        f"EmbeddingClient forwards to the provider through new methods {sorted(unclassified)}; "
+        "add each to QUERY_EMBEDDING_METHODS or CONTENT_EMBEDDING_METHODS in this file"
+    )
+
+    assert "_prepare" in methods, "the instruction helper itself was removed"
+
+
+@pytest.mark.asyncio
+async def test_every_query_method_carries_the_instruction(
+    recording_client: RecordingInnerClient,
+) -> None:
+    """The behavioural half of the same guard: each named query method really does
+    prefix, so the static check above cannot pass on a `_prepare` that no longer
+    prefixes anything."""
+    client = EmbeddingClient()
+    with embedding_call_purpose("search_memory"):
+        await client.embed("한 건")
+        await client.simple_batch_embed(["여러 건"])
+
+    assert recording_client.embedded == ["Instruct: find memories\nQuery: 한 건"]
+    assert recording_client.batched == [["Instruct: find memories\nQuery: 여러 건"]]
+    assert QUERY_EMBEDDING_METHODS == {"embed", "simple_batch_embed"}, (
+        "this test covers each method in QUERY_EMBEDDING_METHODS; extend it when that grows"
+    )
+
+
+def test_query_purposes_partition_upstream_taxonomy() -> None:
+    """Guard on the one thing this design depends on: that every upstream
+    embedding purpose is knowingly classified as query or content. If upstream
+    renames a purpose or adds one, this fails at merge time instead of quietly
+    dropping the instruction from a retrieval path.
+    """
+    upstream = {purpose.value for purpose in EmbeddingCallPurpose}
+
+    assert upstream >= QUERY_CALL_PURPOSES, sorted(QUERY_CALL_PURPOSES - upstream)
+    assert not QUERY_CALL_PURPOSES & CONTENT_CALL_PURPOSES
+
+    unclassified = upstream - QUERY_CALL_PURPOSES - CONTENT_CALL_PURPOSES
+    assert not unclassified, (
+        f"upstream added embedding purposes {sorted(unclassified)}; classify each "
+        "as query (src/embedding_client.py QUERY_CALL_PURPOSES) or content "
+        "(CONTENT_CALL_PURPOSES in this file)"
+    )
 
 
 @pytest.mark.asyncio

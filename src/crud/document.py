@@ -356,7 +356,7 @@ async def query_documents(
     # Use provided embedding or generate one
     if embedding is None:
         try:
-            embedding = await embedding_client.embed_query(query)
+            embedding = await embedding_client.embed(query)
         except ValueError as e:
             raise ValidationException(
                 "Query exceeds maximum token limit of "

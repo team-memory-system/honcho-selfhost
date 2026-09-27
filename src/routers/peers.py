@@ -289,7 +289,7 @@ async def get_representation(
                     parent_category="api",
                 ),
             ):
-                embedding = await embedding_client.embed_query(options.search_query)
+                embedding = await embedding_client.embed(options.search_query)
 
         # If no target specified, get global representation (omniscient Honcho perspective)
         representation = await crud.get_working_representation(
@@ -452,7 +452,7 @@ async def get_peer_context(
                     parent_category="api",
                 ),
             ):
-                embedding = await embedding_client.embed_query(search_query)
+                embedding = await embedding_client.embed(search_query)
 
         # Get the working representation
         representation = await crud.get_working_representation(

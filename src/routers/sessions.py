@@ -756,7 +756,7 @@ async def get_session_context(
                 parent_category="api",
             ),
         ):
-            embedding = await embedding_client.embed_query(search_query)
+            embedding = await embedding_client.embed(search_query)
 
     # Sequential calls on shared DB session
     representation = await _get_working_representation_task(
