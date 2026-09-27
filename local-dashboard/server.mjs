@@ -20,6 +20,13 @@ let dryRunEnabled = true;
 let dryRunDisabledTools = new Set();
 let mcpToolConfigQueue = Promise.resolve();
 const mcpToolConfigPath = process.env.HONCHO_MCP_TOOL_CONFIG || join(process.env.HOME, ".config/honcho/mcp-bridge/tool-config.json");
+// The audit log lives in the bridge's database schema, and the bridge is the only
+// thing holding a driver for it. The dashboard reads it over the bridge's guarded
+// /audit route rather than opening a second connection of its own.
+const auditUrl = (process.env.HONCHO_MCP_AUDIT_URL || "").replace(/\/$/, "");
+const auditTokenFile = process.env.HONCHO_MCP_BEARER_TOKEN_FILE || "";
+const auditTokenInline = process.env.HONCHO_MCP_BEARER_TOKEN || "";
+const auditFilters = ["limit", "caller", "tool", "status", "bridge", "hours"];
 const mcpTools = [
   { name: "server_info", group: "상태", description: "MCP 브리지의 주소, 기본 Workspace·Peer, 읽기 전용 여부와 Honcho 연결 상태를 한 번에 확인합니다.", use_case: "연결 문제 진단이나 에이전트의 기본 조회 범위를 확인할 때", off_impact: "에이전트가 브리지 설정과 상태를 스스로 진단할 수 없습니다." },
   { name: "get_queue_status", group: "상태", description: "메시지에서 사실과 추론을 만드는 Deriver 작업의 완료·진행·대기 수를 조회합니다.", use_case: "새 기억이 아직 처리 중인지, 추론 생성이 밀렸는지 확인할 때", off_impact: "에이전트가 기억 처리 완료 여부를 확인할 수 없습니다." },
@@ -317,6 +324,35 @@ async function setMcpEnabled(enabled) {
   return getMcpStatus();
 }
 
+async function auditToken() {
+  if (auditTokenInline) return auditTokenInline;
+  if (!auditTokenFile) return "";
+  return (await fs.readFile(auditTokenFile, "utf8")).trim();
+}
+
+async function readAudit(req, res) {
+  if (!auditUrl) {
+    return json(res, 200, { enabled: false, reason: "HONCHO_MCP_AUDIT_URL is not set." });
+  }
+  const requested = new URL(req.url, "http://dashboard").searchParams;
+  const params = new URLSearchParams();
+  for (const name of auditFilters) {
+    const value = requested.get(name);
+    if (value) params.set(name, value);
+  }
+  try {
+    const token = await auditToken();
+    const upstream = await fetch(`${auditUrl}?${params}`, {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      signal: AbortSignal.timeout(30_000),
+    });
+    const payload = await upstream.json().catch(() => ({ error: "Audit response was not JSON." }));
+    return json(res, upstream.status, upstream.ok ? { enabled: true, ...payload } : payload);
+  } catch (error) {
+    return json(res, 502, { error: "Audit log is unreachable.", detail: error.message, audit_url: auditUrl });
+  }
+}
+
 async function proxy(req, res) {
   const path = req.url.slice("/api".length);
   if (!path.startsWith("/v3/")) return json(res, 400, { error: "Only Honcho v3 routes are allowed." });
@@ -375,7 +411,10 @@ createServer(async (req, res) => {
     }
   }
   if (req.url === "/api/dashboard/config") {
-    return json(res, 200, { honcho_url: honchoUrl, has_server_api_key: Boolean(serverApiKey) });
+    return json(res, 200, { honcho_url: honchoUrl, has_server_api_key: Boolean(serverApiKey), has_audit_log: Boolean(auditUrl) });
+  }
+  if (req.url.startsWith("/api/dashboard/audit") && req.method === "GET") {
+    return readAudit(req, res);
   }
   if (req.url === "/api/dashboard/mcp" && req.method === "GET") {
     return json(res, 200, await getMcpStatus());

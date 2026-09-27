@@ -8,6 +8,7 @@ const state = {
   totals: { peers: 0, sessions: 0, conclusions: 0 },
   chatBusy: false,
   mcpTools: null,
+  audit: null,
   selectedPeer: null, selectedSession: null,
 };
 
@@ -16,6 +17,7 @@ const titles = {
   sessions: ["SESSION LOGS", "대화의 타임라인"], memory: ["MEMORY EXPLORER", "근거와 결론"],
   dialectic: ["DIALECTIC CHAT", "Honcho와 대화"],
   mcp: ["MCP TOOL CONTROL", "에이전트 도구 권한"],
+  audit: ["MCP CALL AUDIT", "누가 무엇을 물었는가"],
 };
 
 function esc(value = "") { const d = document.createElement("div"); d.textContent = String(value); return d.innerHTML; }
@@ -49,6 +51,7 @@ async function api(path, options = {}) {
 async function init() {
   state.config = await fetch("/api/dashboard/config").then(r => r.json());
   $("#connection-url").textContent = state.config.honcho_url;
+  if (state.config.has_audit_log) $("#nav-audit").hidden = false;
   bindEvents();
   await loadWorkspaces();
 }
@@ -119,6 +122,51 @@ function renderMcpTools() {
     ? `<div class="empty-inline">${esc(data.error)}</div>`
     : Object.entries(groups).map(([group, tools]) => `<section class="panel mcp-tool-group"><div class="mcp-group-head"><div><p class="eyebrow">${esc(group.toUpperCase())}</p><h2>${esc(group)} 도구</h2></div><span>${tools.filter(tool => tool.enabled).length}/${tools.length} ON</span></div><div class="mcp-tool-grid">${tools.map(tool => { const access = { write: ["쓰기", "write"], danger: ["삭제", "danger"], llm: ["LLM", "llm"] }[tool.access] || ["조회", "read"]; return `<label class="mcp-tool-card ${tool.enabled ? "enabled" : "disabled"}"><div class="mcp-tool-head"><div><code>${esc(tool.name)}</code><em class="access-badge ${access[1]}">${access[0]}</em></div><span class="switch"><input type="checkbox" data-mcp-tool="${esc(tool.name)}" ${tool.enabled ? "checked" : ""}><span></span></span></div><p class="tool-description">${esc(tool.description)}</p><p class="tool-translation">${esc(tool.translation)}</p></label>`; }).join("")}</div></section>`).join("");
 }
+async function loadAudit() {
+  const form = $("#audit-filter-form");
+  const params = new URLSearchParams([...new FormData(form)].filter(([, value]) => value !== ""));
+  $("#audit-list").innerHTML = `<div class="empty-inline">기록을 불러오는 중…</div>`;
+  try {
+    state.audit = await api(`/dashboard/audit?${params}`);
+  } catch (error) {
+    state.audit = { error: error.message };
+  }
+  renderAudit();
+}
+
+function renderAudit() {
+  const data = state.audit || {};
+  const rows = data.rows || [];
+  const summary = data.summary || {};
+  const total = Object.values(summary).reduce((sum, n) => sum + n, 0);
+  $("#audit-total").textContent = data.error ? "오류" : total;
+  $("#audit-nav-count").textContent = data.error ? "!" : (summary.denied || 0) || total || "—";
+  $("#audit-denied-label").textContent = data.error ? "확인 실패" : `거부 ${summary.denied || 0} · 오류 ${summary.error || 0}`;
+  $("#audit-schema").textContent = data.schema ? `스키마 ${data.schema}` : "—";
+  $("#audit-count").textContent = data.error ? "—" : `${rows.length}건`;
+
+  if (data.error) { $("#audit-list").innerHTML = `<div class="empty-inline">${esc(data.error)}</div>`; return; }
+  if (data.enabled === false) { $("#audit-list").innerHTML = `<div class="empty-inline">${esc(data.reason || "감사 로그가 설정되지 않았습니다.")}</div>`; return; }
+  if (!rows.length) { $("#audit-list").innerHTML = `<div class="empty-inline">조건에 맞는 호출이 없습니다.</div>`; return; }
+
+  $("#audit-list").innerHTML = rows.map(row => {
+    const badge = { ok: ["통과", "read"], denied: ["거부", "danger"], error: ["오류", "write"] }[row.status] || ["?", "read"];
+    const score = row.jev_score === null || row.jev_score === undefined ? "" : `<em class="access-badge llm">판정 ${Number(row.jev_score).toFixed(2)}</em>`;
+    return `<article class="audit-row ${esc(row.status)}">
+      <div class="audit-head">
+        <code>${esc(row.tool)}</code>
+        <em class="access-badge ${badge[1]}">${badge[0]}</em>
+        <span class="audit-bridge">${esc(row.bridge)}</span>
+        ${score}
+        <span class="audit-when">${esc(shortDate(row.at))}</span>
+      </div>
+      <p class="audit-caller">${esc(row.caller)} <small>${esc(row.caller_source)}</small>${row.workspace_id ? ` · ${esc(row.workspace_id)}` : ""}${row.duration_ms === null ? "" : ` · ${esc(row.duration_ms)}ms`}</p>
+      ${row.query_text ? `<p class="audit-query">${esc(row.query_text)}</p>` : `<p class="audit-query muted">질의 원문 없음</p>`}
+      ${row.error ? `<p class="audit-error">${esc(row.error)}</p>` : ""}
+    </article>`;
+  }).join("");
+}
+
 function renderEmptyWorkspace(message = "Workspace를 먼저 생성하세요.") { $("#recent-sessions").innerHTML = `<div class="empty-inline">${esc(message)}</div>`; }
 function renderAll() { renderOverview(); renderPeerList(); renderSessionList(); renderConclusions(); fillSelectors(); }
 
@@ -238,6 +286,7 @@ function showView(view) {
   $$(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.view === view)); $$(".view").forEach(v => v.classList.toggle("active", v.id === `view-${view}`));
   $("#page-eyebrow").textContent = titles[view][0]; $("#page-title").textContent = titles[view][1];
   if (view === "mcp") loadMcpTools();
+  if (view === "audit") loadAudit();
 }
 
 function openCreate(type) {
@@ -258,7 +307,13 @@ function bindEvents() {
     if (e.target.closest("[data-close-dialog]")) $("#create-dialog").close();
   });
   $("#workspace-select").addEventListener("change", async e => { state.workspace = e.target.value; state.selectedPeer = state.selectedSession = null; await loadWorkspace(); });
-  $("#refresh-button").addEventListener("click", () => $(".nav-item.active")?.dataset.view === "mcp" ? loadMcpTools() : loadWorkspace());
+  $("#refresh-button").addEventListener("click", () => {
+    const view = $(".nav-item.active")?.dataset.view;
+    if (view === "mcp") return loadMcpTools();
+    if (view === "audit") return loadAudit();
+    return loadWorkspace();
+  });
+  $("#audit-filter-form").addEventListener("submit", e => { e.preventDefault(); loadAudit(); });
   $("#peer-filter").addEventListener("input", e => renderPeerList(e.target.value)); $("#session-filter").addEventListener("input", e => renderSessionList(e.target.value));
   $("#mcp-tool-list").addEventListener("change", async e => {
     if (!e.target.matches("[data-mcp-tool]")) return;

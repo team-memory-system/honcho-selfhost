@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import json
+import logging
 import os
 import secrets
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_request
+
+import audit
+import jev_gate
+
+logger = logging.getLogger("honcho.mcp.bridge")
 
 DEFAULT_CONFIG_HOME = Path(
     os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
@@ -55,6 +65,22 @@ HIDE_PEER_CARDS = _env_flag("HONCHO_MCP_HIDE_PEER_CARDS")
 TOOL_CONFIG_PATH = Path(
     os.environ.get("HONCHO_MCP_TOOL_CONFIG", DEFAULT_RUNTIME_DIR / "tool-config.json")
 ).expanduser()
+
+#: When set, only these tools are registered. An allowlist survives new upstream
+#: tools; a denylist silently exposes each one that gets added.
+ENABLED_TOOL_NAMES: frozenset[str] | None = (
+    frozenset(
+        name.strip()
+        for name in os.environ["HONCHO_MCP_ENABLED_TOOLS"].split(",")
+        if name.strip()
+    )
+    if os.environ.get("HONCHO_MCP_ENABLED_TOOLS", "").strip()
+    else None
+)
+
+#: Ignore the x-honcho-* request headers. A shared bridge must not let its callers
+#: point themselves at another workspace or peer.
+PIN_DEFAULTS = _env_flag("HONCHO_MCP_PIN_DEFAULTS")
 
 if REQUIRE_AUTH and not OPTIONAL_BEARER_TOKEN:
     raise RuntimeError(
@@ -114,14 +140,181 @@ mcp = FastMCP(
 )
 
 
+_tool_config_lock = threading.Lock()
+_tool_config_cache: dict[str, Any] = {"mtime": None, "disabled": DISABLED_TOOL_NAMES}
+_call_depth = threading.local()
+
+
+def _tool_is_registered(name: str) -> bool:
+    if ENABLED_TOOL_NAMES is not None:
+        return name in ENABLED_TOOL_NAMES
+    return name not in DISABLED_TOOL_NAMES
+
+
+def _currently_disabled() -> set[str]:
+    """Disabled tools as of now, so a dashboard edit applies without a restart.
+
+    Registration is fixed at import time, which keeps the advertised tool list
+    minimal. This re-read only ever adds refusals to tools already listed.
+    """
+    try:
+        mtime = TOOL_CONFIG_PATH.stat().st_mtime
+    except OSError:
+        return DISABLED_TOOL_NAMES
+    with _tool_config_lock:
+        if _tool_config_cache["mtime"] != mtime:
+            try:
+                names = _disabled_tool_names(required=False)
+            except RuntimeError:
+                names = set(DISABLED_TOOL_NAMES)
+            if HIDE_PEER_CARDS:
+                names |= {"get_peer_card", "get_peer_context", "set_peer_card"}
+            _tool_config_cache["disabled"] = names
+            _tool_config_cache["mtime"] = mtime
+        return _tool_config_cache["disabled"]
+
+
+def _caller_identity() -> tuple[str, str]:
+    """Who is calling, and how that was established.
+
+    Cloudflare Access is the only source the caller cannot choose for itself, so it
+    wins. The header and the address are recorded with their weaker provenance
+    rather than dropped, so the log is still readable before Access is in place.
+    """
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        return ("local-stdio", "stdio")
+    headers = request.headers
+    email = headers.get("cf-access-authenticated-user-email", "").strip()
+    if email:
+        return (email, "cf-access")
+    client_id = headers.get("cf-access-client-id", "").strip()
+    if client_id:
+        return (client_id, "cf-service-token")
+    name = headers.get("x-honcho-user-name", "").strip()
+    if name:
+        return (name, "x-honcho-user-name")
+    host = getattr(getattr(request, "client", None), "host", "") or ""
+    return (host or "unknown", "address")
+
+
+def _bind_arguments(
+    fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        return dict(inspect.signature(fn).bind_partial(*args, **kwargs).arguments)
+    except TypeError:
+        return dict(kwargs)
+
+
+def _audit_workspace(arguments: dict[str, Any]) -> str | None:
+    try:
+        return _resolve_defaults(workspace_id=arguments.get("workspace_id"))[
+            "workspace_id"
+        ]
+    except Exception:  # noqa: BLE001 - never let bookkeeping break a tool
+        return arguments.get("workspace_id")
+
+
 def register_tool(*, name: str):
-    if name in DISABLED_TOOL_NAMES:
+    """Register one tool, routed through the audit log and the Jev gate.
+
+    Every tool goes through here, so this is the single place that records what was
+    asked and the single place a query can be refused. Nested calls (``get_metadata``
+    reaching for ``inspect_workspace``) are logged once, at the outermost call.
+    """
+    if not _tool_is_registered(name):
 
         def _disabled(fn):
             return fn
 
         return _disabled
-    return mcp.tool(name=name)
+
+    def _decorator(fn: Any) -> Any:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            depth = getattr(_call_depth, "value", 0)
+            if depth:
+                return fn(*args, **kwargs)
+            started = time.perf_counter()
+
+            def elapsed_ms() -> int:
+                return int((time.perf_counter() - started) * 1000)
+
+            # Set inside the try, so that a failure while gathering the call's own
+            # details still restores the depth. A thread left at depth 1 would skip
+            # the audit log for every later call that lands on it.
+            try:
+                _call_depth.value = depth + 1
+                arguments = _bind_arguments(fn, args, kwargs)
+                caller, caller_source = _caller_identity()
+                workspace_id = _audit_workspace(arguments)
+                if name in _currently_disabled():
+                    audit.record(
+                        tool=name,
+                        caller=caller,
+                        caller_source=caller_source,
+                        arguments=arguments,
+                        workspace_id=workspace_id,
+                        status="denied",
+                        error="tool disabled by configuration",
+                        duration_ms=elapsed_ms(),
+                    )
+                    raise RuntimeError(f"Tool is disabled on this MCP server: {name}")
+
+                verdict = jev_gate.judge(
+                    tool=name,
+                    query=audit.query_text_of(arguments) or "",
+                    caller=caller,
+                    workspace_id=workspace_id,
+                )
+                if not verdict.allowed:
+                    audit.record(
+                        tool=name,
+                        caller=caller,
+                        caller_source=caller_source,
+                        arguments=arguments,
+                        workspace_id=workspace_id,
+                        status="denied",
+                        error=verdict.reason,
+                        duration_ms=elapsed_ms(),
+                        jev_score=verdict.score,
+                    )
+                    raise RuntimeError(jev_gate.MESSAGE)
+
+                try:
+                    result = fn(*args, **kwargs)
+                except Exception as exc:
+                    audit.record(
+                        tool=name,
+                        caller=caller,
+                        caller_source=caller_source,
+                        arguments=arguments,
+                        workspace_id=workspace_id,
+                        status="error",
+                        error=f"{type(exc).__name__}: {exc}",
+                        duration_ms=elapsed_ms(),
+                        jev_score=verdict.score,
+                    )
+                    raise
+                audit.record(
+                    tool=name,
+                    caller=caller,
+                    caller_source=caller_source,
+                    arguments=arguments,
+                    workspace_id=workspace_id,
+                    status="ok",
+                    duration_ms=elapsed_ms(),
+                    jev_score=verdict.score,
+                )
+                return result
+            finally:
+                _call_depth.value = depth
+
+        return mcp.tool(name=name)(wrapper)
+
+    return _decorator
 
 
 def _require_auth() -> None:
@@ -141,11 +334,14 @@ def _resolve_defaults(
     user_name: str | None = None,
     assistant_name: str | None = None,
 ) -> dict[str, str]:
-    try:
-        headers = get_http_request().headers
-    except RuntimeError:
-        # Local stdio clients have no HTTP request context and use env defaults.
-        headers = {}
+    if PIN_DEFAULTS:
+        headers: Any = {}
+    else:
+        try:
+            headers = get_http_request().headers
+        except RuntimeError:
+            # Local stdio clients have no HTTP request context and use env defaults.
+            headers = {}
     return {
         "workspace_id": workspace_id
         or headers.get("x-honcho-workspace-id")
@@ -875,6 +1071,60 @@ def get_queue_status(
         }
     )
     return _request("GET", f"/v3/workspaces/{ws}/queue/status", params=params)
+
+
+# --------------------------------------------------------------------- audit read
+
+
+def _audit_read_authorized(request: Any) -> bool:
+    if not OPTIONAL_BEARER_TOKEN:
+        return False
+    auth = request.headers.get("authorization", "")
+    return secrets.compare_digest(auth, f"Bearer {OPTIONAL_BEARER_TOKEN}")
+
+
+def _int_param(params: Any, name: str, default: int | None) -> int | None:
+    raw = params.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+if audit.READ_ENABLED:
+
+    @mcp.custom_route("/audit", methods=["GET"])
+    async def audit_read(request: Any) -> Any:
+        """The owner's read of the audit log.
+
+        Off unless HONCHO_AUDIT_READ is set, so the bridge teammates talk to never
+        serves it. The dashboard is the only intended caller.
+        """
+        import asyncio
+
+        from starlette.responses import JSONResponse
+
+        if not _audit_read_authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        params = request.query_params
+        try:
+            payload = await asyncio.to_thread(
+                audit.read,
+                limit=_int_param(params, "limit", 100) or 100,
+                caller=params.get("caller") or None,
+                tool=params.get("tool") or None,
+                status=params.get("status") or None,
+                bridge=params.get("bridge") or None,
+                hours=_int_param(params, "hours", None),
+            )
+        except Exception as exc:  # noqa: BLE001 - reported to the dashboard as JSON
+            logger.warning("audit read failed: %s: %s", type(exc).__name__, exc)
+            return JSONResponse(
+                {"error": "audit read failed", "detail": str(exc)}, status_code=500
+            )
+        return JSONResponse(payload)
 
 
 if __name__ == "__main__":

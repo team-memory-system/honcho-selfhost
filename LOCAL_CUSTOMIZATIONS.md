@@ -33,8 +33,19 @@ state, logs, generated dependencies, backups, and LaunchAgent-local secrets.
 
 The local MCP bridge source lives in `local-mcp-bridge/`. Its host-specific
 tool state belongs in `~/.config/honcho/mcp-bridge/`, and its logs belong in
-`~/Library/Logs/Honcho/`. The official upstream `mcp/` directory is a separate
-Cloudflare Worker and must not absorb the local Python bridge.
+`~/Library/Logs/Honcho/`.
+
+The upstream `mcp/` directory is not a substitute for it. As of upstream
+`2ad56a4d` (2026-09-02) `mcp/` is self-hostable — it has `src/http.ts` on
+`Bun.serve`, a `Dockerfile`, and an `mcp:` service in
+`docker-compose.yml.example` — so "it is only a Cloudflare Worker" is no longer
+the reason to keep them apart. The reason is what `local-mcp-bridge/server.py`
+does that upstream's does not: it narrows the tool list per caller
+(`HONCHO_MCP_ENABLED_TOOLS`), ignores the `x-honcho-*` headers on a shared
+bridge (`HONCHO_MCP_PIN_DEFAULTS`), records every call with its query text
+(`audit.py`), and can refuse a query before it reaches Honcho
+(`jev_gate.py`). Those live in `register_tool`, which is the single place every
+one of its tools passes through. The two can run side by side.
 
 ## Updating Honcho
 
@@ -86,6 +97,26 @@ do not preserve the intent of separate custom features. Release merges keep an
 auditable history, use the true common ancestor even after many skipped
 versions, and allow the full candidate to be tested without modifying the live
 checkout.
+
+## Reproducible stack (2026-09-28)
+
+`docker-compose.yml` is in `.gitignore` and only ever described one machine.
+`docker-compose.selfhost.yml` is tracked and holds the whole stack: the API, the
+deriver, the database, the cache, both MCP bridges and the dashboard. It is named
+so that `docker compose` never auto-loads it — pass it with `-f`.
+
+Two bridges run from one image. `mcp-bridge` is the owner's, with the tool set
+the dashboard controls and the audit read enabled. `mcp-bridge-shared` is what
+teammates reach: `HONCHO_MCP_ENABLED_TOOLS=chat`, pinned defaults, no audit read.
+
+The audit log lives in its own schema (`HONCHO_AUDIT_SCHEMA`, default
+`honcho_audit`) inside the Honcho database, created on first write. `DB.SCHEMA`
+being configurable is what makes that safe: no alembic migration ever sees it,
+so it costs nothing at merge time and Honcho's own source is unchanged.
+
+The Jev gate is off unless `HONCHO_JEV_GATE` is set. It uses `typesafe_sdk`
+directly, imported on first use, and `HONCHO_JEV_FAIL_MODE` decides whether a
+Jev outage forwards the query or refuses it.
 
 ## Independent LLM proxy (2026-09-23)
 

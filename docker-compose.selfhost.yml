@@ -1,0 +1,204 @@
+# Self-hosted Honcho, as one stack.
+#
+# This file is tracked; `docker-compose.yml` is in .gitignore and only ever
+# described this machine. Everything needed to reproduce the running system on
+# another computer is here: the API, the deriver, the database, the cache, the
+# two MCP bridges and the dashboard.
+#
+# The name is deliberate. `docker compose` auto-loads `compose.yaml`,
+# `compose.yml` and `docker-compose.yml`, so a file named any of those would
+# silently take over every bare `docker compose` call in this directory. Pass
+# this one explicitly:
+#
+#   docker compose -f docker-compose.selfhost.yml up -d
+#
+# Two bridges run from the same image. `mcp-bridge` is the owner's, with the
+# tool set the dashboard controls. `mcp-bridge-shared` is what teammates reach
+# through Cloudflare: one tool, and it ignores the x-honcho-* headers so a
+# caller cannot aim it at another workspace.
+#
+# Every host path comes from HONCHO_CONFIG_DIR, and it has no default. Compose
+# evaluates a nested default eagerly, so falling back to the home directory would
+# still demand that variable - and Windows has none. One required setting is
+# honest, and Compose reads it from the `.env` beside this file:
+#
+#   macOS / Linux    HONCHO_CONFIG_DIR=/Users/you/.config/honcho
+#   Windows          HONCHO_CONFIG_DIR=C:\Users\you\.config\honcho
+#
+# Unset, the command stops with that message instead of binding a wrong directory.
+
+x-honcho-build: &honcho-build
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-honcho-db: &honcho-db
+  DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@database:5432/postgres
+  CACHE_URL: redis://redis:6379/0?suppress=true
+  CACHE_ENABLED: "true"
+
+x-bridge: &bridge
+  build:
+    context: ./local-mcp-bridge
+    dockerfile: Dockerfile
+  depends_on:
+    api:
+      condition: service_started
+    database:
+      condition: service_healthy
+  restart: unless-stopped
+
+x-bridge-env: &bridge-env
+  HONCHO_BASE_URL: http://api:8000
+  HONCHO_MCP_HOST: 0.0.0.0
+  HONCHO_MCP_PORT: "8765"
+  HONCHO_MCP_PATH: /mcp
+  HONCHO_MCP_TIMEOUT: "300"
+  HONCHO_MCP_REQUIRE_AUTH: "1"
+  HONCHO_MCP_BEARER_TOKEN_FILE: /run/secrets/bearer-token
+  HONCHO_MCP_TOOL_CONFIG: /config/tool-config.json
+  HONCHO_WORKSPACE_ID: ${HONCHO_WORKSPACE_ID:-memory}
+  HONCHO_USER_NAME: ${HONCHO_USER_NAME:-user_chen}
+  # The audit log lives in a schema of its own inside the Honcho database, so it
+  # never meets an alembic migration.
+  HONCHO_AUDIT_DSN: postgresql://postgres:postgres@database:5432/postgres
+  HONCHO_AUDIT_SCHEMA: ${HONCHO_AUDIT_SCHEMA:-honcho_audit}
+  HONCHO_AUDIT_RETENTION_DAYS: ${HONCHO_AUDIT_RETENTION_DAYS:-0}
+  HONCHO_AUDIT_STORE_QUERY_TEXT: ${HONCHO_AUDIT_STORE_QUERY_TEXT:-1}
+
+services:
+  api:
+    <<: *honcho-build
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${HONCHO_API_PORT:-8001}:8000"
+    environment: *honcho-db
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+
+  deriver:
+    <<: *honcho-build
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment: *honcho-db
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; os.kill(1, 0)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  database:
+    image: pgvector/pgvector:pg15
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${HONCHO_DB_PORT:-5432}:5432"
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8.2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${HONCHO_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # The owner's bridge: every tool the dashboard leaves on, plus the audit read.
+  mcp-bridge:
+    <<: *bridge
+    environment:
+      <<: *bridge-env
+      HONCHO_ASSISTANT_NAME: ${HONCHO_ASSISTANT_NAME:-assistant}
+      HONCHO_MCP_REQUIRE_TOOL_CONFIG: "1"
+      HONCHO_AUDIT_BRIDGE: personal
+      HONCHO_AUDIT_READ: "1"
+    ports:
+      - "127.0.0.1:${MCP_BRIDGE_PORT:-8766}:8765"
+    volumes:
+      - ${MCP_BRIDGE_CONFIG_DIR:-${HONCHO_CONFIG_DIR:?set HONCHO_CONFIG_DIR in the .env beside this file, e.g. /Users/you/.config/honcho}/mcp-bridge}:/config:ro
+      - ${MCP_BRIDGE_TOKEN_FILE:-${HONCHO_CONFIG_DIR:?set HONCHO_CONFIG_DIR in the .env beside this file, e.g. /Users/you/.config/honcho}/mcp-bridge/bearer-token}:/run/secrets/bearer-token:ro
+
+  # The teammates' bridge. One tool, pinned defaults, no audit read.
+  mcp-bridge-shared:
+    <<: *bridge
+    environment:
+      <<: *bridge-env
+      HONCHO_ASSISTANT_NAME: ${HONCHO_USER_NAME:-user_chen}
+      HONCHO_MCP_ENABLED_TOOLS: ${MCP_SHARED_TOOLS:-chat}
+      HONCHO_MCP_PIN_DEFAULTS: "1"
+      HONCHO_MCP_HIDE_PEER_CARDS: "1"
+      HONCHO_MCP_REQUIRE_TOOL_CONFIG: "0"
+      HONCHO_AUDIT_BRIDGE: shared
+      HONCHO_AUDIT_READ: "0"
+      # Judgment gate. Off until HONCHO_JEV_GATE is set and a key is present.
+      HONCHO_JEV_GATE: ${HONCHO_JEV_GATE:-0}
+      HONCHO_JEV_FAIL_MODE: ${HONCHO_JEV_FAIL_MODE:-open}
+      HONCHO_JEV_THRESHOLD: ${HONCHO_JEV_THRESHOLD:-0.7}
+      HONCHO_JEV_TOOLS: ${HONCHO_JEV_TOOLS:-chat}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+    ports:
+      - "127.0.0.1:${MCP_BRIDGE_SHARED_PORT:-8767}:8765"
+    volumes:
+      - ${MCP_BRIDGE_SHARED_CONFIG_DIR:-${HONCHO_CONFIG_DIR:?set HONCHO_CONFIG_DIR in the .env beside this file, e.g. /Users/you/.config/honcho}/coworker-mcp}:/config:ro
+      - ${MCP_BRIDGE_SHARED_TOKEN_FILE:-${HONCHO_CONFIG_DIR:?set HONCHO_CONFIG_DIR in the .env beside this file, e.g. /Users/you/.config/honcho}/coworker-mcp/bearer-token}:/run/secrets/bearer-token:ro
+
+  dashboard:
+    build:
+      context: ./local-dashboard
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      HONCHO_URL: http://api:8000
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: "4173"
+      # In a container there is no launchctl; the dashboard edits the tool config
+      # file and the bridge re-reads it on the next call.
+      MCP_CONTROL_MODE: file
+      HONCHO_MCP_TOOL_CONFIG: /config/tool-config.json
+      HONCHO_MCP_AUDIT_URL: http://mcp-bridge:8765/audit
+      HONCHO_MCP_BEARER_TOKEN_FILE: /run/secrets/bearer-token
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-4173}:4173"
+    volumes:
+      - ${MCP_BRIDGE_CONFIG_DIR:-${HONCHO_CONFIG_DIR:?set HONCHO_CONFIG_DIR in the .env beside this file, e.g. /Users/you/.config/honcho}/mcp-bridge}:/config
+      - ${MCP_BRIDGE_TOKEN_FILE:-${HONCHO_CONFIG_DIR:?set HONCHO_CONFIG_DIR in the .env beside this file, e.g. /Users/you/.config/honcho}/mcp-bridge/bearer-token}:/run/secrets/bearer-token:ro
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redis-data:
