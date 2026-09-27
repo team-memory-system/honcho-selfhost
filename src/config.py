@@ -1450,10 +1450,6 @@ class AppSettings(HonchoSettings):
         "https://api.honcho.dev",
     ]
 
-    # Keep the upstream default permissive. Self-hosted profiles can restrict
-    # this to their loopback and Compose service names to prevent DNS rebinding.
-    TRUSTED_HOSTS: list[str] = ["*"]
-
     COLLECT_METRICS_LOCAL: bool = False
     LOCAL_METRICS_FILE: str = "metrics.jsonl"
     REASONING_TRACES_FILE: str | None = None  # Path to JSONL file for reasoning traces
