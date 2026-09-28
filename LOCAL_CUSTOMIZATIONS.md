@@ -20,6 +20,12 @@ official Honcho release and a small set of local commits.
 
 ## What belongs in Git
 
+`AGENTS.md` at the repository root is local, not upstream's. It is the orientation
+document for anyone — person or agent — arriving in this fork, and it points back
+here for the detail. Upstream's `.gitignore` excludes that filename so a
+contributor's own notes stay untracked; this fork adds a one-line `!AGENTS.md`
+exception so the document travels with a clone.
+
 Keep local changes as narrow, independently revertible commits:
 
 1. Self-host companion applications (dashboard and local MCP

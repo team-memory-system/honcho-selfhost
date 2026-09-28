@@ -1,0 +1,140 @@
+# Working in this fork
+
+`README.md` and `CLAUDE.md` in this repository are upstream's. This file is local,
+and it is the one to read first.
+
+## What this is
+
+A maintained fork of [`plastic-labs/honcho`](https://github.com/plastic-labs/honcho),
+AGPL-3.0, run as one person's private memory server. `.honcho-upstream-version`
+records which official release the fork is currently based on.
+
+One of three repositories in the memory system:
+
+| Repository | What it is | Installed where |
+|---|---|---|
+| **`honcho-selfhost`** (this one) | The memory server, plus the MCP bridge and dashboard | One computer per person |
+| [`honcho-agent-bridge`](https://github.com/team-memory-system/honcho-agent-bridge) | Collector, installer, agent plugin | Every machine that runs an agent |
+| [`llm-proxy`](https://github.com/team-memory-system/llm-proxy) | Subscription-to-API adapters and a router | Only the computer that runs Honcho |
+
+**Topology.** One Honcho and one database per person; that person's several machines
+all feed the same one. Teammates do not share a database. What is shared is a single
+MCP tool, `chat`, served by a second bridge process with its own narrowed tool list.
+
+## The rule that shapes everything here
+
+**Upstream keeps moving, and this fork keeps merging it.** So every local change is
+written to be as small and as revertible as possible, and to touch files upstream is
+unlikely to touch. `LOCAL_CUSTOMIZATIONS.md` enumerates what differs and why.
+
+Two worked examples of what that discipline buys:
+
+- The retrieval-instruction feature used to add `embed_query()` and change 13 call
+  sites. Those 13 files then conflicted on every merge. It now reads the
+  `embedding_call_purpose` ContextVar that upstream already sets, inside `_prepare()`,
+  so the call sites are upstream's own code. Merging the next release touches
+  **two** files instead of fourteen.
+- The audit log lives in its own database schema, created on first write. `DB.SCHEMA`
+  being configurable is what makes that safe: no alembic migration ever sees the
+  table, so it costs nothing at merge time and Honcho's own source is unchanged.
+
+### Merging a new release
+
+Use the script. Do not merge a tag directly on `main`.
+
+```sh
+scripts/prepare_upstream_update.sh          # newest official tag
+scripts/prepare_upstream_update.sh v3.2.1   # a specific one
+```
+
+It refuses a dirty `main`, refuses a tag that is not a descendant of the recorded
+base, and does the merge in a throwaway worktree under `.worktrees/` so the
+production checkout is never mid-merge. `rerere` is on, so a resolution you make
+once is reapplied. Promote with `scripts/promote_upstream_update.sh`.
+
+## Running it
+
+```sh
+docker compose -f docker-compose.selfhost.yml up -d
+```
+
+- `docker-compose.selfhost.yml` is **tracked** and describes the whole stack: api,
+  deriver, database, redis, two MCP bridges, dashboard.
+- `docker-compose.yml` is in `.gitignore` and only ever described one machine. The
+  tracked file is deliberately named so `docker compose` never auto-loads it; pass
+  `-f`.
+- `HONCHO_CONFIG_DIR` has no default and must be set, in the `.env` beside the
+  compose file. Compose evaluates a nested default eagerly, so falling back to the
+  home directory would still demand a variable Windows does not have. Unset, the
+  command stops and says so.
+
+**Never pass `--build` unless you mean to ship the current working tree to the
+running system.** The images are built from this checkout. A rebuild while something
+is uncommitted deploys that something.
+
+## The MCP bridge
+
+`local-mcp-bridge/server.py`. Imports zero Honcho code — it is an HTTP client — which
+is why it can live here at no merge cost. 31 tools.
+
+Everything that matters hangs off one function, `register_tool`:
+
+| Concern | Where |
+|---|---|
+| Audit log, with the query text | `audit.py` |
+| Refusing a query before it reaches Honcho | `jev_gate.py` |
+| Runtime tool toggles from the dashboard | `_currently_disabled()` |
+
+Two processes run from one image:
+
+| | Tools | Headers | Audit read |
+|---|---|---|---|
+| `mcp-bridge` | Whatever the dashboard leaves on | Honoured | Yes |
+| `mcp-bridge-shared` | `HONCHO_MCP_ENABLED_TOOLS=chat` | Ignored (`HONCHO_MCP_PIN_DEFAULTS`) | No |
+
+An allowlist, not a denylist: a 30-name denylist silently widens every time upstream
+adds a tool.
+
+The audit log must never break a tool call. `audit.record` swallows everything, the
+connection has a timeout and backs off after a failure, and with no DSN it does
+nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set.
+
+## Open items an agent should know about
+
+- **Auth is off.** `AUTH_USE_AUTH=false`, so `src/security.py` returns admin for every
+  request. Turning it on is four simultaneous edits (this `.env`, the REST proxy, the
+  bridge, the collector's environment) and will break live collection if done partly.
+- **`TRUSTED_HOSTS` was removed and should probably go back.** See the commit
+  `revert(security)`. Upstream has no such middleware, so removing it only reduced
+  merge surface — but it was the only DNS-rebinding defence while a REST endpoint is
+  reachable from outside, and no replacement was added. The release builder still
+  emits a `TRUSTED_HOSTS` setting that nothing reads.
+- **`v3.2.1` is not merged yet.** Three conflict hunks, all mechanical: one argument
+  list in `src/embedding_client.py` where upstream added `on_oversize` and this fork
+  added `_prepare`, and two import blocks in the matching test. The upstream machinery
+  this fork depends on is intact at that tag — the ContextVar, the purpose enum, and
+  all ten of its values.
+- **The two bridge bearer tokens are currently identical.** Whoever holds the
+  teammates' token can also call the owner's bridge.
+
+## Verify a change
+
+```sh
+uv run pytest tests/llm tests/test_security.py -q      # no database needed
+cd local-mcp-bridge  && uv run pytest -q && uv run ruff check .
+cd local-dashboard   && npm test
+```
+
+Database-backed suites need the `database` host name from inside Compose; they do not
+run from the host with this `.env`.
+
+Two tests exist to fail loudly rather than degrade quietly:
+`test_query_purposes_partition_upstream_taxonomy` (an upstream purpose nobody
+classified) and `test_exactly_the_query_paths_route_through_prepare` (the wiring
+being removed while the taxonomy still looks right).
+
+## Secrets
+
+Never in this repository. `.env` is ignored. The bridge reads its bearer token from a
+file (`scripts/write_bridge_secrets.sh` / `.ps1` populate it from 1Password), so no
+token sits in a plist, a compose file, or `docker inspect`.

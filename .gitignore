@@ -196,7 +196,10 @@ CRUSH.md
 .crush/
 
 metrics.jsonl
-AGENTS.md
+# Upstream ignores AGENTS.md so a contributor's local agent notes stay out of the
+# tree. This fork tracks it instead: it is the orientation document for anyone
+# arriving here, and agents look for it by that name.
+!AGENTS.md
 lancedb_data/
 grafana-data/
 
