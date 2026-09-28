@@ -351,6 +351,38 @@ def register_tool(*, name: str):
     return _decorator
 
 
+class BearerGate:
+    """Refuse the MCP endpoint without the bearer token, before any message is read.
+
+    `_require_auth` only runs when a tool reaches Honcho, so without this a wrong
+    token still completed `initialize` and listed every tool. A client checking its
+    connection then saw success and failed on the first real question.
+    `_require_auth` stays as the second check.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (
+            scope["type"] == "http"
+            and OPTIONAL_BEARER_TOKEN
+            and scope.get("path", "").rstrip("/") == MCP_PATH.rstrip("/")
+        ):
+            presented = dict(scope.get("headers") or []).get(b"authorization", b"")
+            expected = f"Bearer {OPTIONAL_BEARER_TOKEN}".encode()
+            if not secrets.compare_digest(presented, expected):
+                from starlette.responses import JSONResponse
+
+                response = JSONResponse(
+                    {"error": "Unauthorized: missing or invalid bearer token"},
+                    status_code=401,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def _require_auth() -> None:
     if MCP_TRANSPORT == "stdio":
         return
@@ -1205,10 +1237,13 @@ if __name__ == "__main__":
     if MCP_TRANSPORT == "stdio":
         mcp.run(transport="stdio", show_banner=False)
     else:
+        from starlette.middleware import Middleware
+
         mcp.run(
             transport="streamable-http",
             host=LISTEN_HOST,
             port=LISTEN_PORT,
             path=MCP_PATH,
             show_banner=False,
+            middleware=[Middleware(BearerGate)],
         )

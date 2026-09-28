@@ -96,6 +96,12 @@ The pin checks every argument listed in `PEER_ARGUMENTS`, plus `workspace_id`, a
 refuses `filters` outright. `test_every_peer_argument_is_pinned` fails when a tool
 gains a peer-naming argument that is not in that list.
 
+In front of all of it, `BearerGate` refuses the MCP endpoint at the HTTP layer when
+the bearer token is missing or wrong. `_require_auth` only runs once a tool reaches
+Honcho, so before the gate a wrong token still completed `initialize` and listed the
+tools, and a teammate's connection check reported success. `_require_auth` stays as
+the second check.
+
 An allowlist, not a denylist: a 30-name denylist silently widens every time upstream
 adds a tool.
 
