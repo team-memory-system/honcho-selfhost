@@ -47,8 +47,9 @@ The upstream `mcp/` directory is not a substitute for it. As of upstream
 `docker-compose.yml.example` — so "it is only a Cloudflare Worker" is no longer
 the reason to keep them apart. The reason is what `local-mcp-bridge/server.py`
 does that upstream's does not: it narrows the tool list per caller
-(`HONCHO_MCP_ENABLED_TOOLS`), ignores the `x-honcho-*` headers on a shared
-bridge (`HONCHO_MCP_PIN_DEFAULTS`), records every call with its query text
+(`HONCHO_MCP_ENABLED_TOOLS`), fixes a shared bridge to its own workspace and
+peers, ignoring the `x-honcho-*` headers and refusing arguments that name others
+(`HONCHO_MCP_PIN_DEFAULTS`), records every call with its query text
 (`audit.py`), and can refuse a query before it reaches Honcho
 (`jev_gate.py`). Those live in `register_tool`, which is the single place every
 one of its tools passes through. The two can run side by side.

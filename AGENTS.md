@@ -87,10 +87,14 @@ Everything that matters hangs off one function, `register_tool`:
 
 Two processes run from one image:
 
-| | Tools | Headers | Audit read |
+| | Tools | Workspace and peers | Audit read |
 |---|---|---|---|
-| `mcp-bridge` | Whatever the dashboard leaves on | Honoured | Yes |
-| `mcp-bridge-shared` | `HONCHO_MCP_ENABLED_TOOLS=chat` | Ignored (`HONCHO_MCP_PIN_DEFAULTS`) | No |
+| `mcp-bridge` | Whatever the dashboard leaves on | Caller's choice, by header or argument | Yes |
+| `mcp-bridge-shared` | `HONCHO_MCP_ENABLED_TOOLS=chat` | Fixed: headers ignored, arguments naming others refused (`HONCHO_MCP_PIN_DEFAULTS`) | No |
+
+The pin checks every argument listed in `PEER_ARGUMENTS`, plus `workspace_id`, and
+refuses `filters` outright. `test_every_peer_argument_is_pinned` fails when a tool
+gains a peer-naming argument that is not in that list.
 
 An allowlist, not a denylist: a 30-name denylist silently widens every time upstream
 adds a tool.

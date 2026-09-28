@@ -379,3 +379,160 @@ def test_pinned_defaults_ignore_client_headers(monkeypatch: pytest.MonkeyPatch) 
     resolved = server._resolve_defaults()
     assert resolved["workspace_id"] == server.DEFAULT_WORKSPACE_ID
     assert resolved["user_name"] == server.DEFAULT_USER_NAME
+
+
+# ------------------------------------------------------------ pinned arguments
+
+#: Every tool registered, so each one's arguments can be tried against the pin.
+_ALL_TOOLS_ENV = {
+    "HONCHO_MCP_TOOL_CONFIG": "/nonexistent/tool-config.json",
+    "HONCHO_MCP_REQUIRE_TOOL_CONFIG": "0",
+    "HONCHO_MCP_ENABLED_TOOLS": "",
+    "HONCHO_MCP_HIDE_PEER_CARDS": "0",
+}
+
+
+@pytest.fixture
+def pinned(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A shared bridge with every tool registered.
+
+    Patch `_request` in the test body, not with `no_upstream`: this reload would
+    undo a patch applied before it.
+    """
+    fresh = _reload_server(
+        monkeypatch, {**_ALL_TOOLS_ENV, "HONCHO_MCP_PIN_DEFAULTS": "1"}
+    )
+    monkeypatch.setattr(
+        fresh, "get_http_request", lambda: SimpleNamespace(headers={}, client=None)
+    )
+    return fresh
+
+
+@pytest.mark.parametrize(
+    ("call", "argument"),
+    [
+        pytest.param(
+            lambda m: m.chat("q", workspace_id="different-workspace"),
+            "workspace_id",
+            id="chat-workspace",
+        ),
+        pytest.param(
+            lambda m: m.chat("q", peer_id="different-peer"),
+            "peer_id",
+            id="chat-observer",
+        ),
+        pytest.param(
+            lambda m: m.chat("q", target_peer_id="different-peer"),
+            "target_peer_id",
+            id="chat-target",
+        ),
+        pytest.param(
+            lambda m: m.get_representation("different-peer"),
+            "peer_id",
+            id="positional-peer",
+        ),
+        pytest.param(
+            lambda m: m.query_conclusions(
+                "q",
+                observer_id=m.DEFAULT_USER_NAME,
+                observed_id=m.DEFAULT_USER_NAME,
+                filters={"observer": "different-peer"},
+            ),
+            "filters",
+            id="filters-override-observer",
+        ),
+        pytest.param(
+            lambda m: m.remove_peers_from_session("s", ["different-peer"]),
+            "peer_ids",
+            id="peer-id-list",
+        ),
+        pytest.param(
+            lambda m: m.create_session("s", peers={"different-peer": {}}),
+            "peers",
+            id="peer-map",
+        ),
+        pytest.param(
+            lambda m: m.add_messages_to_session(
+                "s", [{"peer_id": "different-peer", "content": "x"}]
+            ),
+            "messages",
+            id="message-peer",
+        ),
+    ],
+)
+def test_a_pinned_bridge_refuses_arguments_that_point_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+    pinned: Any,
+    audited: list[dict[str, Any]],
+    call: Any,
+    argument: str,
+) -> None:
+    """Ignoring the headers is not enough when the same values can be arguments."""
+
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("A call aimed past the pin was forwarded to Honcho")
+
+    monkeypatch.setattr(pinned, "_request", unexpected)
+
+    with pytest.raises(RuntimeError, match=f"^{argument} cannot"):
+        call(pinned)
+
+    assert audited[-1]["status"] == "denied"
+    assert audited[-1]["error"].startswith(argument)
+
+
+def test_a_pinned_bridge_accepts_its_own_values(
+    monkeypatch: pytest.MonkeyPatch, pinned: Any, audited: list[dict[str, Any]]
+) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(
+        pinned, "_request", lambda method, path, **_: seen.append(path) or {"ok": True}
+    )
+
+    pinned.chat("q")
+    pinned.chat(
+        "q",
+        workspace_id=pinned.DEFAULT_WORKSPACE_ID,
+        peer_id=pinned.DEFAULT_ASSISTANT_NAME,
+        target_peer_id=pinned.DEFAULT_USER_NAME,
+    )
+
+    own = (
+        f"/v3/workspaces/{pinned.DEFAULT_WORKSPACE_ID}"
+        f"/peers/{pinned.DEFAULT_ASSISTANT_NAME}/chat"
+    )
+    assert seen == [own, own]
+    assert [row["status"] for row in audited] == ["ok", "ok"]
+
+
+def test_an_unpinned_bridge_still_follows_arguments(
+    monkeypatch: pytest.MonkeyPatch, audited: list[dict[str, Any]]
+) -> None:
+    """The owner's own bridge keeps reaching any workspace and peer."""
+    seen: list[str] = []
+    monkeypatch.setattr(server, "PIN_DEFAULTS", False)
+    monkeypatch.setattr(
+        server, "_request", lambda method, path, **_: seen.append(path) or {"ok": True}
+    )
+    monkeypatch.setattr(
+        server, "get_http_request", lambda: SimpleNamespace(headers={}, client=None)
+    )
+
+    server.chat("q", workspace_id="other-workspace", peer_id="other-peer")
+
+    assert seen == ["/v3/workspaces/other-workspace/peers/other-peer/chat"]
+
+
+def test_every_peer_argument_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tool argument that names a peer is only safe on a shared bridge if the pin
+    checks it. A new one, from upstream or from us, has to be added deliberately."""
+    fresh = _reload_server(monkeypatch, _ALL_TOOLS_ENV)
+    named = {
+        argument
+        for tool in asyncio.run(fresh.mcp.list_tools())
+        for argument in tool.parameters.get("properties", {})
+        if any(word in argument for word in ("peer", "observe", "sender", "target"))
+    }
+    # peer_card is the card's text, not a peer id.
+    unpinned = named - {"peer_card"} - fresh.PEER_ARGUMENTS
+    assert not unpinned, sorted(unpinned)

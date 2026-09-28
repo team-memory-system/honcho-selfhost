@@ -78,9 +78,29 @@ ENABLED_TOOL_NAMES: frozenset[str] | None = (
     else None
 )
 
-#: Ignore the x-honcho-* request headers. A shared bridge must not let its callers
-#: point themselves at another workspace or peer.
+#: Ignore the x-honcho-* request headers and refuse tool arguments that name another
+#: workspace or peer. A shared bridge must not let its callers point themselves
+#: elsewhere, by header or by argument.
 PIN_DEFAULTS = _env_flag("HONCHO_MCP_PIN_DEFAULTS")
+
+#: Tool arguments that name peers, as one id, a list of ids, or peer and message
+#: objects. On a pinned bridge each must be omitted or name only the bridge's own
+#: peers. `test_every_peer_argument_is_pinned` fails when a tool gains one that is
+#: not listed here.
+PEER_ARGUMENTS = frozenset(
+    {
+        "messages",
+        "observed_id",
+        "observer_id",
+        "peer_id",
+        "peer_ids",
+        "peer_perspective",
+        "peer_target",
+        "peers",
+        "sender_id",
+        "target_peer_id",
+    }
+)
 
 if REQUIRE_AUTH and not OPTIONAL_BEARER_TOKEN:
     raise RuntimeError(
@@ -263,6 +283,20 @@ def register_tool(*, name: str):
                     )
                     raise RuntimeError(f"Tool is disabled on this MCP server: {name}")
 
+                violation = _pin_violation(arguments)
+                if violation:
+                    audit.record(
+                        tool=name,
+                        caller=caller,
+                        caller_source=caller_source,
+                        arguments=arguments,
+                        workspace_id=workspace_id,
+                        status="denied",
+                        error=violation,
+                        duration_ms=elapsed_ms(),
+                    )
+                    raise RuntimeError(violation)
+
                 verdict = jev_gate.judge(
                     tool=name,
                     query=audit.query_text_of(arguments) or "",
@@ -335,13 +369,18 @@ def _resolve_defaults(
     assistant_name: str | None = None,
 ) -> dict[str, str]:
     if PIN_DEFAULTS:
-        headers: Any = {}
-    else:
-        try:
-            headers = get_http_request().headers
-        except RuntimeError:
-            # Local stdio clients have no HTTP request context and use env defaults.
-            headers = {}
+        # The wrapper already refused a caller's other values. Ignoring them here
+        # as well keeps a nested call from reopening that.
+        return {
+            "workspace_id": DEFAULT_WORKSPACE_ID,
+            "user_name": DEFAULT_USER_NAME,
+            "assistant_name": DEFAULT_ASSISTANT_NAME,
+        }
+    try:
+        headers = get_http_request().headers
+    except RuntimeError:
+        # Local stdio clients have no HTTP request context and use env defaults.
+        headers = {}
     return {
         "workspace_id": workspace_id
         or headers.get("x-honcho-workspace-id")
@@ -353,6 +392,41 @@ def _resolve_defaults(
         or headers.get("x-honcho-assistant-name")
         or DEFAULT_ASSISTANT_NAME,
     }
+
+
+def _named_peers(value: Any) -> set[str]:
+    """Every peer id in one argument: an id, ids, a peer map, or peer/message items."""
+    if not value:
+        return set()
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, dict):
+        return {str(key) for key in value}
+    names: set[str] = set()
+    for item in value:
+        if isinstance(item, dict):
+            item = item.get("peer_id") or item.get("id")
+        if item:
+            names.add(str(item))
+    return names
+
+
+def _pin_violation(arguments: dict[str, Any]) -> str | None:
+    """Why a call on a pinned bridge reaches past its workspace or peers, if it does."""
+    if not PIN_DEFAULTS:
+        return None
+    workspace_id = arguments.get("workspace_id")
+    if workspace_id and workspace_id != DEFAULT_WORKSPACE_ID:
+        return "workspace_id cannot be changed on this MCP server; omit it"
+    # Honcho filters can name any peer, nested at any depth, and query_conclusions
+    # lets them override its observer_id. Checking them is not worth the risk.
+    if arguments.get("filters"):
+        return "filters cannot be used on this MCP server; omit them"
+    own_peers = {DEFAULT_USER_NAME, DEFAULT_ASSISTANT_NAME}
+    for key in sorted(PEER_ARGUMENTS):
+        if _named_peers(arguments.get(key)) - own_peers:
+            return f"{key} cannot name another peer on this MCP server; omit it"
+    return None
 
 
 def _require_card_access(path: str, params: dict[str, Any] | None) -> None:
