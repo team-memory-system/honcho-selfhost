@@ -97,16 +97,20 @@ for (const tool of mcpTools) {
   [tool.description, tool.translation] = mcpToolDescriptions[tool.name];
 }
 const mcpToolNames = new Set(mcpTools.map(tool => tool.name));
+// launchd labels are per-installation, so they come from the environment rather
+// than from this file. MCP_CONTROL_MODE=file skips launchd entirely.
+const BRIDGE_LABEL = process.env.HONCHO_BRIDGE_LAUNCHD_LABEL || "honcho-external-mcp";
+const TUNNEL_LABEL = process.env.HONCHO_TUNNEL_LAUNCHD_LABEL || "cloudflared.honcho-mcp";
 const mcpServices = [
   {
     id: "bridge",
-    label: "com.chenjing.honcho-external-mcp",
-    plist: join(process.env.HOME, "Library/LaunchAgents/com.chenjing.honcho-external-mcp.plist"),
+    label: BRIDGE_LABEL,
+    plist: join(process.env.HOME, `Library/LaunchAgents/${BRIDGE_LABEL}.plist`),
   },
   {
     id: "tunnel",
-    label: "com.chenjing.cloudflared.honcho-mcp",
-    plist: join(process.env.HOME, "Library/LaunchAgents/com.chenjing.cloudflared.honcho-mcp.plist"),
+    label: TUNNEL_LABEL,
+    plist: join(process.env.HOME, `Library/LaunchAgents/${TUNNEL_LABEL}.plist`),
   },
 ];
 
@@ -265,7 +269,7 @@ async function getMcpTools() {
   const disabled = await readDisabledTools();
   const bridge = mcpDryRun || mcpControlMode === "file"
     ? true
-    : await serviceLoaded("com.chenjing.honcho-external-mcp");
+    : await serviceLoaded(BRIDGE_LABEL);
   return {
     bridge_running: bridge,
     dry_run: mcpDryRun,
@@ -291,8 +295,8 @@ async function setMcpToolEnabled(name, enabled) {
       } finally {
         await fs.rm(tempPath, { force: true });
       }
-      if (mcpControlMode === "launchd" && await serviceLoaded("com.chenjing.honcho-external-mcp")) {
-        await execFileAsync("launchctl", ["kill", "SIGTERM", `${launchDomain}/com.chenjing.honcho-external-mcp`], { timeout: 5_000 });
+      if (mcpControlMode === "launchd" && await serviceLoaded(BRIDGE_LABEL)) {
+        await execFileAsync("launchctl", ["kill", "SIGTERM", `${launchDomain}/${BRIDGE_LABEL}`], { timeout: 5_000 });
       }
     }
   });

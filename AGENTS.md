@@ -124,8 +124,10 @@ nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set.
   added `_prepare`, and two import blocks in the matching test. The upstream machinery
   this fork depends on is intact at that tag — the ContextVar, the purpose enum, and
   all ten of its values.
-- **The two bridge bearer tokens are currently identical.** Whoever holds the
-  teammates' token can also call the owner's bridge.
+- **The two bridges need different bearer tokens.** They read
+  `HONCHO_MCP_BEARER_TOKEN_FILE`, and `scripts/write_bridge_secrets.sh` writes both
+  from 1Password. If one value is used for both, whoever holds the teammates'
+  token can also call the owner's bridge, so check that before handing one out.
 
 ## Verify a change
 

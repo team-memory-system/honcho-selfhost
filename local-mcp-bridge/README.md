@@ -9,15 +9,15 @@ is not part of the official upstream `mcp/` Cloudflare Worker.
 The tracked source and host-specific runtime state are deliberately separate:
 
 ```text
-/Users/chenjing/dev/honcho/local-mcp-bridge/  # Git-tracked source
-~/.config/honcho/mcp-bridge/                 # tool state and optional token
-~/Library/Logs/Honcho/                       # service logs
+<checkout>/local-mcp-bridge/    # Git-tracked source
+~/.config/honcho/mcp-bridge/    # tool state and optional token
+~/Library/Logs/Honcho/          # service logs
 ```
 
 The production-compatible endpoint remains `http://127.0.0.1:8766/mcp`, under
-the existing `com.chenjing.honcho-external-mcp` LaunchAgent label. Keeping the
-label, port, and bearer value stable allows existing Codex and tunnel clients
-to survive a source-path migration.
+whatever launchd label the installation already uses. Keeping the label, port,
+and bearer value stable allows existing Codex and tunnel clients to survive a
+source-path migration.
 
 The current Codex identity is carried in request headers:
 
@@ -28,7 +28,7 @@ The current Codex identity is carried in request headers:
 ## Install and test
 
 ```bash
-cd /Users/chenjing/dev/honcho/local-mcp-bridge
+cd <checkout>/local-mcp-bridge
 uv sync --frozen
 uv run ruff check server.py tests
 uv run pytest -q
@@ -87,10 +87,10 @@ and operational-inspection tool that is disabled in production.
 
 ## Separate coworker endpoint
 
-The dedicated `com.chenjing.honcho-coworker-mcp` LaunchAgent listens on
-`127.0.0.1:8767`, using its own tool configuration in
-`~/.config/honcho/coworker-mcp/tool-config.json`. Its public MCP URL is
-`https://honcho-coworker.chenjing.org/mcp`.
+A second launchd service listens on `127.0.0.1:8767`, using its own tool
+configuration in `~/.config/honcho/coworker-mcp/tool-config.json`. Its public
+MCP URL is whatever hostname the operator's tunnel maps to that port; the
+address is given to teammates directly and is not recorded here.
 
 This process sets `HONCHO_MCP_HIDE_PEER_CARDS=1`. The card tools are not
 registered, and session-context requests specifying `peer_target` are rejected.

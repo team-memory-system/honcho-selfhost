@@ -12,7 +12,7 @@
 #   env -u OP_SERVICE_ACCOUNT_TOKEN op item create --category="API Credential" \
 #     --vault Agent --title "honcho shared mcp bridge token" credential="$(openssl rand -hex 32)"
 #
-# Give the two bridges different tokens. They share one today, which means anyone
+# Give the two bridges different tokens. One value used for both means anyone
 # holding the teammates' token can also call the owner's bridge.
 set -eu
 

@@ -9,7 +9,7 @@ HONCHO_URL=http://127.0.0.1:8001 npm start
 
 브라우저에서 `http://127.0.0.1:4173`을 여세요.
 
-이 Mac에서는 `com.chenjing.honcho-dashboard` LaunchAgent가 Honcho API·MCP와 함께 로그인 시 자동 시작하고, 종료 시 자동 재시작합니다.
+이 대시보드를 launchd 서비스로 등록해 두면 Honcho API·MCP와 함께 로그인 시 자동 시작하고, 종료 시 자동 재시작합니다. 라벨은 설치마다 다릅니다.
 
 환경 변수:
 
@@ -31,5 +31,5 @@ Dialectic 화면은 두 모드를 지원합니다.
 
 사이드바의 `MCP 도구` 화면에서는 공식 Honcho 도구 30개와 로컬 `server_info`를 포함한 31개 도구를 각각 켜거나 끌 수 있습니다.
 Bridge의 도구 노출은 대시보드 설정 파일로만 제어하며 조회·쓰기·삭제·LLM 도구의 성격을 화면에서 구분합니다.
-변경 시 `com.chenjing.honcho-external-mcp` bridge만 재시작하며 Honcho API와 tunnel은 유지합니다.
+변경 시 bridge만 재시작하며 Honcho API와 tunnel은 유지합니다. 재시작할 launchd 라벨은 `HONCHO_BRIDGE_LAUNCHD_LABEL` 로 지정합니다.
 MCP 도구 제어 API는 localhost 요청만 허용합니다.
