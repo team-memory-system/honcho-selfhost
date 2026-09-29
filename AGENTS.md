@@ -119,11 +119,23 @@ nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set.
   merge surface — but it was the only DNS-rebinding defence while a REST endpoint is
   reachable from outside, and no replacement was added. The release builder still
   emits a `TRUSTED_HOSTS` setting that nothing reads.
-- **`v3.2.1` is not merged yet.** Three conflict hunks, all mechanical: one argument
-  list in `src/embedding_client.py` where upstream added `on_oversize` and this fork
-  added `_prepare`, and two import blocks in the matching test. The upstream machinery
-  this fork depends on is intact at that tag — the ContextVar, the purpose enum, and
-  all ten of its values.
+- **Based on `v3.2.1` since 2026-09-30.** The merge had three mechanical conflict
+  hunks: the `simple_batch_embed` call in `src/embedding_client.py` (upstream's
+  `on_oversize` plus this fork's `_prepare`), and import blocks there and in the
+  matching test. The fork's `RecordingInnerClient` test fake had to accept
+  `on_oversize` too. Deployed the same day; migration `a7c3e9f1b2d4`
+  (`document_sources`) ran, and the reconciler's new `backfill_document_sources`
+  task fills that table in the background.
+- **Testing a candidate from `.worktrees/`.** `src/config.py` calls
+  `load_dotenv(override=True)`, which walks up to the production checkout's `.env`
+  and overrides the environment. Run the suite with `PYTHON_DOTENV_DISABLED=1`,
+  `DB_CONNECTION_URI` pointing at a throwaway `pgvector/pgvector:pg15` container, and
+  that container started with `POSTGRES_HOST_AUTH_METHOD=trust` (the conftest renders
+  the URL with the password masked, as upstream CI does). The TypeScript SDK tests
+  also need `bun install` in `sdks/typescript`; the lancedb and qdrant tests need
+  `uv sync --all-extras`. basedpyright reports 20 errors in upstream's own
+  `src/vector_store/lancedb.py` and `qdrant.py` at `v3.2.1`; this install uses
+  pgvector.
 - **The two bridges need different bearer tokens.** They read
   `HONCHO_MCP_BEARER_TOKEN_FILE`, and `scripts/write_bridge_secrets.sh` writes both
   from 1Password. If one value is used for both, whoever holds the teammates'
