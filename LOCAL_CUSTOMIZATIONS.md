@@ -127,12 +127,35 @@ The Jev gate is off unless `HONCHO_JEV_GATE` is set. It uses `typesafe_sdk`
 directly, imported on first use, and `HONCHO_JEV_FAIL_MODE` decides whether a
 Jev outage forwards the query or refuses it.
 
-## Independent LLM proxy (2026-09-23)
+## Independent LLM proxy (2026-09-23, router since 2026-09-30)
 
-Codex and Claude proxy sources and LaunchAgents moved to `../llm-proxy`.
-Honcho consumes their OpenAI-compatible HTTP endpoints; it does not package or
-manage their lifecycle. Existing ports and private API keys remain unchanged.
-Use `python3 ../llm-proxy/proxyctl.py status` to inspect the host services.
+Codex and Claude proxy sources moved out of this repository on 2026-09-23. They
+now live in `../subscription-gateway` (the repository was named `llm-proxy`).
+Honcho consumes an OpenAI-compatible HTTP endpoint. It does not package the
+gateway or manage its lifecycle.
+
+Since 2026-09-30 every chat model setting in `.env` points at the gateway's
+router, `http://host.docker.internal:11400/v1`, and `LLM_VLLM_API_KEY` holds the
+router's client key (`router` in
+`~/Library/Application Support/SubscriptionGateway/secrets.json`). The router
+sends each request to a logged-in account and moves to the next account when one
+hits its usage limit. The LaunchAgent `subscription-gateway.ui` (screen on 11450)
+starts the router and the per-account adapters and restarts them if they stop.
+Embeddings are unchanged.
+
+The single-account proxy Honcho used before, `com.chenjing.llm-proxy.codex`
+(11435), was retired, as was its Claude sibling `com.chenjing.llm-proxy.claude`
+(11446). Their plists are in `~/Library/LaunchAgents-retired-20260930/`. To go
+back:
+
+1. restore `.env.bak-20260930-before-router` over `.env`;
+2. move `com.chenjing.llm-proxy.codex.plist` back to `~/Library/LaunchAgents/`
+   and `launchctl bootstrap gui/$(id -u)` it;
+3. recreate `api` and `deriver` without `--build`.
+
+Before switching, the router answered the request shapes Honcho sends (plain,
+`parse` with a Pydantic schema, tools, and streaming with tools and
+`stream_options`) the same way 11435 did.
 
 ## Special-token text is plain text (2026-09-28)
 

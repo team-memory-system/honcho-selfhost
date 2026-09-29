@@ -15,7 +15,7 @@ One of three repositories in the memory system:
 |---|---|---|
 | **`honcho-selfhost`** (this one) | The memory server, plus the MCP bridge and dashboard | One computer per person |
 | [`honcho-agent-bridge`](https://github.com/team-memory-system/honcho-agent-bridge) | Collector, installer, agent plugin | Every machine that runs an agent |
-| [`llm-proxy`](https://github.com/team-memory-system/llm-proxy) | Subscription-to-API adapters and a router | Only the computer that runs Honcho |
+| [`subscription-gateway`](https://github.com/team-memory-system/subscription-gateway) | Subscription logins served as an OpenAI-compatible API: an adapter per account and a router that fails over between them | Only the computer that runs Honcho |
 
 **Topology.** One Honcho and one database per person; that person's several machines
 all feed the same one. Teammates do not share a database. What is shared is a single
