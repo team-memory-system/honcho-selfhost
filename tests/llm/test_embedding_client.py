@@ -3,7 +3,7 @@ import ast
 import base64
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from google.genai import types as genai_types
@@ -92,7 +92,13 @@ class RecordingInnerClient:
         self.embedded.append(query)
         return [0.1, 0.2]
 
-    async def simple_batch_embed(self, texts: list[str]) -> list[list[float]]:
+    async def simple_batch_embed(
+        self,
+        texts: list[str],
+        *,
+        on_oversize: Literal["raise", "truncate"] = "raise",
+    ) -> list[list[float]]:
+        del on_oversize
         self.batched.append(list(texts))
         return [[0.1] for _ in texts]
 
