@@ -12,6 +12,9 @@ from google.genai import types as genai_types
 from nanoid import generate as generate_nanoid
 from openai import AsyncOpenAI
 
+from . import (
+    tiktoken_plain_text,  # noqa: F401  # local: special-token text is plain text
+)
 from .config import EmbeddingModelConfig, resolve_embedding_model_config, settings
 
 logger = logging.getLogger(__name__)

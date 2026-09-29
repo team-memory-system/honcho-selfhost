@@ -133,3 +133,15 @@ Codex and Claude proxy sources and LaunchAgents moved to `../llm-proxy`.
 Honcho consumes their OpenAI-compatible HTTP endpoints; it does not package or
 manage their lifecycle. Existing ports and private API keys remain unchanged.
 Use `python3 ../llm-proxy/proxyctl.py status` to inspect the host services.
+
+## Special-token text is plain text (2026-09-28)
+
+tiktoken refuses by default to encode the literal text of a special token
+(`<|endoftext|>`, `<|fim_prefix|>`, …) and raises `ValueError`. Honcho encodes
+message content to count and chunk it, so a transcript that merely mentions one
+of those strings returned HTTP 500 on every store attempt and stalled the
+collector queue behind it. `src/tiktoken_plain_text.py` patches
+`tiktoken.Encoding.encode` once to default `disallowed_special=()`; it is
+imported from `src/embedding_client.py`, which every API and deriver path loads
+and which already differs from upstream. Upstream call sites are unchanged.
+`tests/test_tiktoken_plain_text.py` covers it.
