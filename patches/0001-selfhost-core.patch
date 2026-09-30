@@ -1,0 +1,416 @@
+diff --git a/src/config.py b/src/config.py
+index f8af42d2..f7f33a13 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -820,6 +820,10 @@ class EmbeddingSettings(HonchoSettings):
+     VECTOR_DIMENSIONS: Annotated[int, Field(default=1536, gt=0)] = 1536
+     MAX_INPUT_TOKENS: Annotated[int, Field(default=8192, gt=0)] = 8192
+     MAX_TOKENS_PER_REQUEST: Annotated[int, Field(default=300_000, gt=0)] = 300_000
++    # Optional retrieval instruction for asymmetric embedding models such as
++    # Qwen3-Embedding. Stored content remains unmodified; only search queries
++    # are wrapped as ``Instruct: ...\nQuery: ...``.
++    QUERY_INSTRUCTION: str | None = None
+     # Caps concurrent message-embedding fan-out on the API request path (the
+     # immediate-embed background task). The reconciler is unaffected.
+     MAX_CONCURRENT_EMBEDDINGS: Annotated[int, Field(default=10, gt=0, le=100)] = 10
+diff --git a/src/embedding_client.py b/src/embedding_client.py
+index 30ee0825..a1a1c43b 100644
+--- a/src/embedding_client.py
++++ b/src/embedding_client.py
+@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
+ import tiktoken
+ from nanoid import generate as generate_nanoid
+ 
++from . import (
++    tiktoken_plain_text,  # noqa: F401  # local: special-token text is plain text
++)
+ from .config import (
+     EmbeddingEncodingFormat,
+     EmbeddingModelConfig,
+@@ -26,6 +29,24 @@ logger = logging.getLogger(__name__)
+ 
+ _T = TypeVar("_T")
+ 
++# `embedding_call_purpose` slugs whose input is a retrieval query rather than
++# stored content. Enumerated from every `with embedding_call_purpose(...)` site
++# upstream; the query and document sets do not overlap. Anything absent here —
++# including a purpose upstream adds later — is treated as content and embedded
++# verbatim. `tests/llm/test_embedding_client.py` fails if the upstream taxonomy
++# drifts, so the split gets re-checked at merge time instead of silently
++# degrading retrieval.
++QUERY_CALL_PURPOSES: frozenset[str] = frozenset(
++    {
++        "search_memory",
++        "search_messages",
++        "session_context_search",
++        "dialectic_prefetch",
++        "preference_extraction",
++        "generic_document_search",
++    }
++)
++
+ 
+ async def _emit_embedding_call(
+     *,
+@@ -761,9 +782,31 @@ class EmbeddingClient:
+             settings.EMBEDDING.resolve_encoding_format(),
+         )
+ 
++    @staticmethod
++    def _prepare(text: str) -> str:
++        """Prefix the configured retrieval instruction when this call embeds a
++        *query* rather than stored content.
++
++        Asymmetric models such as Qwen3-Embedding want the instruction on the
++        query side only; attaching it to documents cancels the effect out and
++        undoing that means re-embedding the corpus. We read the intent from the
++        `embedding_call_purpose` ContextVar the callers already set for
++        telemetry, so no call site has to change. An unset or unrecognized
++        purpose falls through unmodified — upstream behaviour — which keeps a
++        new document path from silently picking up the prefix.
++        """
++        instruction = settings.EMBEDDING.QUERY_INSTRUCTION
++        if not instruction:
++            return text
++        from src.utils.types import get_embedding_call_purpose
++
++        if get_embedding_call_purpose() not in QUERY_CALL_PURPOSES:
++            return text
++        return f"Instruct: {instruction.strip()}\nQuery: {text}"
++
+     async def embed(self, query: str) -> list[float]:
+         """Embed a single query string."""
+-        return await self._get_client().embed(query)
++        return await self._get_client().embed(self._prepare(query))
+ 
+     async def simple_batch_embed(
+         self,
+@@ -773,7 +816,7 @@ class EmbeddingClient:
+     ) -> list[list[float]]:
+         """Batch embed a list of text strings (each must fit token limit)."""
+         return await self._get_client().simple_batch_embed(
+-            texts, on_oversize=on_oversize
++            [self._prepare(text) for text in texts], on_oversize=on_oversize
+         )
+ 
+     def prepare_chunks(self, id_resource_dict: dict[str, str]) -> dict[str, list[str]]:
+diff --git a/src/tiktoken_plain_text.py b/src/tiktoken_plain_text.py
+new file mode 100644
+index 00000000..19e1abc2
+--- /dev/null
++++ b/src/tiktoken_plain_text.py
+@@ -0,0 +1,26 @@
++"""Count special-token look-alikes in message text as ordinary text.
++
++tiktoken's `Encoding.encode` raises `ValueError` by default when the input
++contains the literal text of a special token such as `<|endoftext|>` or
++`<|fim_prefix|>`. Honcho only ever encodes user content to count tokens or to
++chunk it for embedding, so that text is never meant as a control token. Left
++alone, a transcript that merely mentions one of these strings fails with HTTP
++500 on every attempt to store it.
++
++Patching the class once covers every encoder, including module-level ones
++created before this import, without touching the upstream call sites. Callers
++that pass `disallowed_special` explicitly keep their own value.
++"""
++
++import tiktoken
++
++_encode = tiktoken.Encoding.encode
++
++if not getattr(_encode, "_honcho_plain_text", False):
++
++    def encode(self: tiktoken.Encoding, text: str, **kwargs: object) -> list[int]:
++        kwargs.setdefault("disallowed_special", ())
++        return _encode(self, text, **kwargs)  # pyright: ignore[reportArgumentType]
++
++    encode._honcho_plain_text = True  # pyright: ignore[reportFunctionMemberAccess]
++    tiktoken.Encoding.encode = encode  # pyright: ignore[reportAttributeAccessIssue]
+diff --git a/tests/llm/test_embedding_client.py b/tests/llm/test_embedding_client.py
+index 7fd9237d..c009e7b1 100644
+--- a/tests/llm/test_embedding_client.py
++++ b/tests/llm/test_embedding_client.py
+@@ -1,7 +1,9 @@
+ import array
++import ast
+ import base64
++from pathlib import Path
+ from types import SimpleNamespace
+-from typing import Any, cast
++from typing import Any, Literal, cast
+ 
+ import pytest
+ from google.genai import types as genai_types
+@@ -10,12 +12,30 @@ from src.config import (
+     EmbeddingEncodingFormat,
+     EmbeddingModelConfig,
+     resolve_embedding_model_config,
++    settings,
+ )
+-from src.embedding_client import (
++from src.embedding_client import (  # pyright: ignore[reportPrivateUsage]
++    QUERY_CALL_PURPOSES,
+     BatchItem,
+     EmbeddingClient,
+     EmbeddingTokenLimitError,
+-    _EmbeddingClient,  # pyright: ignore[reportPrivateUsage]
++    _EmbeddingClient,
++)
++from src.telemetry.events import EmbeddingCallPurpose
++from src.utils.types import embedding_call_purpose
++
++# Purposes whose embedding input is stored content. Kept here rather than in
++# src/ because production code only needs to know what a query looks like —
++# this set exists so a new upstream purpose trips
++# test_query_purposes_partition_upstream_taxonomy instead of being silently
++# treated as content.
++CONTENT_CALL_PURPOSES = frozenset(
++    {
++        "create_observations",
++        "message_create",
++        "vector_sync",
++        "summary",
++    }
+ )
+ 
+ 
+@@ -60,6 +80,212 @@ class FakeOpenAIEmbeddingsAPI:
+         return SimpleNamespace(data=data)
+ 
+ 
++class RecordingInnerClient:
++    """Stands in for the transport-level client so the tests see exactly the
++    text `EmbeddingClient` hands down."""
++
++    def __init__(self) -> None:
++        self.embedded: list[str] = []
++        self.batched: list[list[str]] = []
++
++    async def embed(self, query: str) -> list[float]:
++        self.embedded.append(query)
++        return [0.1, 0.2]
++
++    async def simple_batch_embed(
++        self,
++        texts: list[str],
++        *,
++        on_oversize: Literal["raise", "truncate"] = "raise",
++    ) -> list[list[float]]:
++        del on_oversize
++        self.batched.append(list(texts))
++        return [[0.1] for _ in texts]
++
++
++@pytest.fixture
++def recording_client(monkeypatch: pytest.MonkeyPatch) -> RecordingInnerClient:
++    inner = RecordingInnerClient()
++    monkeypatch.setattr(settings.EMBEDDING, "QUERY_INSTRUCTION", "find memories")
++    monkeypatch.setattr(EmbeddingClient, "_get_client", lambda _self: inner)
++    return inner
++
++
++@pytest.mark.asyncio
++async def test_query_purpose_applies_configured_retrieval_instruction(
++    recording_client: RecordingInnerClient,
++) -> None:
++    with embedding_call_purpose("search_memory"):
++        result = await EmbeddingClient().embed("coffee preferences")
++
++    assert result == [0.1, 0.2]
++    assert recording_client.embedded == [
++        "Instruct: find memories\nQuery: coffee preferences"
++    ]
++
++
++@pytest.mark.asyncio
++async def test_document_purpose_embeds_content_verbatim(
++    recording_client: RecordingInnerClient,
++) -> None:
++    with embedding_call_purpose("message_create"):
++        await EmbeddingClient().embed("the user rides a Trek Madone")
++
++    assert recording_client.embedded == ["the user rides a Trek Madone"]
++
++
++@pytest.mark.asyncio
++async def test_absent_purpose_embeds_content_verbatim(
++    recording_client: RecordingInnerClient,
++) -> None:
++    """No purpose in scope means no instruction — upstream behaviour. Keeps a
++    new content path from picking up the prefix just because it wasn't tagged.
++    """
++    await EmbeddingClient().embed("untagged text")
++
++    assert recording_client.embedded == ["untagged text"]
++
++
++@pytest.mark.asyncio
++async def test_batch_embed_applies_instruction_to_each_query(
++    recording_client: RecordingInnerClient,
++) -> None:
++    with embedding_call_purpose("preference_extraction"):
++        result = await EmbeddingClient().simple_batch_embed(["one", "two"])
++
++    assert result == [[0.1], [0.1]]
++    assert recording_client.batched == [
++        ["Instruct: find memories\nQuery: one", "Instruct: find memories\nQuery: two"]
++    ]
++
++
++@pytest.mark.asyncio
++async def test_unset_instruction_embeds_content_verbatim(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    inner = RecordingInnerClient()
++    monkeypatch.setattr(settings.EMBEDDING, "QUERY_INSTRUCTION", None)
++    monkeypatch.setattr(EmbeddingClient, "_get_client", lambda _self: inner)
++
++    with embedding_call_purpose("search_memory"):
++        await EmbeddingClient().embed("coffee preferences")
++
++    assert inner.embedded == ["coffee preferences"]
++
++
++#: The only `EmbeddingClient` methods whose text is a caller's retrieval query.
++#: Everything else the class forwards is stored content, and must reach the
++#: provider untouched — attaching the instruction to documents cancels the effect
++#: out, and undoing that means re-embedding the whole corpus.
++QUERY_EMBEDDING_METHODS = frozenset({"embed", "simple_batch_embed"})
++
++#: Methods that hand stored content to the provider. Listed so that adding the
++#: prefix to one of them fails here.
++CONTENT_EMBEDDING_METHODS = frozenset({"batch_embed", "prepare_chunks"})
++
++
++def _embedding_client_methods() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
++    """Every method of `EmbeddingClient`, read from the file itself."""
++    source = Path("src/embedding_client.py").read_text()
++    tree = ast.parse(source)
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ClassDef) and node.name == "EmbeddingClient":
++            return {
++                item.name: item
++                for item in node.body
++                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
++            }
++    raise AssertionError(
++        "EmbeddingClient is no longer a class in src/embedding_client.py"
++    )
++
++
++def _takes_caller_text(method: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
++    """True when the method receives something from the caller.
++
++    The property accessors also reach the inner client, but they pass nothing in,
++    so there is no text for the instruction to attach to.
++    """
++    arguments = method.args
++    names = [
++        argument.arg
++        for argument in [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
++    ]
++    return [name for name in names if name not in {"self", "cls"}] != []
++
++
++def test_exactly_the_query_paths_route_through_prepare() -> None:
++    """Guard the wiring, not just the taxonomy.
++
++    `test_query_purposes_partition_upstream_taxonomy` checks that every upstream
++    purpose is classified. It says nothing about whether `_prepare` is still
++    called: dropping it from `embed` during an upstream merge would leave every
++    test green while retrieval quietly loses the instruction. So assert the call
++    sites by name, in both directions — a query path that stops wrapping fails
++    here, and so does a content path that starts.
++    """
++    methods = _embedding_client_methods()
++    forwarding = {
++        name: ast.unparse(method)
++        for name, method in methods.items()
++        if not name.startswith("_")
++        and _takes_caller_text(method)
++        and "_get_client()" in ast.unparse(method)
++    }
++    wrapping = {name for name, body in forwarding.items() if "_prepare(" in body}
++
++    assert wrapping == QUERY_EMBEDDING_METHODS, {
++        "stopped wrapping": sorted(QUERY_EMBEDDING_METHODS - wrapping),
++        "started wrapping": sorted(wrapping - QUERY_EMBEDDING_METHODS),
++    }
++
++    unclassified = set(forwarding) - QUERY_EMBEDDING_METHODS - CONTENT_EMBEDDING_METHODS
++    assert not unclassified, (
++        f"EmbeddingClient forwards to the provider through new methods {sorted(unclassified)}; "
++        "add each to QUERY_EMBEDDING_METHODS or CONTENT_EMBEDDING_METHODS in this file"
++    )
++
++    assert "_prepare" in methods, "the instruction helper itself was removed"
++
++
++@pytest.mark.asyncio
++async def test_every_query_method_carries_the_instruction(
++    recording_client: RecordingInnerClient,
++) -> None:
++    """The behavioural half of the same guard: each named query method really does
++    prefix, so the static check above cannot pass on a `_prepare` that no longer
++    prefixes anything."""
++    client = EmbeddingClient()
++    with embedding_call_purpose("search_memory"):
++        await client.embed("한 건")
++        await client.simple_batch_embed(["여러 건"])
++
++    assert recording_client.embedded == ["Instruct: find memories\nQuery: 한 건"]
++    assert recording_client.batched == [["Instruct: find memories\nQuery: 여러 건"]]
++    assert {"embed", "simple_batch_embed"} == QUERY_EMBEDDING_METHODS, (
++        "this test covers each method in QUERY_EMBEDDING_METHODS; extend it when that grows"
++    )
++
++
++def test_query_purposes_partition_upstream_taxonomy() -> None:
++    """Guard on the one thing this design depends on: that every upstream
++    embedding purpose is knowingly classified as query or content. If upstream
++    renames a purpose or adds one, this fails at merge time instead of quietly
++    dropping the instruction from a retrieval path.
++    """
++    upstream = {purpose.value for purpose in EmbeddingCallPurpose}
++
++    assert upstream >= QUERY_CALL_PURPOSES, sorted(QUERY_CALL_PURPOSES - upstream)
++    assert not QUERY_CALL_PURPOSES & CONTENT_CALL_PURPOSES
++
++    unclassified = upstream - QUERY_CALL_PURPOSES - CONTENT_CALL_PURPOSES
++    assert not unclassified, (
++        f"upstream added embedding purposes {sorted(unclassified)}; classify each "
++        "as query (src/embedding_client.py QUERY_CALL_PURPOSES) or content "
++        "(CONTENT_CALL_PURPOSES in this file)"
++    )
++
++
+ @pytest.mark.asyncio
+ async def test_openai_embedding_client_uses_configured_model_and_dimensions(
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/test_tiktoken_plain_text.py b/tests/test_tiktoken_plain_text.py
+new file mode 100644
+index 00000000..b2396823
+--- /dev/null
++++ b/tests/test_tiktoken_plain_text.py
+@@ -0,0 +1,21 @@
++import pytest
++import tiktoken
++
++import src.tiktoken_plain_text  # noqa: F401
++
++TEXT = "tokenizer notes: <|fim_prefix|> def f(): <|fim_suffix|> <|endoftext|>"
++
++
++@pytest.mark.parametrize("name", ["cl100k_base", "o200k_base"])
++def test_special_token_text_encodes_as_plain_text(name: str):
++    encoding = tiktoken.get_encoding(name)
++    tokens = encoding.encode(TEXT)
++    assert encoding.decode(tokens) == TEXT
++    assert not set(tokens) & {
++        encoding.encode_single_token(t) for t in encoding.special_tokens_set
++    }
++
++
++def test_explicit_disallowed_special_is_kept():
++    with pytest.raises(ValueError):
++        tiktoken.get_encoding("cl100k_base").encode(TEXT, disallowed_special="all")

@@ -1,111 +1,44 @@
-# Local Honcho release workflow
+# Local Honcho source and release workflow
 
-This checkout keeps the self-hosted deployment as a maintained merge of an
-official Honcho release and a small set of local commits.
+Official Honcho is the pristine `upstream/honcho` Git submodule. This repository
+tracks its exact commit, our core patch set, and independent companion services.
+It no longer merges the official source tree into its root.
 
-## Branches and remotes
+## Source identity
 
-- `upstream`: the official `plastic-labs/honcho` repository. Its push URL is
-  deliberately disabled.
-- `origin`: the private self-host repository used to back up and publish local
-  commits. `main` tracks `origin/main`, never `upstream/main`.
-- `main`: the production source branch with local commits.
-- `upstream-base/vX.Y.Z`: immutable pointers to official releases used by the
-  local deployment.
-- `integration/vX.Y.Z`: temporary update candidates created in an isolated Git
-  worktree.
+`selfhost-source.json` records the official repository/ref/commit, ordered patches,
+and local companion paths. Its upstream commit must match the Git submodule; its
+ref must match `.honcho-upstream-version`. `patches/0001-selfhost-core.patch`
+contains the former fork differences in `src/` and `tests/` only.
 
-`.honcho-upstream-version` records the official release currently merged into
-`main`.
+`node scripts/prepare-source.mjs` exports the official commit with `git archive`,
+checks/applies patches in an isolated directory, adds tracked companion files,
+and records the resulting provenance in `.honcho-source.json`. The output defaults
+to `.build/honcho`; `--output <directory>` is used by the installer and release
+builder. Only output previously owned by this preparer can be replaced. A failure
+preserves the last successful output and never changes the upstream submodule.
 
-## What belongs in Git
+## Adopting an official release
 
-`AGENTS.md` at the repository root is local, not upstream's. It is the orientation
-document for anyone — person or agent — arriving in this fork, and it points back
-here for the detail. Upstream's `.gitignore` excludes that filename so a
-contributor's own notes stay untracked; this fork adds a one-line `!AGENTS.md`
-exception so the document travels with a clone.
+1. Run `scripts/prepare_upstream_update.sh vX.Y.Z` from clean `main`.
+2. The candidate worktree updates its official gitlink, source manifest, and
+   version file. Its patch application must succeed; repair the patch in that
+   candidate when upstream changed the same code.
+3. Run source preparation and tests against an isolated test database. Commit the
+   candidate and run `scripts/promote_upstream_update.sh vX.Y.Z`.
+4. Build/deploy separately after the usual database backup and runtime checks.
 
-Keep local changes as narrow, independently revertible commits:
+The existing Git history is retained. The source before this layout change is
+`4282bd243d925d8785a004afc13b8eb04eede3df`. During migration, 1,126 prepared source
+files matched that revision byte for byte; wrapper docs and deployment metadata
+were deliberately excluded from that source comparison.
 
-1. Self-host companion applications (dashboard and local MCP
-   bridge).
-2. Honcho core extensions that still differ from upstream.
-3. Operational migration tools.
-4. This release workflow.
+## Configuration and installation
 
-Runtime state does not belong in Git: `.env`, API keys, database data, MCP tool
-state, logs, generated dependencies, backups, and LaunchAgent-local secrets.
-
-The local MCP bridge source lives in `local-mcp-bridge/`. Its host-specific
-tool state belongs in `~/.config/honcho/mcp-bridge/`, and its logs belong in
-`~/Library/Logs/Honcho/`.
-
-The upstream `mcp/` directory is not a substitute for it. As of upstream
-`2ad56a4d` (2026-09-02) `mcp/` is self-hostable — it has `src/http.ts` on
-`Bun.serve`, a `Dockerfile`, and an `mcp:` service in
-`docker-compose.yml.example` — so "it is only a Cloudflare Worker" is no longer
-the reason to keep them apart. The reason is what `local-mcp-bridge/server.py`
-does that upstream's does not: it narrows the tool list per caller
-(`HONCHO_MCP_ENABLED_TOOLS`), fixes a shared bridge to its own workspace and
-peers, ignoring the `x-honcho-*` headers and refusing arguments that name others
-(`HONCHO_MCP_PIN_DEFAULTS`), refuses a wrong bearer token before `initialize`
-(`BearerGate`), records every call with its query text
-(`audit.py`), and can refuse a query before it reaches Honcho
-(`jev_gate.py`). All but the bearer check live in `register_tool`, which is the
-single place every one of its tools passes through; `BearerGate` sits in front of
-the HTTP endpoint. The two can run side by side.
-
-## Updating Honcho
-
-Prepare the newest stable release without touching the production checkout:
-
-```bash
-scripts/prepare_upstream_update.sh
-```
-
-Or target an explicit official tag:
-
-```bash
-scripts/prepare_upstream_update.sh v3.0.12
-```
-
-The command fetches official history, creates `.worktrees/vX.Y.Z` from
-`main`, and merges the new tag there. Resolve any conflicts and commit
-them inside that worktree. Git `rerere` is enabled, so recurring resolutions
-are remembered.
-
-Validate the candidate in its worktree before promotion:
-
-```bash
-cd .worktrees/vX.Y.Z
-uv sync --frozen
-uv run ruff check src tests
-uv run basedpyright src
-uv run pytest -q
-docker compose build api deriver
-```
-
-Database-dependent tests should use an isolated test database. Never point the
-candidate test suite at the production database.
-
-After validation, promote the already-tested candidate without deploying it:
-
-```bash
-scripts/promote_upstream_update.sh vX.Y.Z
-```
-
-Promotion creates a backup branch, fast-forwards `main`, and removes the
-temporary worktree. Building and restarting production remains a separate,
-explicit operation with the normal database backup and rollback checks.
-
-## Why merge releases instead of stashing
-
-Stashes are temporary, omit untracked files unless explicitly requested, and
-do not preserve the intent of separate custom features. Release merges keep an
-auditable history, use the true common ancestor even after many skipped
-versions, and allow the full candidate to be tested without modifying the live
-checkout.
+Runtime `.env`, credentials, database volumes, logs, and generated source remain
+ignored. The checked-in Compose file builds from `.build/honcho`; the API and
+worker use the upstream Dockerfile. The installer materializes this wrapper into
+the former flat runtime layout, so installed Compose paths remain stable.
 
 ## Reproducible stack (2026-09-28)
 

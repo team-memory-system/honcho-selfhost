@@ -1,0 +1,17 @@
+{
+  "format": 1,
+  "upstream": {
+    "path": "upstream/honcho",
+    "repo": "https://github.com/plastic-labs/honcho",
+    "ref": "v3.2.1",
+    "commit": "79cb31645f4efdef626d1bd9316a648adb5da89b"
+  },
+  "patches": ["patches/0001-selfhost-core.patch"],
+  "localPaths": [
+    "local-dashboard",
+    "local-mcp-bridge",
+    "scripts/benchmark_embedding_retrieval.py",
+    "scripts/write_bridge_secrets.sh",
+    "scripts/write_bridge_secrets.ps1"
+  ]
+}

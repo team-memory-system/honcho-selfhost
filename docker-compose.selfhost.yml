@@ -10,7 +10,8 @@
 # silently take over every bare `docker compose` call in this directory. Pass
 # this one explicitly:
 #
-#   docker compose -f docker-compose.selfhost.yml up -d
+#   node scripts/prepare-source.mjs
+#   docker compose -f docker-compose.selfhost.yml up -d --build
 #
 # Two bridges run from the same image. `mcp-bridge` is the owner's, with the
 # tool set the dashboard controls. `mcp-bridge-shared` is what teammates reach
@@ -29,7 +30,7 @@
 
 x-honcho-build: &honcho-build
   build:
-    context: .
+    context: ./.build/honcho
     dockerfile: Dockerfile
 
 x-honcho-db: &honcho-db
@@ -115,7 +116,7 @@ services:
       POSTGRES_PASSWORD: postgres
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./.build/honcho/database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - pgdata:/var/lib/postgresql/data/
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]

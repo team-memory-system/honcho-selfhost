@@ -209,3 +209,7 @@ grafana-data/
 # Sandbox real-provider credentials (see sandbox/real.env.example)
 sandbox/real.env
 sandbox/.state.env
+
+# Generated patched Honcho source
+.build/
+.honcho-source-*/

@@ -1,1 +1,1 @@
-CREATE EXTENSION IF NOT EXISTS vector;
+../.build/honcho/database/init.sql

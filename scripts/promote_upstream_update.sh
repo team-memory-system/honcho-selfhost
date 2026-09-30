@@ -44,8 +44,10 @@ fi
 backup_branch="backup/custom-before-${target_tag}-$(date +%Y%m%d%H%M%S)"
 git branch "$backup_branch" main
 git merge --ff-only "$candidate_branch"
-git branch "upstream-base/$target_tag" "$target_tag"
-git worktree remove "$candidate_path"
+git submodule update --init -- upstream/honcho
+node scripts/prepare-source.mjs
+git -C "$candidate_path" submodule deinit --force -- upstream/honcho
+git worktree remove --force "$candidate_path"
 git branch -d "$candidate_branch"
 
 echo "Promoted $target_tag to main."
