@@ -146,8 +146,9 @@ export async function prepareSource({ root = ROOT, output = path.join(root, ".bu
     for (const relative of manifest.patches) {
       const file = sourcePath(root, relative);
       const bytes = await fs.readFile(file);
-      git(candidate, ["apply", "--check", file]);
-      git(candidate, ["apply", file]);
+      const apply = ["-c", "core.autocrlf=false", "-c", "core.eol=lf", "apply"];
+      git(candidate, [...apply, "--check", file]);
+      git(candidate, [...apply, file]);
       patches.push({ path: relative, sha256: crypto.createHash("sha256").update(bytes).digest("hex") });
     }
     await fs.rm(path.join(candidate, ".git"), { recursive: true, force: true });
@@ -177,7 +178,10 @@ async function main(args) {
   return prepareSource({ output: args[1] ? path.resolve(args[1]) : undefined });
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// macOS temporary directories and Windows junctions can reach this module
+// through a different spelling than import.meta.url's resolved file path.
+const invokedFile = process.argv[1] ? await fs.realpath(process.argv[1]).catch(() => null) : null;
+if (invokedFile === await fs.realpath(fileURLToPath(import.meta.url))) {
   main(process.argv.slice(2)).then(result => console.log(JSON.stringify(result, null, 2))).catch(error => {
     console.error(error.message);
     process.exitCode = 1;

@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { prepareSource } from "../scripts/prepare-source.mjs";
 
 function git(cwd, ...args) {
@@ -102,4 +103,20 @@ test("preparation will not replace an unrelated output directory", async t => {
   await fs.writeFile(path.join(f.output, "keep.txt"), "user data\n");
   await assert.rejects(prepareSource({ root: f.root }), /not created by this preparer/);
   assert.deepEqual(await fs.readdir(f.output), ["keep.txt"]);
+});
+
+test("the CLI runs through a directory alias and produces LF source even with autocrlf enabled", async t => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.root, "scripts"));
+  await fs.copyFile(fileURLToPath(new URL("../scripts/prepare-source.mjs", import.meta.url)), path.join(f.root, "scripts", "prepare-source.mjs"));
+  const alias = `${f.root}-alias`;
+  await fs.symlink(f.root, alias, process.platform === "win32" ? "junction" : "dir");
+  t.after(() => fs.rm(alias, { force: true }));
+  const output = execFileSync(process.execPath, [path.join(alias, "scripts", "prepare-source.mjs"), "--output", path.join(alias, "prepared")], {
+    encoding: "utf8", stdio: "pipe",
+    env: { ...process.env, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.autocrlf", GIT_CONFIG_VALUE_0: "true" },
+  });
+  assert.equal(JSON.parse(output).ok, true);
+  assert.equal(await fs.readFile(path.join(f.root, "prepared", "src", "core.py"), "utf8"), "value = 2\n");
+  assert.equal(await fs.readFile(path.join(f.root, "prepared", "source-alias", "core.py"), "utf8"), "value = 2\n");
 });
