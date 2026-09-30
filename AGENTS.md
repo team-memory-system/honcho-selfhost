@@ -9,13 +9,14 @@ A maintained fork of [`plastic-labs/honcho`](https://github.com/plastic-labs/hon
 AGPL-3.0, run as one person's private memory server. `.honcho-upstream-version`
 records which official release the fork is currently based on.
 
-One of three repositories in the memory system:
+The memory system uses two Team Memory System repositories and an independently
+maintained gateway:
 
 | Repository | What it is | Installed where |
 |---|---|---|
 | **`honcho-selfhost`** (this one) | The memory server, plus the MCP bridge and dashboard | One computer per person |
 | [`honcho-agent-bridge`](https://github.com/team-memory-system/honcho-agent-bridge) | Collector, installer, agent plugin | Every machine that runs an agent |
-| [`subscription-gateway`](https://github.com/team-memory-system/subscription-gateway) | Subscription logins served as an OpenAI-compatible API: an adapter per account and a router that fails over between them | Only the computer that runs Honcho |
+| [`subscription-gateway`](https://github.com/chenjingdev/subscription-gateway) | Independent subscription-to-API gateway: an adapter per account and a router that fails over between them. The agent bridge installs a pinned source revision | The computer that runs Honcho |
 
 **Topology.** One Honcho and one database per person; that person's several machines
 all feed the same one. Teammates do not share a database. What is shared is a single
