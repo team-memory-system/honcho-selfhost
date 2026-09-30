@@ -135,7 +135,7 @@ export async function prepareSource({ root = ROOT, output = path.join(root, ".bu
   try {
     const archive = path.join(temporary, "upstream.tar");
     const links = upstreamLinks(upstream, manifest.upstream.commit);
-    git(upstream, ["archive", "--format=tar", `--output=${archive}`, manifest.upstream.commit]);
+    git(upstream, ["-c", "core.autocrlf=false", "-c", "core.eol=lf", "archive", "--format=tar", `--output=${archive}`, manifest.upstream.commit]);
     const tar = process.platform === "win32"
       ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe") : "tar";
     execFileSync(tar, ["-xf", archive, "-C", candidate, ...links.map(link => `--exclude=${link.path}`)], { stdio: "pipe" });
