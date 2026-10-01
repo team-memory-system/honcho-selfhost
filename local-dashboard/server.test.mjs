@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 
 const dashboardRoot = dirname(fileURLToPath(import.meta.url));
 let dashboard;
-let dashboardOutput = "";
 let port;
 let upstream;
 let upstreamPort;
@@ -48,6 +47,54 @@ function request(path, { body, contentType = "application/json", host, method, o
   });
 }
 
+// Starts a dashboard against the fake upstream. DASHBOARD_APP_URL is cleared
+// unless a test sets it, so a shell that exports it cannot change the mode.
+async function startDashboard(env) {
+  const child = spawn(process.execPath, ["server.mjs"], {
+    cwd: dashboardRoot,
+    env: {
+      ...process.env,
+      DASHBOARD_HOST: "127.0.0.1",
+      HONCHO_URL: `http://127.0.0.1:${upstreamPort}`,
+      HONCHO_MCP_TOOL_CONFIG: toolConfigPath,
+      MCP_CONTROL_MODE: "file",
+      DASHBOARD_APP_URL: "",
+      ...env,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.output = "";
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`Dashboard did not start.\n${child.output}`)), 5_000);
+    const onExit = code => {
+      clearTimeout(timeout);
+      reject(new Error(`Dashboard exited with ${code}.\n${child.output}`));
+    };
+    child.stderr.on("data", chunk => { child.output += chunk; });
+    child.stdout.on("data", chunk => {
+      child.output += chunk;
+      if (!child.output.includes("Honcho dashboard:")) return;
+      clearTimeout(timeout);
+      child.off("exit", onExit);
+      resolve();
+    });
+    child.once("exit", onExit);
+  });
+  return child;
+}
+
+async function stopDashboard(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise(resolve => {
+    const timeout = setTimeout(resolve, 2_000);
+    child.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
 before(async () => {
   tempRoot = await fs.mkdtemp(join(tmpdir(), "honcho-dashboard-test-"));
   toolConfigPath = join(tempRoot, "nested", "tool-config.json");
@@ -62,49 +109,14 @@ before(async () => {
     upstream.listen(upstreamPort, "127.0.0.1", resolve);
   });
   port = await availablePort();
-  dashboard = spawn(process.execPath, ["server.mjs"], {
-    cwd: dashboardRoot,
-    env: {
-      ...process.env,
-      DASHBOARD_HOST: "127.0.0.1",
-      DASHBOARD_PORT: String(port),
-      HONCHO_URL: `http://127.0.0.1:${upstreamPort}`,
-      HONCHO_MCP_TOOL_CONFIG: toolConfigPath,
-      MCP_CONTROL_MODE: "file",
-      MCP_CONTROL_ALLOW_REMOTE: "1",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  dashboard.stdout.on("data", chunk => { dashboardOutput += chunk; });
-  dashboard.stderr.on("data", chunk => { dashboardOutput += chunk; });
-
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`Dashboard did not start.\n${dashboardOutput}`)), 5_000);
-    const check = chunk => {
-      if (!chunk.toString().includes("Honcho dashboard:")) return;
-      clearTimeout(timeout);
-      dashboard.stdout.off("data", check);
-      resolve();
-    };
-    dashboard.stdout.on("data", check);
-    dashboard.once("exit", code => {
-      clearTimeout(timeout);
-      reject(new Error(`Dashboard exited with ${code}.\n${dashboardOutput}`));
-    });
+  dashboard = await startDashboard({
+    DASHBOARD_PORT: String(port),
+    MCP_CONTROL_ALLOW_REMOTE: "1",
   });
 });
 
 after(async () => {
-  if (dashboard && dashboard.exitCode === null) {
-    dashboard.kill("SIGTERM");
-    await new Promise(resolve => {
-      const timeout = setTimeout(resolve, 2_000);
-      dashboard.once("exit", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    });
-  }
+  if (dashboard) await stopDashboard(dashboard);
   if (upstream) {
     await new Promise(resolve => upstream.close(() => resolve()));
   }
@@ -201,24 +213,11 @@ test("parallel tool toggles preserve every update and leave no colliding temp fi
 
 test("with DASHBOARD_APP_URL the screen goes to the app and the API stays", async () => {
   const appPort = await availablePort();
-  const child = spawn(process.execPath, ["server.mjs"], {
-    cwd: dashboardRoot,
-    env: {
-      ...process.env,
-      DASHBOARD_HOST: "127.0.0.1",
-      DASHBOARD_PORT: String(appPort),
-      HONCHO_URL: `http://127.0.0.1:${upstreamPort}`,
-      DASHBOARD_APP_URL: "http://127.0.0.1:4180/",
-      MCP_CONTROL_MODE: "file",
-      HONCHO_MCP_TOOL_CONFIG: toolConfigPath,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
+  const child = await startDashboard({
+    DASHBOARD_PORT: String(appPort),
+    DASHBOARD_APP_URL: "http://127.0.0.1:4180/",
   });
   try {
-    await new Promise((resolve, reject) => {
-      child.stdout.on("data", chunk => { if (String(chunk).includes("Honcho dashboard:")) resolve(); });
-      child.once("exit", code => reject(new Error(`dashboard exited ${code}`)));
-    });
     const screen = await fetch(`http://127.0.0.1:${appPort}/`, { redirect: "manual" });
     assert.equal(screen.status, 302);
     assert.equal(screen.headers.get("location"), "http://127.0.0.1:4180/");
@@ -226,7 +225,31 @@ test("with DASHBOARD_APP_URL the screen goes to the app and the API stays", asyn
     assert.equal(deep.status, 302);
     const config = await fetch(`http://127.0.0.1:${appPort}/api/dashboard/config`);
     assert.equal(config.status, 200);
+    const unknown = await fetch(`http://127.0.0.1:${appPort}/api/nope`, { redirect: "manual" });
+    assert.equal(unknown.status, 404);
+    assert.match(unknown.headers.get("content-type"), /application\/json/);
   } finally {
-    child.kill();
+    await stopDashboard(child);
   }
+});
+
+test("a DASHBOARD_APP_URL off this computer is ignored with a warning", async () => {
+  const appPort = await availablePort();
+  const child = await startDashboard({
+    DASHBOARD_PORT: String(appPort),
+    DASHBOARD_APP_URL: "http://example.com:4180/",
+  });
+  try {
+    const screen = await fetch(`http://127.0.0.1:${appPort}/`, { redirect: "manual" });
+    assert.equal(screen.status, 200);
+    assert.match(child.output, /DASHBOARD_APP_URL ignored/);
+  } finally {
+    await stopDashboard(child);
+  }
+});
+
+test("unknown API routes answer 404 instead of the screen", async () => {
+  const missing = await request("/api/nope");
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.error, "Unknown dashboard API route.");
 });

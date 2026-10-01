@@ -21,7 +21,7 @@ HONCHO_URL=http://127.0.0.1:8001 npm start
 - `HONCHO_MCP_TOOL_CONFIG`: MCP 도구 설정 파일 경로 (기본값 `~/.config/honcho/mcp-bridge/tool-config.json`)
 - `MCP_CONTROL_MODE=file`: Docker 배포처럼 MCP 프로세스는 호스트가 관리하고, 대시보드는 공유 설정 파일만 수정할 때 사용
 - `MCP_CONTROL_ALLOW_REMOTE=1`: 컨테이너에서 들어오는 도구 설정 요청을 허용합니다. 대시보드 포트가 `127.0.0.1`에만 공개된 경우에만 사용하세요.
-- `DASHBOARD_APP_URL`: 팀 메모리 앱 주소(`http://127.0.0.1:...`). 정하면 화면은 띄우지 않고 브라우저를 그 앱으로 보내며, `/api/` 경로만 그대로 답합니다. 팀 메모리 앱이 설치한 서버에서 씁니다.
+- `DASHBOARD_APP_URL`: 팀 메모리 앱 주소(이 컴퓨터의 `http(s)://127.0.0.1:...` 또는 `localhost`). 정하면 화면은 띄우지 않고 브라우저를 그 앱으로 보내며, `/api/` 경로만 그대로 답합니다. 다른 컴퓨터 주소는 경고를 남기고 무시합니다. 팀 메모리 앱이 설치한 서버에서 씁니다.
 
 API 인증이 필요하면 `HONCHO_API_KEY` 환경 변수로 설정합니다.
 

@@ -36,10 +36,10 @@ function loopbackHttpUrl(value) {
   if (!value) return "";
   try {
     const url = new URL(value);
-    return url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname) ? url.toString() : "";
-  } catch {
-    return "";
-  }
+    if (["http:", "https:"].includes(url.protocol) && isLoopbackHostname(url.hostname)) return url.toString();
+  } catch {}
+  console.warn(`DASHBOARD_APP_URL ignored: ${value} is not an http(s) address on this computer, so the dashboard keeps its own screen.`);
+  return "";
 }
 const mcpTools = [
   { name: "server_info", group: "상태", description: "MCP 브리지의 주소, 기본 Workspace·Peer, 읽기 전용 여부와 Honcho 연결 상태를 한 번에 확인합니다.", use_case: "연결 문제 진단이나 에이전트의 기본 조회 범위를 확인할 때", off_impact: "에이전트가 브리지 설정과 상태를 스스로 진단할 수 없습니다." },
@@ -467,7 +467,8 @@ createServer(async (req, res) => {
     }
   }
   if (req.url.startsWith("/api/v3/")) return proxy(req, res);
-  if (appUrl && !req.url.startsWith("/api/")) {
+  if (req.url.startsWith("/api/")) return json(res, 404, { error: "Unknown dashboard API route." });
+  if (appUrl) {
     res.writeHead(302, { location: appUrl, "cache-control": "no-store" });
     return res.end();
   }
