@@ -198,3 +198,35 @@ test("parallel tool toggles preserve every update and leave no colliding temp fi
   const current = await request("/api/dashboard/mcp/tools");
   assert.equal(current.body.enabled_count, 0);
 });
+
+test("with DASHBOARD_APP_URL the screen goes to the app and the API stays", async () => {
+  const appPort = await availablePort();
+  const child = spawn(process.execPath, ["server.mjs"], {
+    cwd: dashboardRoot,
+    env: {
+      ...process.env,
+      DASHBOARD_HOST: "127.0.0.1",
+      DASHBOARD_PORT: String(appPort),
+      HONCHO_URL: `http://127.0.0.1:${upstreamPort}`,
+      DASHBOARD_APP_URL: "http://127.0.0.1:4180/",
+      MCP_CONTROL_MODE: "file",
+      HONCHO_MCP_TOOL_CONFIG: toolConfigPath,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      child.stdout.on("data", chunk => { if (String(chunk).includes("Honcho dashboard:")) resolve(); });
+      child.once("exit", code => reject(new Error(`dashboard exited ${code}`)));
+    });
+    const screen = await fetch(`http://127.0.0.1:${appPort}/`, { redirect: "manual" });
+    assert.equal(screen.status, 302);
+    assert.equal(screen.headers.get("location"), "http://127.0.0.1:4180/");
+    const deep = await fetch(`http://127.0.0.1:${appPort}/app.js`, { redirect: "manual" });
+    assert.equal(deep.status, 302);
+    const config = await fetch(`http://127.0.0.1:${appPort}/api/dashboard/config`);
+    assert.equal(config.status, 200);
+  } finally {
+    child.kill();
+  }
+});

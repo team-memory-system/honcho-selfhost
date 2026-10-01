@@ -27,6 +27,20 @@ const auditUrl = (process.env.HONCHO_MCP_AUDIT_URL || "").replace(/\/$/, "");
 const auditTokenFile = process.env.HONCHO_MCP_BEARER_TOKEN_FILE || "";
 const auditTokenInline = process.env.HONCHO_MCP_BEARER_TOKEN || "";
 const auditFilters = ["limit", "caller", "tool", "status", "bridge", "hours"];
+// A server installed by the Team Memory app has the app as its screen. There the
+// dashboard keeps only its /api routes, which the app relays, and sends a browser
+// that opens it to the app instead of showing a second, older screen.
+const appUrl = loopbackHttpUrl(process.env.DASHBOARD_APP_URL);
+
+function loopbackHttpUrl(value) {
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname) ? url.toString() : "";
+  } catch {
+    return "";
+  }
+}
 const mcpTools = [
   { name: "server_info", group: "상태", description: "MCP 브리지의 주소, 기본 Workspace·Peer, 읽기 전용 여부와 Honcho 연결 상태를 한 번에 확인합니다.", use_case: "연결 문제 진단이나 에이전트의 기본 조회 범위를 확인할 때", off_impact: "에이전트가 브리지 설정과 상태를 스스로 진단할 수 없습니다." },
   { name: "get_queue_status", group: "상태", description: "메시지에서 사실과 추론을 만드는 Deriver 작업의 완료·진행·대기 수를 조회합니다.", use_case: "새 기억이 아직 처리 중인지, 추론 생성이 밀렸는지 확인할 때", off_impact: "에이전트가 기억 처리 완료 여부를 확인할 수 없습니다." },
@@ -453,6 +467,10 @@ createServer(async (req, res) => {
     }
   }
   if (req.url.startsWith("/api/v3/")) return proxy(req, res);
+  if (appUrl && !req.url.startsWith("/api/")) {
+    res.writeHead(302, { location: appUrl, "cache-control": "no-store" });
+    return res.end();
+  }
   return staticFile(req, res);
 }).listen(port, host, () => {
   console.log(`Honcho dashboard: http://${host}:${port}`);
