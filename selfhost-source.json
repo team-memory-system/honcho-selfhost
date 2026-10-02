@@ -3,10 +3,12 @@
   "upstream": {
     "path": "upstream/honcho",
     "repo": "https://github.com/plastic-labs/honcho",
-    "ref": "v3.2.1",
-    "commit": "79cb31645f4efdef626d1bd9316a648adb5da89b"
+    "ref": "v3.2.2",
+    "commit": "06ed1929cf017c333a87c41d130bb6a0605d91c0"
   },
-  "patches": ["patches/0001-selfhost-core.patch"],
+  "patches": [
+    "patches/0001-selfhost-core.patch"
+  ],
   "localPaths": [
     "local-dashboard",
     "local-mcp-bridge",
