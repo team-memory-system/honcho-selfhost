@@ -1,11 +1,13 @@
 # Honcho core changes
 
 `0001-selfhost-core.patch` is the complete `src/` and `tests/` difference between
-official Honcho v3.2.1 and the previously deployed self-host source at
+official Honcho v3.2.2 and this self-host source. It began as the difference between
+v3.2.1 and the previously deployed self-host source at
 `4282bd243d925d8785a004afc13b8eb04eede3df`.
 
-It adds retrieval instructions only on query embedding paths, accepts special-token
-look-alikes as ordinary message text, and includes both features' regression tests.
+It adds retrieval instructions only on query embedding paths, leaving room for them
+when a search query is cut to the token cap, accepts special-token look-alikes as
+ordinary message text, and includes regression tests for each.
 The dashboard, MCP bridge, and operational scripts remain ordinary files outside
 the upstream submodule.
 

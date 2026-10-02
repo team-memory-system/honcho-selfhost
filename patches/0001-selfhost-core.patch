@@ -1,5 +1,5 @@
 diff --git a/src/config.py b/src/config.py
-index f8af42d2..f7f33a13 100644
+index 81cadfe..5579644 100644
 --- a/src/config.py
 +++ b/src/config.py
 @@ -820,6 +820,10 @@ class EmbeddingSettings(HonchoSettings):
@@ -14,7 +14,7 @@ index f8af42d2..f7f33a13 100644
      # immediate-embed background task). The reconciler is unaffected.
      MAX_CONCURRENT_EMBEDDINGS: Annotated[int, Field(default=10, gt=0, le=100)] = 10
 diff --git a/src/embedding_client.py b/src/embedding_client.py
-index 30ee0825..a1a1c43b 100644
+index c22779d..11e0946 100644
 --- a/src/embedding_client.py
 +++ b/src/embedding_client.py
 @@ -11,6 +11,9 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
@@ -52,10 +52,19 @@ index 30ee0825..a1a1c43b 100644
  
  async def _emit_embedding_call(
      *,
-@@ -761,9 +782,31 @@ class EmbeddingClient:
+@@ -761,9 +782,40 @@ class EmbeddingClient:
              settings.EMBEDDING.resolve_encoding_format(),
          )
  
++    @staticmethod
++    def _query_prefix() -> str:
++        """What `_prepare` puts in front of a query, or "" when no retrieval
++        instruction is configured."""
++        instruction = settings.EMBEDDING.QUERY_INSTRUCTION
++        if not instruction:
++            return ""
++        return f"Instruct: {instruction.strip()}\nQuery: "
++
 +    @staticmethod
 +    def _prepare(text: str) -> str:
 +        """Prefix the configured retrieval instruction when this call embeds a
@@ -69,14 +78,14 @@ index 30ee0825..a1a1c43b 100644
 +        purpose falls through unmodified — upstream behaviour — which keeps a
 +        new document path from silently picking up the prefix.
 +        """
-+        instruction = settings.EMBEDDING.QUERY_INSTRUCTION
-+        if not instruction:
++        prefix = EmbeddingClient._query_prefix()
++        if not prefix:
 +            return text
 +        from src.utils.types import get_embedding_call_purpose
 +
 +        if get_embedding_call_purpose() not in QUERY_CALL_PURPOSES:
 +            return text
-+        return f"Instruct: {instruction.strip()}\nQuery: {text}"
++        return f"{prefix}{text}"
 +
      async def embed(self, query: str) -> list[float]:
          """Embed a single query string."""
@@ -85,7 +94,7 @@ index 30ee0825..a1a1c43b 100644
  
      async def simple_batch_embed(
          self,
-@@ -773,7 +816,7 @@ class EmbeddingClient:
+@@ -773,7 +825,7 @@ class EmbeddingClient:
      ) -> list[list[float]]:
          """Batch embed a list of text strings (each must fit token limit)."""
          return await self._get_client().simple_batch_embed(
@@ -94,9 +103,36 @@ index 30ee0825..a1a1c43b 100644
          )
  
      def prepare_chunks(self, id_resource_dict: dict[str, str]) -> dict[str, list[str]]:
+@@ -781,8 +833,24 @@ class EmbeddingClient:
+         return self._get_client().prepare_chunks(id_resource_dict)
+ 
+     def truncate_to_token_limit(self, text: str) -> str:
+-        """Truncate text to the embedding token cap (no network)."""
+-        return self._get_client().truncate_to_token_limit(text)[0]
++        """Truncate text to the embedding token cap (no network).
++
++        Every caller shortens a search query that `embed` receives next, and
++        `embed` may put the retrieval instruction in front of it. Cutting the
++        bare query to the full cap would leave the prefixed one over it, and
++        that embed fails — the silently dropped semantic results this method
++        exists to prevent. So cut with the prefix in place and hand back only
++        the query part. The room is kept whenever an instruction is configured,
++        whatever the purpose: this method only ever shortens queries, and a few
++        tokens too short beats a failed embed.
++        """
++        client = self._get_client()
++        prefix = self._query_prefix()
++        if not prefix:
++            return client.truncate_to_token_limit(text)[0]
++        truncated = client.truncate_to_token_limit(prefix + text)[0]
++        # A cap smaller than the prefix itself leaves no room for any query.
++        return truncated[len(prefix) :] if truncated.startswith(prefix) else ""
+ 
+     async def batch_embed(
+         self, id_resource_dict: dict[str, str]
 diff --git a/src/tiktoken_plain_text.py b/src/tiktoken_plain_text.py
 new file mode 100644
-index 00000000..19e1abc2
+index 0000000..19e1abc
 --- /dev/null
 +++ b/src/tiktoken_plain_text.py
 @@ -0,0 +1,26 @@
@@ -127,7 +163,7 @@ index 00000000..19e1abc2
 +    encode._honcho_plain_text = True  # pyright: ignore[reportFunctionMemberAccess]
 +    tiktoken.Encoding.encode = encode  # pyright: ignore[reportAttributeAccessIssue]
 diff --git a/tests/llm/test_embedding_client.py b/tests/llm/test_embedding_client.py
-index 7fd9237d..c009e7b1 100644
+index 7fd9237..c769532 100644
 --- a/tests/llm/test_embedding_client.py
 +++ b/tests/llm/test_embedding_client.py
 @@ -1,7 +1,9 @@
@@ -174,7 +210,7 @@ index 7fd9237d..c009e7b1 100644
  )
  
  
-@@ -60,6 +80,212 @@ class FakeOpenAIEmbeddingsAPI:
+@@ -60,6 +80,297 @@ class FakeOpenAIEmbeddingsAPI:
          return SimpleNamespace(data=data)
  
  
@@ -281,6 +317,11 @@ index 7fd9237d..c009e7b1 100644
 +#: prefix to one of them fails here.
 +CONTENT_EMBEDDING_METHODS = frozenset({"batch_embed", "prepare_chunks"})
 +
++#: Methods that reach the inner client only for token arithmetic: no network, no
++#: embedding. They must not prefix either — the query they shorten is embedded
++#: next through `embed`, which adds the instruction itself.
++TOKEN_ONLY_METHODS = frozenset({"truncate_to_token_limit"})
++
 +
 +def _embedding_client_methods() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
 +    """Every method of `EmbeddingClient`, read from the file itself."""
@@ -337,10 +378,16 @@ index 7fd9237d..c009e7b1 100644
 +        "started wrapping": sorted(wrapping - QUERY_EMBEDDING_METHODS),
 +    }
 +
-+    unclassified = set(forwarding) - QUERY_EMBEDDING_METHODS - CONTENT_EMBEDDING_METHODS
++    unclassified = (
++        set(forwarding)
++        - QUERY_EMBEDDING_METHODS
++        - CONTENT_EMBEDDING_METHODS
++        - TOKEN_ONLY_METHODS
++    )
 +    assert not unclassified, (
 +        f"EmbeddingClient forwards to the provider through new methods {sorted(unclassified)}; "
-+        "add each to QUERY_EMBEDDING_METHODS or CONTENT_EMBEDDING_METHODS in this file"
++        "add each to QUERY_EMBEDDING_METHODS, CONTENT_EMBEDDING_METHODS or "
++        "TOKEN_ONLY_METHODS in this file"
 +    )
 +
 +    assert "_prepare" in methods, "the instruction helper itself was removed"
@@ -362,6 +409,80 @@ index 7fd9237d..c009e7b1 100644
 +    assert recording_client.batched == [["Instruct: find memories\nQuery: 여러 건"]]
 +    assert {"embed", "simple_batch_embed"} == QUERY_EMBEDDING_METHODS, (
 +        "this test covers each method in QUERY_EMBEDDING_METHODS; extend it when that grows"
++    )
++
++
++def _capped_openai_client(
++    monkeypatch: pytest.MonkeyPatch, max_input_tokens: int
++) -> tuple[_EmbeddingClient, FakeOpenAIEmbeddingsAPI]:
++    """A real inner client with a small token cap over a fake OpenAI API."""
++    fake_embeddings = FakeOpenAIEmbeddingsAPI([0.1] * 8)
++
++    class FakeOpenAIClient:
++        def __init__(
++            self,
++            *,
++            api_key: str | None,
++            base_url: str | None,
++            timeout: float | None = None,
++        ) -> None:
++            self.api_key: str | None = api_key
++            self.base_url: str | None = base_url
++            self.embeddings: FakeOpenAIEmbeddingsAPI = fake_embeddings
++
++    monkeypatch.setattr("openai.AsyncOpenAI", FakeOpenAIClient)
++    client = _EmbeddingClient(
++        EmbeddingModelConfig(
++            transport="openai",
++            model="text-embedding-3-small",
++            api_key="test-key",
++            base_url="http://localhost:8000/v1",
++        ),
++        vector_dimensions=8,
++        max_input_tokens=max_input_tokens,
++        max_tokens_per_request=300_000,
++        send_dimensions=False,
++    )
++    return client, fake_embeddings
++
++
++LONG_QUERY = "where did the user say the team should deploy the payment service " * 20
++
++
++@pytest.mark.asyncio
++async def test_a_truncated_query_still_fits_once_the_instruction_is_added(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Upstream cuts an oversized search query to the cap before embedding it,
++    and the instruction goes on afterwards. A query cut to the full cap would
++    overflow and fail the embed, dropping the semantic results the cut is for.
++    """
++    inner, fake_embeddings = _capped_openai_client(monkeypatch, max_input_tokens=24)
++    monkeypatch.setattr(settings.EMBEDDING, "QUERY_INSTRUCTION", "find memories")
++    monkeypatch.setattr(EmbeddingClient, "_get_client", lambda _self: inner)
++    client = EmbeddingClient()
++
++    with embedding_call_purpose("search_memory"):
++        await client.embed(client.truncate_to_token_limit(LONG_QUERY))
++
++    sent = fake_embeddings.calls[0]["input"][0]
++    prefix = "Instruct: find memories\nQuery: "
++    assert sent.startswith(prefix)
++    query_part = sent[len(prefix) :]
++    assert query_part and LONG_QUERY.startswith(query_part)
++    assert len(inner.encoding.encode(sent)) <= 24
++
++
++def test_truncation_without_an_instruction_is_upstreams(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    inner, _ = _capped_openai_client(monkeypatch, max_input_tokens=24)
++    monkeypatch.setattr(settings.EMBEDDING, "QUERY_INSTRUCTION", None)
++    monkeypatch.setattr(EmbeddingClient, "_get_client", lambda _self: inner)
++
++    assert (
++        EmbeddingClient().truncate_to_token_limit(LONG_QUERY)
++        == inner.truncate_to_token_limit(LONG_QUERY)[0]
 +    )
 +
 +
@@ -389,7 +510,7 @@ index 7fd9237d..c009e7b1 100644
      monkeypatch: pytest.MonkeyPatch,
 diff --git a/tests/test_tiktoken_plain_text.py b/tests/test_tiktoken_plain_text.py
 new file mode 100644
-index 00000000..b2396823
+index 0000000..b239682
 --- /dev/null
 +++ b/tests/test_tiktoken_plain_text.py
 @@ -0,0 +1,21 @@

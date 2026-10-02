@@ -11,7 +11,7 @@ local-dashboard/       기억 대시보드
 .build/honcho/         빌드할 때 생성되는 실행 소스
 ```
 
-현재 공식 기반은 **v3.2.1**입니다. 원본의 파일은 서브모듈 안에서 수정하지 않습니다.
+현재 공식 기반은 **v3.2.2**입니다. 원본의 파일은 서브모듈 안에서 수정하지 않습니다.
 
 ## 소스 준비와 실행
 
@@ -44,9 +44,9 @@ API와 deriver는 준비된 소스 안의 **공식 Dockerfile**로 빌드합니�
 - MCP와 대시보드: 각각의 디렉터리에서 관리합니다. 공식 소스에 패치할 필요가 없습니다.
 
 ```sh
-scripts/prepare_upstream_update.sh v3.2.1
+scripts/prepare_upstream_update.sh v3.2.2
 # 후보에서 패치와 테스트를 검증한 뒤
-scripts/promote_upstream_update.sh v3.2.1
+scripts/promote_upstream_update.sh v3.2.2
 ```
 
 패치 충돌은 자동으로 숨기지 않습니다. 후보의 패치를 수정하고 테스트한 뒤 승격합니다.

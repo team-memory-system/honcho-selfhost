@@ -33,12 +33,12 @@ source commits and patch checksums.
 For a new official release use:
 
 ```sh
-scripts/prepare_upstream_update.sh v3.2.1
+scripts/prepare_upstream_update.sh v3.2.2
 ```
 
 The script makes a candidate worktree, updates its submodule/manifest/version,
 and replays the patches there. Resolve patch failures in that candidate, test,
-and commit it before `scripts/promote_upstream_update.sh v3.2.1`. Promotion does
+and commit it before `scripts/promote_upstream_update.sh v3.2.2`. Promotion does
 not rebuild or restart production.
 
 ## Running it
@@ -108,19 +108,22 @@ nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set.
   merge surface — but it was the only DNS-rebinding defence while a REST endpoint is
   reachable from outside, and no replacement was added. The release builder still
   emits a `TRUSTED_HOSTS` setting that nothing reads.
-- **Based on `v3.2.1` since 2026-09-30.** The merge had three mechanical conflict
-  hunks: the `simple_batch_embed` call in `src/embedding_client.py` (upstream's
-  `on_oversize` plus this fork's `_prepare`), and import blocks there and in the
-  matching test. The fork's `RecordingInnerClient` test fake had to accept
-  `on_oversize` too. Deployed the same day; migration `a7c3e9f1b2d4`
-  (`document_sources`) ran, and the reconciler's new `backfill_document_sources`
-  task fills that table in the background.
+- **Based on `v3.2.2` since 2026-10-03, not deployed yet.** The patch applied
+  cleanly. The wiring guard flagged upstream's new
+  `EmbeddingClient.truncate_to_token_limit` (#1255), which cuts an oversized search
+  query before it is embedded. It is classified as token-only, and the fork's wrapper
+  cuts with the query instruction already in place, so the prefixed query still fits
+  the cap. Deploying runs a migration that adds a `session_peers (workspace_name,
+  peer_name, session_name)` index, built without `CONCURRENTLY` (#1237). The previous
+  base, `v3.2.1`, was deployed on 2026-09-30 with migration `a7c3e9f1b2d4`
+  (`document_sources`), which the reconciler's `backfill_document_sources` task fills
+  in the background.
 - **Testing a prepared source tree.** Its `src/config.py` uses
   `load_dotenv(override=True)`, which can walk up to a production `.env`.
   Set `PYTHON_DOTENV_DISABLED=1` and use a throwaway pgvector database with
   `POSTGRES_HOST_AUTH_METHOD=trust`. The full suite also needs SDK dependencies
-  and all vector-store extras; upstream v3.2.1 has 20 known basedpyright errors
-  in its optional lancedb/qdrant files. This installation uses pgvector.
+  and all vector-store extras; upstream v3.2.1 had 20 known basedpyright errors
+  in its optional lancedb/qdrant files (not rechecked on v3.2.2). This installation uses pgvector.
 - **The two bridges need different bearer tokens.** They read
   `HONCHO_MCP_BEARER_TOKEN_FILE`, and `scripts/write_bridge_secrets.sh` writes both
   from 1Password. If one value is used for both, whoever holds the teammates'
