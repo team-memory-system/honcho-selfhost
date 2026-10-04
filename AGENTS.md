@@ -108,12 +108,14 @@ nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set.
   merge surface — but it was the only DNS-rebinding defence while a REST endpoint is
   reachable from outside, and no replacement was added. The release builder still
   emits a `TRUSTED_HOSTS` setting that nothing reads.
-- **Based on `v3.2.2` since 2026-10-03, not deployed yet.** The patch applied
+- **Based on `v3.2.2` since 2026-10-03, deployed the same night.** The API
+  container was created at 2026-10-03 00:31 KST, and the live alembic head is
+  `b8d2f4a6c9e1`. The patch applied
   cleanly. The wiring guard flagged upstream's new
   `EmbeddingClient.truncate_to_token_limit` (#1255), which cuts an oversized search
   query before it is embedded. It is classified as token-only, and the fork's wrapper
   cuts with the query instruction already in place, so the prefixed query still fits
-  the cap. Deploying runs a migration that adds a `session_peers (workspace_name,
+  the cap. Deploying ran a migration that adds a `session_peers (workspace_name,
   peer_name, session_name)` index, built without `CONCURRENTLY` (#1237). The previous
   base, `v3.2.1`, was deployed on 2026-09-30 with migration `a7c3e9f1b2d4`
   (`document_sources`), which the reconciler's `backfill_document_sources` task fills
