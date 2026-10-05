@@ -1,11 +1,7 @@
 .worktrees/
-api/**/*.db
-api/data
-api/docker-compose.yml
 
 *.db
 data
-redis-data
 /docker-compose.yml
 /compose.yml
 
@@ -176,16 +172,11 @@ cython_debug/
 
 .DS_Store
 
-supabase/
-
-docs/node_modules
 node_modules/
 
 # Local self-host companion apps: keep source and lockfiles, never vendored deps.
-codex-openai-proxy/node_modules/
 local-dashboard/node_modules/
 
-timing_logs.csv
 .bench/
 
 config.json
@@ -195,20 +186,13 @@ config.toml
 CRUSH.md
 .crush/
 
-metrics.jsonl
 # Upstream ignores AGENTS.md so a contributor's local agent notes stay out of the
 # tree. This fork tracks it instead: it is the orientation document for anyone
 # arriving here, and agents look for it by that name.
 !AGENTS.md
-lancedb_data/
-grafana-data/
 
 # Claude Code addon stuff
 .omc
-
-# Sandbox real-provider credentials (see sandbox/real.env.example)
-sandbox/real.env
-sandbox/.state.env
 
 # Generated patched Honcho source
 .build/
