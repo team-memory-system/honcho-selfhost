@@ -145,12 +145,17 @@ nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set.
 ```sh
 node --test tests/prepare-source.test.mjs
 (cd .build/honcho && PYTHON_DOTENV_DISABLED=1 uv run pytest tests/llm tests/test_security.py -q)
-(cd local-mcp-bridge && uv run pytest -q && uv run ruff check .)
+(cd local-mcp-bridge && export UV_PROJECT_ENVIRONMENT="$(mktemp -d)" && uv run --frozen --all-extras pytest -q && uv run --frozen --all-extras ruff check .)
 (cd local-dashboard && npm test)
 ```
 
 Database-backed suites need the `database` host name from inside Compose; they do not
 run from the host with this `.env`.
+
+Run the MCP bridge's tests in a throwaway environment, as above. A plain `uv run`
+syncs `local-mcp-bridge/.venv`, which is the interpreter of the live
+`com.chenjing.honcho-external-mcp` LaunchAgent. Without `--all-extras`, 5 tests in
+`tests/test_jev_gate.py` fail with `No module named 'typesafe_sdk'`.
 
 Two tests exist to fail loudly rather than degrade quietly:
 `test_query_purposes_partition_upstream_taxonomy` (an upstream purpose nobody
