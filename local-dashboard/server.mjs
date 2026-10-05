@@ -16,7 +16,6 @@ const launchDomain = `gui/${process.getuid()}`;
 const mcpDryRun = process.env.MCP_CONTROL_DRY_RUN === "1";
 const mcpControlMode = process.env.MCP_CONTROL_MODE || "launchd";
 const allowRemoteMcpControl = process.env.MCP_CONTROL_ALLOW_REMOTE === "1";
-let dryRunEnabled = true;
 let dryRunDisabledTools = new Set();
 let mcpToolConfigQueue = Promise.resolve();
 const mcpToolConfigPath = process.env.HONCHO_MCP_TOOL_CONFIG || join(process.env.HOME, ".config/honcho/mcp-bridge/tool-config.json");
@@ -114,19 +113,6 @@ const mcpToolNames = new Set(mcpTools.map(tool => tool.name));
 // launchd labels are per-installation, so they come from the environment rather
 // than from this file. MCP_CONTROL_MODE=file skips launchd entirely.
 const BRIDGE_LABEL = process.env.HONCHO_BRIDGE_LAUNCHD_LABEL || "honcho-external-mcp";
-const TUNNEL_LABEL = process.env.HONCHO_TUNNEL_LAUNCHD_LABEL || "cloudflared.honcho-mcp";
-const mcpServices = [
-  {
-    id: "bridge",
-    label: BRIDGE_LABEL,
-    plist: join(process.env.HOME, `Library/LaunchAgents/${BRIDGE_LABEL}.plist`),
-  },
-  {
-    id: "tunnel",
-    label: TUNNEL_LABEL,
-    plist: join(process.env.HOME, `Library/LaunchAgents/${TUNNEL_LABEL}.plist`),
-  },
-];
 
 const mime = {
   ".html": "text/html; charset=utf-8",
@@ -240,30 +226,6 @@ async function serviceLoaded(label) {
   }
 }
 
-async function getMcpStatus() {
-  if (mcpDryRun) {
-    return {
-      enabled: dryRunEnabled,
-      state: dryRunEnabled ? "running" : "stopped",
-      dry_run: true,
-      components: { bridge: dryRunEnabled, tunnel: dryRunEnabled },
-    };
-  }
-  if (mcpControlMode === "file") {
-    return {
-      enabled: true,
-      state: "host-managed",
-      dry_run: false,
-      components: { bridge: true, tunnel: false },
-    };
-  }
-  const values = await Promise.all(mcpServices.map(async service => [service.id, await serviceLoaded(service.label)]));
-  const components = Object.fromEntries(values);
-  const enabled = Object.values(components).every(Boolean);
-  const anyRunning = Object.values(components).some(Boolean);
-  return { enabled, state: enabled ? "running" : anyRunning ? "partial" : "stopped", dry_run: false, components };
-}
-
 async function readDisabledToolsUnlocked() {
   if (mcpDryRun) return new Set(dryRunDisabledTools);
   try {
@@ -315,31 +277,6 @@ async function setMcpToolEnabled(name, enabled) {
     }
   });
   return getMcpTools();
-}
-
-async function setMcpEnabled(enabled) {
-  if (mcpDryRun) {
-    dryRunEnabled = enabled;
-    return getMcpStatus();
-  }
-  if (mcpControlMode === "file") {
-    throw new Error("The MCP process is managed by the agent host in this deployment.");
-  }
-  if (enabled) {
-    for (const service of mcpServices) {
-      if (!existsSync(service.plist)) throw new Error(`Missing launch agent: ${service.plist}`);
-      if (!(await serviceLoaded(service.label))) {
-        await execFileAsync("launchctl", ["bootstrap", launchDomain, service.plist], { timeout: 10_000 });
-      }
-    }
-  } else {
-    for (const service of [...mcpServices].reverse()) {
-      if (await serviceLoaded(service.label)) {
-        await execFileAsync("launchctl", ["bootout", `${launchDomain}/${service.label}`], { timeout: 10_000 });
-      }
-    }
-  }
-  return getMcpStatus();
 }
 
 async function auditToken() {
@@ -434,9 +371,6 @@ createServer(async (req, res) => {
   if (req.url.startsWith("/api/dashboard/audit") && req.method === "GET") {
     return readAudit(req, res);
   }
-  if (req.url === "/api/dashboard/mcp" && req.method === "GET") {
-    return json(res, 200, await getMcpStatus());
-  }
   if (req.url === "/api/dashboard/mcp/tools" && req.method === "GET") {
     try {
       return json(res, 200, await getMcpTools());
@@ -453,17 +387,6 @@ createServer(async (req, res) => {
       return json(res, 200, await setMcpToolEnabled(body.name, body.enabled));
     } catch (error) {
       return json(res, 500, { error: "Failed to change MCP tool state.", detail: error.message });
-    }
-  }
-  if (req.url === "/api/dashboard/mcp" && req.method === "POST") {
-    const rejection = validateMcpControlRequest(req);
-    if (rejection) return json(res, rejection.status, { error: rejection.error });
-    try {
-      const body = await readJson(req);
-      if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean." });
-      return json(res, 200, await setMcpEnabled(body.enabled));
-    } catch (error) {
-      return json(res, 500, { error: "Failed to change MCP service state.", detail: error.message });
     }
   }
   if (req.url.startsWith("/api/v3/")) return proxy(req, res);

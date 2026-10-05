@@ -149,8 +149,8 @@ test("MCP control accepts localhost clients but rejects CSRF and DNS-rebinding r
   });
   assert.equal(wrongScheme.status, 403);
 
-  const rebinding = await request("/api/dashboard/mcp", {
-    body: { enabled: false },
+  const rebinding = await request("/api/dashboard/mcp/tools", {
+    body: { name: "server_info", enabled: false },
     host: "attacker.example",
     origin: "http://attacker.example",
   });
