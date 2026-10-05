@@ -8,4 +8,3 @@ tool-config.json
 bearer-token
 bearer_token*
 cloudflared*.yml
-!examples/cloudflared.yml

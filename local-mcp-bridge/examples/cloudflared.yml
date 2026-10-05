@@ -1,7 +1,0 @@
-tunnel: <tunnel-id-or-name>
-credentials-file: /absolute/path/to/cloudflared-credentials.json
-
-ingress:
-  - hostname: honcho-mcp.example.com
-    service: http://127.0.0.1:8766
-  - service: http_status:404
