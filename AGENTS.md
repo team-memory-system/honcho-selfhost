@@ -120,6 +120,15 @@ nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set.
   base, `v3.2.1`, was deployed on 2026-09-30 with migration `a7c3e9f1b2d4`
   (`document_sources`), which the reconciler's `backfill_document_sources` task fills
   in the background.
+- **A second, empty server runs on the DGX Spark** (`ssh spark`, `~/services/honcho`),
+  built 2026-10-05. It runs the same v3.2.2 images, copied from this Mac, but embeds
+  with Qwen3-Embedding 4B (`qwen3-embedding-4b-honcho-8192`, 1536 dimensions) on the
+  GB10 instead of the 8B here. Its deriver reaches this Mac's LLM router through an
+  ssh relay whose key may only forward to `127.0.0.1:11400`. It is meant to hold the
+  memory rebuilt from the conversation originals; the live `memory` stays here until
+  that cutover. Its `README.md` has the layout, the relay design and the throughput:
+  4B on the GB10 embeds about 1,070 message-length texts a minute, 8B on this Mac
+  about 114. Its compose file is specific to that host and is not in this repo.
 - **Testing a prepared source tree.** Its `src/config.py` uses
   `load_dotenv(override=True)`, which can walk up to a production `.env`.
   Set `PYTHON_DOTENV_DISABLED=1` and use a throwaway pgvector database with
