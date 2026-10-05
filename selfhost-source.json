@@ -12,7 +12,6 @@
   "localPaths": [
     "local-dashboard",
     "local-mcp-bridge",
-    "scripts/benchmark_embedding_retrieval.py",
     "scripts/write_bridge_secrets.sh",
     "scripts/write_bridge_secrets.ps1"
   ]
