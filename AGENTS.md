@@ -73,6 +73,7 @@ Everything that matters hangs off one function, `register_tool`:
 | Audit log, with the query text | `audit.py` |
 | Refusing a query before it reaches Honcho | `jev_gate.py` |
 | Runtime tool toggles from the dashboard | `_currently_disabled()` |
+| A teammate's projects behind a team server's gate (`HONCHO_MCP_SCOPE_FROM_GATE`) | `_projects_asked()` |
 
 Two processes run from one image:
 
