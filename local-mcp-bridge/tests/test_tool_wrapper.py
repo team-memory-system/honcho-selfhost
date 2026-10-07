@@ -313,6 +313,30 @@ def test_a_refused_query_never_reaches_honcho(
     assert audited[0]["arguments"]["query"] == "집 주소"
 
 
+def test_jev_reads_the_whole_of_a_long_query(
+    monkeypatch: pytest.MonkeyPatch,
+    audited: list[dict[str, Any]],
+    no_upstream: list[tuple[str, str]],
+) -> None:
+    """A question past the audit log's cut must still reach the gate."""
+    judged: list[str] = []
+
+    def judge(**kwargs: Any) -> jev_gate.Verdict:
+        judged.append(kwargs["query"])
+        return jev_gate.Verdict(allowed=True, score=0.02, reason="in scope")
+
+    monkeypatch.setattr(
+        server, "jev_gate", SimpleNamespace(judge=judge, MESSAGE="refused")
+    )
+    monkeypatch.setattr(
+        server, "get_http_request", lambda: SimpleNamespace(headers={}, client=None)
+    )
+    long = "배포 " * 3000 + "그리고 집 주소"
+
+    server.chat(long)
+    assert judged == [long]
+
+
 def test_an_allowed_query_carries_its_score(
     monkeypatch: pytest.MonkeyPatch,
     audited: list[dict[str, Any]],
@@ -362,6 +386,34 @@ def test_a_query_jev_failed_to_judge_says_so_on_its_row(
     assert audited[0]["status"] == "ok"
     assert audited[0]["jev_score"] is None
     assert audited[0]["error"] == "jev unavailable: TypeSafeAPIConnectionError: no route"
+
+
+def test_a_query_the_team_hub_let_through_without_a_key_says_so_on_its_row(
+    monkeypatch: pytest.MonkeyPatch,
+    audited: list[dict[str, Any]],
+    no_upstream: list[tuple[str, str]],
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "jev_gate",
+        SimpleNamespace(
+            judge=lambda **_: jev_gate.Verdict(
+                allowed=True,
+                score=None,
+                reason="not judged: the team hub has no Jev key",
+                no_key=True,
+            ),
+            MESSAGE="refused",
+        ),
+    )
+    monkeypatch.setattr(
+        server, "get_http_request", lambda: SimpleNamespace(headers={}, client=None)
+    )
+
+    server.chat("지난주 배포")
+    assert audited[0]["status"] == "ok"
+    assert audited[0]["jev_score"] is None
+    assert audited[0]["error"] == "not judged: the team hub has no Jev key"
 
 
 # ------------------------------------------------------- runtime reconfiguration

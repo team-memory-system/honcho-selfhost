@@ -56,9 +56,17 @@ The audit log lives in its own schema (`HONCHO_AUDIT_SCHEMA`, default
 being configurable is what makes that safe: no alembic migration ever sees it,
 so it costs nothing at merge time and Honcho's own source is unchanged.
 
-The Jev gate is off unless `HONCHO_JEV_GATE` is set. It uses `typesafe_sdk`
-directly, imported on first use, and `HONCHO_JEV_FAIL_MODE` decides whether a
-Jev outage forwards the query or refuses it.
+The Jev gate is off unless `HONCHO_JEV_GATE` is set. With `HONCHO_JEV_GUARD_URL`
+(a Team Memory member's server, whose app writes it with `HONCHO_JEV_GUARD_TOKEN`)
+it posts each gated query, as `{tool, caller, workspace, query}`, to the team
+hub's `/guard` with that server's token and follows the hub's verdict: the team's
+Jev key, model and threshold live in the hub, and a hub with no key answers
+`judged: false`, which lets the call through unjudged. Without it, it calls Jev
+itself through `typesafe_sdk` with `TYPESAFE_API_KEY`, imported on first use.
+Either way the gate reads the whole query, not the audit log's 8000-character
+copy, `HONCHO_JEV_FAIL_MODE` decides whether an outage, or a refusal of the
+token, forwards the query or refuses it, and a query forwarded without a judgment
+keeps the reason on its audit row.
 
 ## Independent LLM proxy (2026-09-23, router since 2026-09-30)
 

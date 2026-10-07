@@ -97,7 +97,8 @@ adds a tool.
 
 The audit log must never break a tool call. `audit.record` swallows everything, the
 connection has a timeout and backs off after a failure, and with no DSN it does
-nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set.
+nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set; with
+`HONCHO_JEV_GUARD_URL` it asks the team hub's guard instead of calling Jev itself.
 
 ## Open items an agent should know about
 

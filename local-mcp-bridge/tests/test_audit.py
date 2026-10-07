@@ -106,6 +106,11 @@ def test_long_values_are_truncated() -> None:
     assert len(audit.sanitize({"query": long})["query"]) < 3000
 
 
+def test_the_whole_query_is_read_without_a_limit() -> None:
+    long = "가" * 9000 + " 집 주소"
+    assert audit.query_text_of({"query": long}, limit=None) == long
+
+
 def test_a_broken_database_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """A tool call must survive an unreachable audit log."""
     monkeypatch.setattr(audit, "DSN", "postgresql://127.0.0.1:1/definitely-not-there")

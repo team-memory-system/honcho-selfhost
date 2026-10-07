@@ -157,20 +157,26 @@ class _Writer:
 _writer = _Writer()
 
 
-def _truncate(value: str, limit: int = 8000) -> str:
-    return value if len(value) <= limit else value[:limit] + "…[truncated]"
+def _truncate(value: str, limit: int | None = 8000) -> str:
+    if limit is None or len(value) <= limit:
+        return value
+    return value[:limit] + "…[truncated]"
 
 
-def query_text_of(arguments: dict[str, Any]) -> str | None:
-    """The caller's own words, pulled from whichever parameter carries them."""
+def query_text_of(arguments: dict[str, Any], *, limit: int | None = 8000) -> str | None:
+    """The caller's own words, pulled from whichever parameter carries them.
+
+    Cut at `limit` characters for the log; the Jev gate passes None, because a
+    question hidden past the cut would otherwise reach Honcho unjudged.
+    """
     for name in QUERY_PARAMS:
         value = arguments.get(name)
         if isinstance(value, str) and value.strip():
-            return _truncate(value)
+            return _truncate(value, limit)
         if isinstance(value, (list, tuple)) and value:
             joined = " | ".join(str(item) for item in value)
             if joined.strip():
-                return _truncate(joined)
+                return _truncate(joined, limit)
     return None
 
 

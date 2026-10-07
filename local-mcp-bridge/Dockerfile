@@ -6,8 +6,9 @@ ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
 
 COPY pyproject.toml uv.lock ./
-# The jev extra is installed but unused unless HONCHO_JEV_GATE is set, so the gate
-# can be switched on with an environment variable instead of a rebuild.
+# The jev extra is installed but unused unless HONCHO_JEV_GATE is set without
+# HONCHO_JEV_GUARD_URL, so the gate can be switched on with an environment variable
+# instead of a rebuild.
 RUN uv sync --frozen --no-group dev --extra jev
 COPY server.py audit.py jev_gate.py ./
 

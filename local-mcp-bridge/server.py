@@ -326,7 +326,7 @@ def register_tool(*, name: str):
 
                 verdict = jev_gate.judge(
                     tool=name,
-                    query=audit.query_text_of(arguments) or "",
+                    query=audit.query_text_of(arguments, limit=None) or "",
                     caller=caller,
                     workspace_id=workspace_id,
                 )
@@ -344,9 +344,10 @@ def register_tool(*, name: str):
                     )
                     raise RuntimeError(jev_gate.MESSAGE)
 
-                # A call Jev failed to judge and let through says so on its row;
-                # otherwise it would read like a call with the gate off.
-                unjudged = verdict.reason if verdict.failed else None
+                # A call let through without a judgment (Jev failed, or the team
+                # hub has no Jev key) says so on its row; otherwise it would read
+                # like a call with the gate off.
+                unjudged = verdict.reason if verdict.failed or verdict.no_key else None
                 try:
                     result = fn(*args, **kwargs)
                 except Exception as exc:

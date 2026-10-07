@@ -11,7 +11,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Only needed when HONCHO_JEV_GATE is on; jev_gate imports it lazily.
+# Only needed when HONCHO_JEV_GATE is on without HONCHO_JEV_GUARD_URL; jev_gate
+# imports it lazily.
 jev = ["typesafe-sdk==0.6.0"]
 
 [dependency-groups]
