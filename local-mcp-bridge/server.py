@@ -344,9 +344,13 @@ def register_tool(*, name: str):
                     )
                     raise RuntimeError(jev_gate.MESSAGE)
 
+                # A call Jev failed to judge and let through says so on its row;
+                # otherwise it would read like a call with the gate off.
+                unjudged = verdict.reason if verdict.failed else None
                 try:
                     result = fn(*args, **kwargs)
                 except Exception as exc:
+                    failure = f"{type(exc).__name__}: {exc}"
                     audit.record(
                         tool=name,
                         caller=caller,
@@ -354,7 +358,7 @@ def register_tool(*, name: str):
                         arguments=arguments,
                         workspace_id=workspace_id,
                         status="error",
-                        error=f"{type(exc).__name__}: {exc}",
+                        error=f"{failure}; {unjudged}" if unjudged else failure,
                         duration_ms=elapsed_ms(),
                         jev_score=verdict.score,
                     )
@@ -366,6 +370,7 @@ def register_tool(*, name: str):
                     arguments=arguments,
                     workspace_id=workspace_id,
                     status="ok",
+                    error=unjudged,
                     duration_ms=elapsed_ms(),
                     jev_score=verdict.score,
                 )
@@ -568,10 +573,8 @@ def _find_project(opened: list[dict[str, str]], wanted: str) -> dict[str, str]:
             "Several projects open to you on this MCP server have that name; "
             f"name one by id: {ids}"
         )
-    names = ", ".join(project["name"] for project in opened)
-    raise RuntimeError(
-        f"That project is not open to you on this MCP server. Open to you: {names}"
-    )
+    # The same words for every name that is not open: a refusal hints at no project.
+    raise RuntimeError("That project is not open to you on this MCP server")
 
 
 def _projects_asked(

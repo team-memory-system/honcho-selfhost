@@ -67,11 +67,16 @@ _client: Any = None
 
 @dataclass(frozen=True)
 class Verdict:
-    """Outcome of one judgment. `score` is None when Jev was not consulted."""
+    """Outcome of one judgment. `score` is None when Jev was not consulted.
+
+    `failed` is True when Jev was asked and gave no answer, whichever way
+    `FAIL_MODE` then decided.
+    """
 
     allowed: bool
     score: float | None
     reason: str
+    failed: bool = False
 
 
 def enabled_for(tool: str) -> bool:
@@ -139,6 +144,7 @@ def judge(*, tool: str, query: str, caller: str, workspace_id: str | None) -> Ve
 
 def _on_failure(detail: str) -> Verdict:
     logger.warning("jev gate failed (%s mode): %s", FAIL_MODE, detail)
+    reason = f"jev unavailable: {detail}"
     if FAIL_MODE == "closed":
-        return Verdict(allowed=False, score=None, reason=f"jev unavailable: {detail}")
-    return Verdict(allowed=True, score=None, reason=f"jev unavailable: {detail}")
+        return Verdict(allowed=False, score=None, reason=reason, failed=True)
+    return Verdict(allowed=True, score=None, reason=reason, failed=True)

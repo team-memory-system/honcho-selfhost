@@ -106,6 +106,7 @@ def test_fail_open_forwards_when_jev_is_down(monkeypatch: pytest.MonkeyPatch) ->
     assert verdict.allowed is True
     assert verdict.score is None
     assert "unavailable" in verdict.reason
+    assert verdict.failed is True
 
 
 def test_fail_closed_refuses_when_jev_is_down(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -117,6 +118,7 @@ def test_fail_closed_refuses_when_jev_is_down(monkeypatch: pytest.MonkeyPatch) -
     verdict = jev_gate.judge(tool="chat", query="q", caller="x", workspace_id="w")
     assert verdict.allowed is False
     assert verdict.score is None
+    assert verdict.failed is True
 
 
 def test_an_unexpected_error_does_not_escape(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -308,7 +308,7 @@ def test_a_project_is_named_by_id_or_name_in_any_case(
 
 
 @pytest.mark.parametrize("wanted", ["secret", "honch", "p-999999999999"])
-def test_a_project_not_open_is_refused_naming_the_open_ones(
+def test_a_project_not_open_is_refused_naming_no_project(
     gate: Any,
     audited: list[dict[str, Any]],
     honcho: list[dict[str, Any]],
@@ -319,7 +319,7 @@ def test_a_project_not_open_is_refused_naming_the_open_ones(
     with pytest.raises(RuntimeError, match="not open to you") as refused:
         server.chat("q", project=wanted)
 
-    assert str(refused.value).endswith("Open to you: honcho, Design")
+    assert str(refused.value) == "That project is not open to you on this MCP server"
     assert honcho == []
     assert audited[0]["status"] == "denied"
     assert audited[0]["arguments"]["project"] == wanted
@@ -650,6 +650,7 @@ def test_a_real_tool_call_reads_the_gate_headers(
     assert answered["structuredContent"] == {"content": f"from {DESIGN['id']}"}
     assert refused["isError"]
     assert "not open to you" in refused["content"][0]["text"]
+    assert "design" not in refused["content"][0]["text"].casefold()
     assert ungated["isError"]
     assert "x-honcho-scope-mode is missing" in ungated["content"][0]["text"]
     assert filtered["isError"], "chat has no filters argument to send"

@@ -333,6 +333,35 @@ def test_an_allowed_query_carries_its_score(
     server.chat("지난주 배포")
     assert audited[0]["status"] == "ok"
     assert audited[0]["jev_score"] == pytest.approx(0.02)
+    assert audited[0]["error"] is None
+
+
+def test_a_query_jev_failed_to_judge_says_so_on_its_row(
+    monkeypatch: pytest.MonkeyPatch,
+    audited: list[dict[str, Any]],
+    no_upstream: list[tuple[str, str]],
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "jev_gate",
+        SimpleNamespace(
+            judge=lambda **_: jev_gate.Verdict(
+                allowed=True,
+                score=None,
+                reason="jev unavailable: TypeSafeAPIConnectionError: no route",
+                failed=True,
+            ),
+            MESSAGE="refused",
+        ),
+    )
+    monkeypatch.setattr(
+        server, "get_http_request", lambda: SimpleNamespace(headers={}, client=None)
+    )
+
+    server.chat("지난주 배포")
+    assert audited[0]["status"] == "ok"
+    assert audited[0]["jev_score"] is None
+    assert audited[0]["error"] == "jev unavailable: TypeSafeAPIConnectionError: no route"
 
 
 # ------------------------------------------------------- runtime reconfiguration
