@@ -151,7 +151,8 @@ function renderAudit() {
 
   $("#audit-list").innerHTML = rows.map(row => {
     const badge = { ok: ["통과", "read"], denied: ["거부", "danger"], error: ["오류", "write"] }[row.status] || ["?", "read"];
-    const score = row.jev_score === null || row.jev_score === undefined ? "" : `<em class="access-badge llm">판정 ${Number(row.jev_score).toFixed(2)}</em>`;
+    const scoreBadge = (value, label) => value === null || value === undefined ? "" : `<em class="access-badge llm">${label} ${Number(value).toFixed(2)}</em>`;
+    const score = scoreBadge(row.jev_score, "판정") + scoreBadge(row.answer_score, "답 판정");
     return `<article class="audit-row ${esc(row.status)}">
       <div class="audit-head">
         <code>${esc(row.tool)}</code>

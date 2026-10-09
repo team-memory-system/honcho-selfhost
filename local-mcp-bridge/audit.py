@@ -72,8 +72,12 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.tool_calls (
     status        text        NOT NULL,
     error         text,
     duration_ms   integer,
-    jev_score     double precision
+    jev_score     double precision,
+    answer_score  double precision
 );
+
+-- A log made before answers were judged gains the column in place.
+ALTER TABLE {SCHEMA}.tool_calls ADD COLUMN IF NOT EXISTS answer_score double precision;
 
 CREATE INDEX IF NOT EXISTS tool_calls_at_idx     ON {SCHEMA}.tool_calls (at DESC);
 CREATE INDEX IF NOT EXISTS tool_calls_caller_idx ON {SCHEMA}.tool_calls (caller, at DESC);
@@ -83,8 +87,8 @@ CREATE INDEX IF NOT EXISTS tool_calls_tool_idx   ON {SCHEMA}.tool_calls (tool, a
 _INSERT = f"""
 INSERT INTO {SCHEMA}.tool_calls
     (bridge, caller, caller_source, tool, workspace_id,
-     query_text, arguments, status, error, duration_ms, jev_score)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+     query_text, arguments, status, error, duration_ms, jev_score, answer_score)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -208,8 +212,13 @@ def record(
     error: str | None = None,
     duration_ms: int | None = None,
     jev_score: float | None = None,
+    answer_score: float | None = None,
 ) -> None:
-    """Append one call. Never raises: a broken audit log must not break a tool."""
+    """Append one call. Never raises: a broken audit log must not break a tool.
+
+    `jev_score` is Jev's score for the query, `answer_score` its score for the
+    answer, which is read only once the query has passed and Honcho has answered.
+    """
     if not enabled():
         return
     try:
@@ -227,6 +236,7 @@ def record(
             _truncate(error, 2000) if error else None,
             duration_ms,
             jev_score,
+            answer_score,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("audit row build failed: %s: %s", type(exc).__name__, exc)
@@ -240,7 +250,7 @@ READ_ENABLED = (
 
 _SELECT = f"""
 SELECT id, at, bridge, caller, caller_source, tool, workspace_id,
-       query_text, arguments, status, error, duration_ms, jev_score
+       query_text, arguments, status, error, duration_ms, jev_score, answer_score
   FROM {SCHEMA}.tool_calls
  WHERE (%(caller)s::text IS NULL OR caller = %(caller)s::text)
    AND (%(tool)s::text   IS NULL OR tool   = %(tool)s::text)
@@ -265,6 +275,7 @@ _COLUMNS = (
     "error",
     "duration_ms",
     "jev_score",
+    "answer_score",
 )
 
 _SUMMARY = f"""

@@ -66,7 +66,30 @@ itself through `typesafe_sdk` with `TYPESAFE_API_KEY`, imported on first use.
 Either way the gate reads the whole query, not the audit log's 8000-character
 copy, `HONCHO_JEV_FAIL_MODE` decides whether an outage, or a refusal of the
 token, forwards the query or refuses it, and a query forwarded without a judgment
-keeps the reason on its audit row.
+keeps the reason on its audit row. A query longer than 16,000 characters, which
+the hub would not take, is refused unjudged, so padding cannot walk it past the
+gate.
+
+Once Honcho has answered, the gate reads the answer too, because a harmless
+question can still draw private matters out of the memory. Every piece of text in
+the tool's result is posted as `{tool, caller, workspace, query, answer}` (or put
+to Jev with its own question), in overlapping 16,000-character pieces when long.
+An answer judged private is withheld behind the query's own refusal, so the
+refusal does not say the memory held anything. `HONCHO_JEV_ANSWER_FAIL_MODE`
+(closed unless set) decides what an outage does to an answer. A hub that does not
+answer `checked: "answer"` predates answer checks; the answer then goes out
+unjudged and its row says so. The audit row keeps both scores, `jev_score` for the
+query and `answer_score` for the answer.
+
+The owner can try the gate from the dashboard. `POST /api/dashboard/guard-trial`
+goes to the bridge's `POST /guard-trial`, beside `/audit`, with the same token and
+on with the same `HONCHO_AUDIT_READ`, so a team server's gate, which passes only
+`/mcp` on, never lets a teammate reach it. A trial (`guard_trial` in `server.py`)
+judges the query with `jev_gate.judge`, then the answer the owner wrote or
+Honcho's own from one project's scope with `jev_gate.judge_answer`, and returns
+each verdict, the answer and what the teammate would get: `passed`, `refused`,
+`withheld`, or `no_answer` when Honcho could not answer. It names its caller
+`guard-trial` to Jev and records nothing.
 
 ## Independent LLM proxy (2026-09-23, router since 2026-09-30)
 

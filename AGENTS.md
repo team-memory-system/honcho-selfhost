@@ -71,13 +71,13 @@ Everything that matters hangs off one function, `register_tool`:
 | Concern | Where |
 |---|---|
 | Audit log, with the query text | `audit.py` |
-| Refusing a query before it reaches Honcho | `jev_gate.py` |
+| Refusing a query before it reaches Honcho, and withholding an answer before it leaves | `jev_gate.py` |
 | Runtime tool toggles from the dashboard | `_currently_disabled()` |
 | A teammate's projects behind a team server's gate (`HONCHO_MCP_SCOPE_FROM_GATE`) | `_projects_asked()` |
 
 Two processes run from one image:
 
-| | Tools | Workspace and peers | Audit read |
+| | Tools | Workspace and peers | Audit read, guard trial |
 |---|---|---|---|
 | `mcp-bridge` | Whatever the dashboard leaves on | Caller's choice, by header or argument | Yes |
 | `mcp-bridge-shared` | `HONCHO_MCP_ENABLED_TOOLS=chat` | Fixed: headers ignored, arguments naming others refused (`HONCHO_MCP_PIN_DEFAULTS`) | No |
@@ -99,6 +99,11 @@ The audit log must never break a tool call. `audit.record` swallows everything, 
 connection has a timeout and backs off after a failure, and with no DSN it does
 nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set; with
 `HONCHO_JEV_GUARD_URL` it asks the team hub's guard instead of calling Jev itself.
+It judges the query before Honcho sees it and the answer before the caller does,
+and a withheld answer gets the query's own refusal. With `HONCHO_AUDIT_READ` the
+bridge also serves `POST /guard-trial` to the dashboard (`guard_trial`): a question
+judged as a teammate's, then the answer the owner wrote or Honcho's own from one
+project's scope judged as theirs, with nothing recorded.
 
 ## Open items an agent should know about
 

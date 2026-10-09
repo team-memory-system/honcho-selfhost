@@ -1,5 +1,6 @@
 // The dashboard does not hold a database driver. It reads the audit log through
-// the bridge's guarded /audit route, so these tests stand in a fake bridge and
+// the bridge's guarded /audit route, and passes the owner's trials of the Jev gate
+// to the bridge's /guard-trial beside it, so these tests stand in a fake bridge and
 // check what the dashboard forwards, hides and reports.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -35,9 +36,18 @@ async function availablePort() {
 }
 
 function get(path) {
+  return send(path, "GET");
+}
+
+function post(path, body) {
+  const text = typeof body === "string" ? body : JSON.stringify(body);
+  return send(path, "POST", text, { "content-type": "application/json", "content-length": Buffer.byteLength(text) });
+}
+
+function send(path, method, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { hostname: "127.0.0.1", port, path, method: "GET", headers: { host: `127.0.0.1:${port}` } },
+      { hostname: "127.0.0.1", port, path, method, headers: { host: `127.0.0.1:${port}`, ...headers } },
       res => {
         const chunks = [];
         res.on("data", chunk => chunks.push(chunk));
@@ -48,7 +58,7 @@ function get(path) {
       },
     );
     req.on("error", reject);
-    req.end();
+    req.end(body);
   });
 }
 
@@ -103,8 +113,11 @@ before(async () => {
   await fs.writeFile(tokenPath, `${TOKEN}\n`);
 
   bridgePort = await availablePort();
-  bridge = createHttpServer((req, res) => {
-    seen.push({ url: req.url, authorization: req.headers.authorization || "" });
+  bridge = createHttpServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const text = Buffer.concat(chunks).toString("utf8");
+    seen.push({ method: req.method, url: req.url, authorization: req.headers.authorization || "", body: text ? JSON.parse(text) : null });
     const payload = JSON.stringify(bridgeReply.body);
     res.writeHead(bridgeReply.status, {
       "content-type": "application/json",
@@ -205,6 +218,80 @@ test("an unreachable bridge is reported as unreachable", async () => {
     const audit = await get("/api/dashboard/audit");
     assert.equal(audit.status, 502);
     assert.match(audit.body.error, /unreachable/);
+  } finally {
+    await stopDashboard();
+  }
+});
+
+test("a guard trial goes to the bridge's /guard-trial beside /audit, with the token, and its answer comes back", async () => {
+  await startDashboard({
+    HONCHO_MCP_AUDIT_URL: `http://127.0.0.1:${bridgePort}/audit`,
+    HONCHO_MCP_BEARER_TOKEN_FILE: tokenPath,
+  });
+  try {
+    seen = [];
+    const trial = {
+      gate: true,
+      outcome: "withheld",
+      query: { allowed: true, score: 0.03, reason: "in scope", unjudged: false },
+      answer: "그는 요즘 병원에 다닙니다.",
+      answer_check: { allowed: false, score: 0.96, reason: "answer withheld: it discloses private matters", unjudged: false },
+    };
+    bridgeReply = { status: 200, body: trial };
+    const body = { query: "밥 요즘 어때?", project: { id: "p-0123456789ab", name: "flypiano" }, answer: "가".repeat(20_000) };
+
+    const answer = await post("/api/dashboard/guard-trial", body);
+
+    assert.equal(answer.status, 200);
+    assert.deepEqual(answer.body, { enabled: true, ...trial });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].method, "POST");
+    assert.equal(seen[0].url, "/guard-trial");
+    assert.equal(seen[0].authorization, `Bearer ${TOKEN}`);
+    assert.deepEqual(seen[0].body, body, "an answer longer than a settings change still goes through");
+
+    // The bridge's refusal comes back as it is.
+    bridgeReply = { status: 400, body: { error: "bad_request", detail: "query takes the question to try" } };
+    const refused = await post("/api/dashboard/guard-trial", { query: " " });
+    assert.deepEqual([refused.status, refused.body.error], [400, "bad_request"]);
+    assert.equal(refused.body.enabled, undefined);
+
+    // A bridge from before the trial answers 404, which the screen tells apart.
+    bridgeReply = { status: 404, body: "Not Found" };
+    const older = await post("/api/dashboard/guard-trial", { query: "q" });
+    assert.deepEqual([older.status, older.body.code], [404, "no_trial"]);
+
+    // Nothing that is not JSON, or too big, reaches the bridge.
+    seen = [];
+    assert.equal((await post("/api/dashboard/guard-trial", "{")).status, 400);
+    assert.equal((await post("/api/dashboard/guard-trial", { query: "q", answer: "x".repeat(300_000) })).status, 400);
+    assert.equal((await send("/api/dashboard/guard-trial", "POST", "{}", { "content-type": "text/plain" })).status, 415);
+    assert.equal((await get("/api/dashboard/guard-trial")).status, 404);
+    assert.equal(seen.length, 0);
+  } finally {
+    await stopDashboard();
+  }
+});
+
+test("without an audit URL there is no trial, and an unreachable bridge says so", async () => {
+  await startDashboard({});
+  try {
+    const off = await post("/api/dashboard/guard-trial", { query: "q" });
+    assert.equal(off.status, 200);
+    assert.equal(off.body.enabled, false);
+  } finally {
+    await stopDashboard();
+  }
+
+  const deadPort = await availablePort();
+  await startDashboard({
+    HONCHO_MCP_AUDIT_URL: `http://127.0.0.1:${deadPort}/audit`,
+    HONCHO_MCP_BEARER_TOKEN_FILE: tokenPath,
+  });
+  try {
+    const dead = await post("/api/dashboard/guard-trial", { query: "q" });
+    assert.equal(dead.status, 502);
+    assert.equal(dead.body.trial_url, `http://127.0.0.1:${deadPort}/guard-trial`);
   } finally {
     await stopDashboard();
   }

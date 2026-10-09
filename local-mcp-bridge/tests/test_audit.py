@@ -40,10 +40,14 @@ def test_record_keeps_the_query_text_verbatim(monkeypatch: pytest.MonkeyPatch) -
         error="out of scope",
         duration_ms=12,
         jev_score=0.91,
+        answer_score=0.04,
     )
 
     assert len(rows) == 1
-    (_bridge, caller, source, tool, ws, query, args_json, status, error, ms, score) = rows[0]
+    (
+        _bridge, caller, source, tool, ws, query, args_json, status, error, ms, score,
+        answer_score,
+    ) = rows[0]
     assert tool == "chat"
     assert caller == "teammate@example.com"
     assert source == "cf-access"
@@ -54,6 +58,16 @@ def test_record_keeps_the_query_text_verbatim(monkeypatch: pytest.MonkeyPatch) -
     assert error == "out of scope"
     assert ms == 12
     assert score == pytest.approx(0.91)
+    assert answer_score == pytest.approx(0.04)
+
+
+def test_the_answer_score_is_a_column_an_older_log_gains() -> None:
+    """A table made before answers were judged has no answer_score; the DDL run on
+    every connection adds it, so the insert does not fail on an older log."""
+    assert "ADD COLUMN IF NOT EXISTS answer_score" in audit._DDL
+    assert audit._INSERT.count("%s") == 12
+    assert audit._COLUMNS[-1] == "answer_score"
+    assert "answer_score" in audit._SELECT
 
 
 def test_query_text_can_be_withheld(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -154,7 +168,7 @@ def test_a_failure_backs_off_instead_of_retrying_every_call(
         raise OSError("connection refused")
 
     monkeypatch.setattr(writer, "_connect", counting_connect)
-    row = ("bridge", "caller", "address", "search", "memory", "q", "{}", "ok", None, 1, None)
+    row = ("bridge", "caller", "address", "search", "memory", "q", "{}", "ok", None, 1, None, None)
 
     writer.write(row)
     first = attempts

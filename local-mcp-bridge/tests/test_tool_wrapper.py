@@ -284,6 +284,32 @@ def test_a_broken_audit_log_does_not_break_the_tool(
 # ------------------------------------------------------------------ jev gate
 
 
+def _answer_passes(**_: Any) -> jev_gate.Verdict:
+    return jev_gate.Verdict(allowed=True, score=None, reason="gate off")
+
+
+def _gate(
+    query: jev_gate.Verdict, answer: jev_gate.Verdict | None = None
+) -> tuple[SimpleNamespace, list[dict[str, Any]]]:
+    """A stand-in gate giving these verdicts, and the answer checks it was asked."""
+    asked: list[dict[str, Any]] = []
+
+    def judge_answer(**kwargs: Any) -> jev_gate.Verdict:
+        asked.append(kwargs)
+        return answer or _answer_passes()
+
+    gate = SimpleNamespace(
+        judge=lambda **_: query, judge_answer=judge_answer, MESSAGE="refused"
+    )
+    return gate, asked
+
+
+def _no_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        server, "get_http_request", lambda: SimpleNamespace(headers={}, client=None)
+    )
+
+
 def test_a_refused_query_never_reaches_honcho(
     monkeypatch: pytest.MonkeyPatch, audited: list[dict[str, Any]]
 ) -> None:
@@ -298,6 +324,7 @@ def test_a_refused_query_never_reaches_honcho(
             judge=lambda **_: jev_gate.Verdict(
                 allowed=False, score=0.95, reason="out of scope"
             ),
+            judge_answer=_answer_passes,
             MESSAGE="refused",
         ),
     )
@@ -326,7 +353,7 @@ def test_jev_reads_the_whole_of_a_long_query(
         return jev_gate.Verdict(allowed=True, score=0.02, reason="in scope")
 
     monkeypatch.setattr(
-        server, "jev_gate", SimpleNamespace(judge=judge, MESSAGE="refused")
+        server, "jev_gate", SimpleNamespace(judge=judge, judge_answer=_answer_passes, MESSAGE="refused")
     )
     monkeypatch.setattr(
         server, "get_http_request", lambda: SimpleNamespace(headers={}, client=None)
@@ -347,6 +374,7 @@ def test_an_allowed_query_carries_its_score(
         "jev_gate",
         SimpleNamespace(
             judge=lambda **_: jev_gate.Verdict(allowed=True, score=0.02, reason="in scope"),
+            judge_answer=_answer_passes,
             MESSAGE="refused",
         ),
     )
@@ -375,6 +403,7 @@ def test_a_query_jev_failed_to_judge_says_so_on_its_row(
                 reason="jev unavailable: TypeSafeAPIConnectionError: no route",
                 failed=True,
             ),
+            judge_answer=_answer_passes,
             MESSAGE="refused",
         ),
     )
@@ -403,6 +432,7 @@ def test_a_query_the_team_hub_let_through_without_a_key_says_so_on_its_row(
                 reason="not judged: the team hub has no Jev key",
                 no_key=True,
             ),
+            judge_answer=_answer_passes,
             MESSAGE="refused",
         ),
     )
@@ -414,6 +444,140 @@ def test_a_query_the_team_hub_let_through_without_a_key_says_so_on_its_row(
     assert audited[0]["status"] == "ok"
     assert audited[0]["jev_score"] is None
     assert audited[0]["error"] == "not judged: the team hub has no Jev key"
+
+
+def test_an_answer_that_discloses_private_matters_is_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+    audited: list[dict[str, Any]],
+    no_upstream: list[tuple[str, str]],
+) -> None:
+    gate, asked = _gate(
+        jev_gate.Verdict(allowed=True, score=0.02, reason="in scope"),
+        jev_gate.Verdict(allowed=False, score=0.97, reason=jev_gate.ANSWER_REFUSED),
+    )
+    monkeypatch.setattr(server, "jev_gate", gate)
+    _no_request(monkeypatch)
+
+    # The very refusal a refused question gets: nothing says the answer existed.
+    with pytest.raises(RuntimeError, match="^refused$"):
+        server.chat("지난주 배포 어땠어?")
+
+    assert no_upstream, "the question passed, so Honcho was asked"
+    assert len(asked) == 1
+    assert audited == [audited[0]]
+    assert audited[0]["status"] == "denied"
+    assert audited[0]["error"] == jev_gate.ANSWER_REFUSED
+    assert audited[0]["jev_score"] == pytest.approx(0.02)
+    assert audited[0]["answer_score"] == pytest.approx(0.97)
+
+
+def test_the_answer_judged_is_what_honcho_gave_for_that_question(
+    monkeypatch: pytest.MonkeyPatch, audited: list[dict[str, Any]]
+) -> None:
+    answer = {"content": "배포는 금요일에 했습니다.", "evidence": None}
+    monkeypatch.setattr(server, "_request", lambda *args, **kwargs: answer)
+    gate, asked = _gate(
+        jev_gate.Verdict(allowed=True, score=0.02, reason="in scope"),
+        jev_gate.Verdict(allowed=True, score=0.05, reason="answer in scope"),
+    )
+    monkeypatch.setattr(server, "jev_gate", gate)
+    _no_request(monkeypatch)
+
+    assert server.chat("지난주 배포 어땠어?") == answer
+
+    assert asked[0]["result"] == answer
+    assert asked[0]["query"] == "지난주 배포 어땠어?"
+    assert asked[0]["tool"] == "chat"
+    assert audited[0]["status"] == "ok"
+    assert audited[0]["error"] is None
+    assert audited[0]["jev_score"] == pytest.approx(0.02)
+    assert audited[0]["answer_score"] == pytest.approx(0.05)
+
+
+def test_a_refused_query_or_a_failed_call_has_no_answer_to_judge(
+    monkeypatch: pytest.MonkeyPatch, audited: list[dict[str, Any]]
+) -> None:
+    gate, asked = _gate(jev_gate.Verdict(allowed=False, score=0.9, reason="out of scope"))
+    monkeypatch.setattr(server, "jev_gate", gate)
+    _no_request(monkeypatch)
+    with pytest.raises(RuntimeError):
+        server.chat("집 주소")
+
+    gate, asked_after_failure = _gate(
+        jev_gate.Verdict(allowed=True, score=0.02, reason="in scope")
+    )
+    monkeypatch.setattr(server, "jev_gate", gate)
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("Honcho is down")
+
+    monkeypatch.setattr(server, "_request", broken)
+    with pytest.raises(RuntimeError, match="Honcho is down"):
+        server.chat("지난주 배포")
+
+    assert asked == []
+    assert asked_after_failure == []
+    assert [row["status"] for row in audited] == ["denied", "error"]
+
+
+@pytest.mark.parametrize(
+    ("query", "answer", "error"),
+    [
+        pytest.param(
+            jev_gate.Verdict(allowed=True, score=0.02, reason="in scope"),
+            jev_gate.Verdict(
+                allowed=True, score=None, reason=jev_gate.ANSWER_SKIPPED, skipped=True
+            ),
+            jev_gate.ANSWER_SKIPPED,
+            id="hub-without-answer-checks",
+        ),
+        pytest.param(
+            jev_gate.Verdict(
+                allowed=True,
+                score=None,
+                reason="not judged: the team hub has no Jev key",
+                no_key=True,
+            ),
+            jev_gate.Verdict(
+                allowed=True,
+                score=None,
+                reason="not judged: the team hub has no Jev key",
+                no_key=True,
+            ),
+            "not judged: the team hub has no Jev key",
+            id="no-key-said-once",
+        ),
+        pytest.param(
+            jev_gate.Verdict(
+                allowed=True, score=None, reason="jev unavailable: x", failed=True
+            ),
+            jev_gate.Verdict(
+                allowed=True,
+                score=None,
+                reason="jev unavailable for the answer: y",
+                failed=True,
+            ),
+            "jev unavailable: x; jev unavailable for the answer: y",
+            id="both-unjudged",
+        ),
+    ],
+)
+def test_an_answer_let_through_unjudged_says_so_on_its_row(
+    monkeypatch: pytest.MonkeyPatch,
+    audited: list[dict[str, Any]],
+    no_upstream: list[tuple[str, str]],
+    query: jev_gate.Verdict,
+    answer: jev_gate.Verdict,
+    error: str,
+) -> None:
+    gate, _ = _gate(query, answer)
+    monkeypatch.setattr(server, "jev_gate", gate)
+    _no_request(monkeypatch)
+
+    server.chat("지난주 배포")
+
+    assert audited[0]["status"] == "ok"
+    assert audited[0]["error"] == error
 
 
 # ------------------------------------------------------- runtime reconfiguration

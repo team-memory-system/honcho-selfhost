@@ -26,10 +26,27 @@ const auditUrl = (process.env.HONCHO_MCP_AUDIT_URL || "").replace(/\/$/, "");
 const auditTokenFile = process.env.HONCHO_MCP_BEARER_TOKEN_FILE || "";
 const auditTokenInline = process.env.HONCHO_MCP_BEARER_TOKEN || "";
 const auditFilters = ["limit", "caller", "tool", "status", "bridge", "hours"];
+// The owner's trial of the Jev gate is the bridge's other route for the dashboard,
+// beside /audit, with the same token.
+const trialUrl = besideAudit("guard-trial");
+// A trial carries a question and maybe an answer, each up to what Jev reads at once.
+const TRIAL_BODY_BYTES = 256 * 1024;
+// Honcho may take its time over the answer, and Jev is asked twice; this still ends
+// before the app that relays the trial stops waiting (180 s).
+const TRIAL_TIMEOUT_MS = 170_000;
 // A server installed by the Team Memory app has the app as its screen. There the
 // dashboard keeps only its /api routes, which the app relays, and sends a browser
 // that opens it to the app instead of showing a second, older screen.
 const appUrl = loopbackHttpUrl(process.env.DASHBOARD_APP_URL);
+
+/** The bridge's route `name` beside its /audit, or "" without a usable audit URL. */
+function besideAudit(name) {
+  try {
+    return auditUrl ? new URL(name, auditUrl).href : "";
+  } catch {
+    return "";
+  }
+}
 
 function loopbackHttpUrl(value) {
   if (!value) return "";
@@ -127,12 +144,12 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-async function readJson(req) {
+async function readJson(req, limit = 16_384) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 16_384) throw new Error("Request body is too large.");
+    if (size > limit) throw new Error("Request body is too large.");
     chunks.push(chunk);
   }
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
@@ -308,6 +325,40 @@ async function readAudit(req, res) {
   }
 }
 
+/**
+ * The owner tries the Jev gate: the bridge judges a question as a teammate's, then
+ * the answer, written or Honcho's own from one project, and says what the teammate
+ * would have got. The body goes on as it came; the bridge reads it.
+ */
+async function tryGuard(req, res) {
+  if (!trialUrl) {
+    return json(res, 200, { enabled: false, reason: "HONCHO_MCP_AUDIT_URL is not set." });
+  }
+  let body;
+  try {
+    body = await readJson(req, TRIAL_BODY_BYTES);
+  } catch (error) {
+    return json(res, 400, { error: error.message });
+  }
+  try {
+    const token = await auditToken();
+    const upstream = await fetch(trialUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TRIAL_TIMEOUT_MS),
+    });
+    if (upstream.status === 404) {
+      await upstream.arrayBuffer().catch(() => {});
+      return json(res, 404, { error: "This bridge has no guard trial yet.", code: "no_trial" });
+    }
+    const payload = await upstream.json().catch(() => ({ error: "Guard trial response was not JSON." }));
+    return json(res, upstream.status, upstream.ok ? { enabled: true, ...payload } : payload);
+  } catch (error) {
+    return json(res, 502, { error: "The bridge is unreachable.", detail: error.message, trial_url: trialUrl });
+  }
+}
+
 async function proxy(req, res) {
   const path = req.url.slice("/api".length);
   if (!path.startsWith("/v3/")) return json(res, 400, { error: "Only Honcho v3 routes are allowed." });
@@ -370,6 +421,9 @@ createServer(async (req, res) => {
   }
   if (req.url.startsWith("/api/dashboard/audit") && req.method === "GET") {
     return readAudit(req, res);
+  }
+  if (req.url === "/api/dashboard/guard-trial" && req.method === "POST") {
+    return tryGuard(req, res);
   }
   if (req.url === "/api/dashboard/mcp/tools" && req.method === "GET") {
     try {

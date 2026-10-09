@@ -28,7 +28,10 @@ class _FakeClient:
         self.calls.append({"state": state, "questions": questions})
         if self._error is not None:
             raise self._error
-        return SimpleNamespace(answers={"out_of_scope": _FakeAnswer(self._noul)})
+        # Jev answers every question it is asked, under the name it was asked by.
+        return SimpleNamespace(
+            answers={name: _FakeAnswer(self._noul) for name in questions}
+        )
 
     def close(self) -> None:
         return None
@@ -135,6 +138,192 @@ def test_an_unexpected_error_does_not_escape(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_the_question_names_both_outcomes() -> None:
     assert set(jev_gate.CRITERIA) == {"true", "false"}
+    assert set(jev_gate.ANSWER_CRITERIA) == {"true", "false"}
+
+
+def test_a_query_longer_than_the_limit_is_refused_unjudged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Padding a question past what Jev reads must not walk it past the gate."""
+    client = _FakeClient(noul=0.01)
+    _enable(monkeypatch, client)
+    monkeypatch.setattr(jev_gate, "FAIL_MODE", "open")
+
+    long = "배포 " * (jev_gate.TEXT_LIMIT // 3) + "그리고 집 주소"
+    verdict = jev_gate.judge(tool="chat", query=long, caller="x", workspace_id="w")
+
+    assert len(long) > jev_gate.TEXT_LIMIT
+    assert verdict.allowed is False
+    assert verdict.reason == jev_gate.QUERY_TOO_LONG
+    assert client.calls == []
+    at_limit = "가" * jev_gate.TEXT_LIMIT
+    assert jev_gate.judge(tool="chat", query=at_limit, caller="x", workspace_id="w").allowed
+
+
+# --------------------------------------------------------------------- answers
+
+
+def _check(result: Any, query: str = "지난주 배포 어땠어?") -> Any:
+    return jev_gate.judge_answer(
+        tool="chat", query=query, result=result, caller="teammate", workspace_id="memory"
+    )
+
+
+def test_an_answer_is_judged_with_its_own_question(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(noul=0.95)
+    _enable(monkeypatch, client)
+    monkeypatch.setattr(jev_gate, "THRESHOLD", 0.7)
+
+    verdict = _check({"content": "그날은 병원 진료 때문에 쉬었습니다.", "evidence": None})
+
+    assert verdict.allowed is False
+    assert verdict.score == pytest.approx(0.95)
+    assert verdict.reason == jev_gate.ANSWER_REFUSED
+    (call,) = client.calls
+    assert list(call["questions"]) == ["sensitive_answer"]
+    assert call["questions"]["sensitive_answer"].instructions == jev_gate.ANSWER_QUESTION
+    assert call["state"]["answer"] == "그날은 병원 진료 때문에 쉬었습니다."
+    assert call["state"]["query"] == "지난주 배포 어땠어?"
+
+
+def test_a_work_answer_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable(monkeypatch, _FakeClient(noul=0.03))
+    verdict = _check({"content": "배포는 금요일에 했습니다."})
+    assert verdict.allowed is True
+    assert verdict.score == pytest.approx(0.03)
+    assert verdict.reason == "answer in scope"
+    assert verdict.unjudged is False
+
+
+def test_every_piece_of_text_in_a_result_is_read() -> None:
+    result = {
+        "answers": [
+            {"project": "flypiano", "answer": {"content": "학습 실험", "evidence": None}},
+            {"project": "cmux", "error": "Honcho could not answer"},
+        ],
+        "count": 2,
+        "ok": True,
+    }
+    assert jev_gate.text_of(result) == "flypiano\n학습 실험\ncmux\nHoncho could not answer"
+    assert jev_gate.text_of("그대로") == "그대로"
+    assert jev_gate.text_of(None) == ""
+
+
+def test_an_answer_with_no_text_is_not_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(noul=0.99)
+    _enable(monkeypatch, client)
+    assert _check({"content": "  ", "evidence": None}).allowed is True
+    assert _check(None).allowed is True
+    assert client.calls == []
+
+
+def test_answers_are_judged_only_for_the_named_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(noul=0.99)
+    _enable(monkeypatch, client)
+    verdict = jev_gate.judge_answer(
+        tool="search", query="q", result={"content": "x"}, caller="x", workspace_id="w"
+    )
+    assert verdict.allowed is True
+    monkeypatch.setattr(jev_gate, "ENABLED", False)
+    assert _check({"content": "x"}).allowed is True
+    assert client.calls == []
+
+
+def test_a_long_answer_is_judged_in_overlapping_pieces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(noul=0.04)
+    _enable(monkeypatch, client)
+    answer = "가" * (jev_gate.TEXT_LIMIT * 2)
+
+    assert _check({"content": answer}).allowed is True
+
+    pieces = [call["state"]["answer"] for call in client.calls]
+    assert len(pieces) == 3
+    assert all(len(piece) <= jev_gate.TEXT_LIMIT for piece in pieces)
+    step = jev_gate.TEXT_LIMIT - jev_gate.ANSWER_OVERLAP
+    assert "".join(piece[:step] for piece in pieces[:-1]) + pieces[-1] == answer
+
+
+def test_a_blank_piece_of_a_long_answer_is_not_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(noul=0.03)
+    _enable(monkeypatch, client)
+    answer = "배포 결과 정리" + " " * (jev_gate.TEXT_LIMIT * 2)
+
+    assert _check({"content": answer}).allowed is True
+
+    assert len(jev_gate._pieces(answer)) == 3
+    assert [call["state"]["answer"].strip() for call in client.calls] == ["배포 결과 정리"]
+
+
+def test_one_refused_piece_withholds_the_whole_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scores = iter([0.02, 0.96, 0.01])
+
+    class Scoring(_FakeClient):
+        def system_one(self, *, state: Any, questions: dict[str, Any]) -> Any:
+            self.calls.append({"state": state, "questions": questions})
+            score = next(scores)
+            return SimpleNamespace(answers={name: _FakeAnswer(score) for name in questions})
+
+    client = Scoring()
+    _enable(monkeypatch, client)
+    answer = "업무 " * (jev_gate.TEXT_LIMIT // 2)
+
+    verdict = _check({"content": answer})
+
+    assert verdict.allowed is False
+    assert verdict.score == pytest.approx(0.96)
+    assert len(client.calls) == 2, "the first refused piece decides"
+
+
+def test_an_answer_too_long_to_judge_is_withheld(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(noul=0.01)
+    _enable(monkeypatch, client)
+    answer = "가" * (jev_gate.TEXT_LIMIT * (jev_gate.ANSWER_PIECES + 1))
+
+    verdict = _check({"content": answer})
+
+    assert verdict.allowed is False
+    assert verdict.reason == jev_gate.ANSWER_TOO_LONG
+    assert client.calls == []
+
+
+def test_an_answer_jev_cannot_judge_is_withheld_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typesafe_sdk import TypeSafeAPIConnectionError
+
+    _enable(monkeypatch, _FakeClient(error=TypeSafeAPIConnectionError("no route")))
+    # The query side forwards on a failure; the answer side has its own mode.
+    monkeypatch.setattr(jev_gate, "FAIL_MODE", "open")
+    assert jev_gate.ANSWER_FAIL_MODE == "closed"
+
+    verdict = _check({"content": "배포는 금요일"})
+
+    assert verdict.allowed is False
+    assert verdict.failed is True
+    assert verdict.reason.startswith("jev unavailable for the answer: ")
+
+    monkeypatch.setattr(jev_gate, "ANSWER_FAIL_MODE", "open")
+    let_through = _check({"content": "배포는 금요일"})
+    assert let_through.allowed is True
+    assert let_through.unjudged is True
+
+
+def test_an_unreadable_result_is_a_failure_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, _FakeClient(noul=0.01))
+
+    class Unprintable:
+        def __str__(self) -> str:
+            raise ValueError("no text")
+
+    verdict = _check({"content": Unprintable()})
+    assert verdict.allowed is False
+    assert verdict.reason == "jev unavailable for the answer: unreadable result: ValueError"
 
 
 # ------------------------------------------------------------- team hub guard
@@ -497,6 +686,86 @@ def test_the_hub_client_uses_the_jev_timeout(monkeypatch: pytest.MonkeyPatch) ->
         assert client.timeout == httpx.Timeout(3.5)
     finally:
         client.close()
+
+
+def test_the_hub_judges_the_answer_with_the_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _hub(
+        monkeypatch,
+        _answer(judged=True, allowed=False, score=0.97, threshold=0.7, checked="answer"),
+    )
+
+    verdict = _check({"content": "연봉은 7천입니다."}, query="지난주 배포")
+
+    assert json.loads(seen[0].content) == {
+        "tool": "chat",
+        "caller": "teammate",
+        "workspace": "memory",
+        "query": "지난주 배포",
+        "answer": "연봉은 7천입니다.",
+    }
+    assert verdict.allowed is False
+    assert verdict.score == pytest.approx(0.97)
+    assert verdict.reason == jev_gate.ANSWER_REFUSED
+
+
+def test_the_hub_passing_an_answer_lets_it_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    _hub(
+        monkeypatch,
+        _answer(judged=True, allowed=True, score=0.03, threshold=0.7, checked="answer"),
+    )
+    verdict = _check({"content": "배포는 금요일"})
+    assert verdict.allowed is True
+    assert verdict.score == pytest.approx(0.03)
+    assert verdict.unjudged is False
+
+
+def test_a_hub_that_does_not_judge_answers_lets_them_out_unjudged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hub from before answers were judged reads the query alone, so its score
+    is not taken for the answer's."""
+    _hub(monkeypatch, _answer(judged=True, allowed=False, score=0.99, threshold=0.7))
+
+    verdict = _check({"content": "배포는 금요일"})
+
+    assert verdict.allowed is True
+    assert verdict.score is None
+    assert verdict.skipped is True
+    assert verdict.reason == jev_gate.ANSWER_SKIPPED
+
+
+def test_a_team_without_a_jev_key_lets_answers_out_unjudged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _hub(monkeypatch, _answer(judged=False, allowed=True, score=None, reason="no_key"))
+    verdict = _check({"content": "배포는 금요일"})
+    assert verdict.allowed is True
+    assert verdict.no_key is True
+
+
+@pytest.mark.parametrize(("handler", "detail"), FAILURES)
+def test_a_hub_failure_on_an_answer_withholds_it(
+    monkeypatch: pytest.MonkeyPatch, handler: Handler, detail: str
+) -> None:
+    _hub(monkeypatch, handler, fail_mode="open")
+
+    verdict = _check({"content": "배포는 금요일"})
+
+    assert verdict.allowed is False
+    assert verdict.failed is True
+    assert verdict.reason == f"jev unavailable for the answer: {detail}"
+
+
+def test_a_long_query_never_reaches_the_hub(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _hub(
+        monkeypatch, _answer(judged=True, allowed=True, score=0.01, threshold=0.7)
+    )
+    verdict = _ask("가" * (jev_gate.TEXT_LIMIT + 1))
+    assert verdict.allowed is False
+    assert verdict.reason == jev_gate.QUERY_TOO_LONG
+    assert seen == []
 
 
 def test_the_hub_is_not_asked_when_the_gate_is_off_or_the_query_empty(

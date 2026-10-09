@@ -252,14 +252,24 @@ def _audit_workspace(arguments: dict[str, Any]) -> str | None:
         return arguments.get("workspace_id")
 
 
+def _unjudged(*verdicts: jev_gate.Verdict) -> str | None:
+    """Why a call let through went without a judgment, once per distinct reason."""
+    reasons: list[str] = []
+    for verdict in verdicts:
+        if verdict.unjudged and verdict.reason not in reasons:
+            reasons.append(verdict.reason)
+    return "; ".join(reasons) or None
+
+
 def register_tool(*, name: str):
     """Register one tool, routed through the audit log and the Jev gate.
 
     Every tool goes through here, so this is the single place that records what was
     asked and the single place a query can be refused: a disabled tool, a pinned
     bridge's other workspace or peer, a call outside a teammate's projects, then the
-    Jev gate. Nested calls (``get_metadata`` reaching for ``inspect_workspace``) are
-    logged once, at the outermost call.
+    Jev gate on the query and, once Honcho has answered, on the answer. Nested calls
+    (``get_metadata`` reaching for ``inspect_workspace``) are logged once, at the
+    outermost call.
     """
     if not _tool_is_registered(name):
 
@@ -324,11 +334,9 @@ def register_tool(*, name: str):
                     )
                     raise RuntimeError(violation)
 
+                query = audit.query_text_of(arguments, limit=None) or ""
                 verdict = jev_gate.judge(
-                    tool=name,
-                    query=audit.query_text_of(arguments, limit=None) or "",
-                    caller=caller,
-                    workspace_id=workspace_id,
+                    tool=name, query=query, caller=caller, workspace_id=workspace_id
                 )
                 if not verdict.allowed:
                     audit.record(
@@ -347,7 +355,7 @@ def register_tool(*, name: str):
                 # A call let through without a judgment (Jev failed, or the team
                 # hub has no Jev key) says so on its row; otherwise it would read
                 # like a call with the gate off.
-                unjudged = verdict.reason if verdict.failed or verdict.no_key else None
+                unjudged = _unjudged(verdict)
                 try:
                     result = fn(*args, **kwargs)
                 except Exception as exc:
@@ -364,6 +372,32 @@ def register_tool(*, name: str):
                         jev_score=verdict.score,
                     )
                     raise
+
+                # The answer is read before it leaves: a harmless question can
+                # still draw private matters out of the memory. A withheld answer
+                # gets the very refusal a refused question gets, so the refusal
+                # says nothing about what the memory holds.
+                checked = jev_gate.judge_answer(
+                    tool=name,
+                    query=query,
+                    result=result,
+                    caller=caller,
+                    workspace_id=workspace_id,
+                )
+                if not checked.allowed:
+                    audit.record(
+                        tool=name,
+                        caller=caller,
+                        caller_source=caller_source,
+                        arguments=arguments,
+                        workspace_id=workspace_id,
+                        status="denied",
+                        error=checked.reason,
+                        duration_ms=elapsed_ms(),
+                        jev_score=verdict.score,
+                        answer_score=checked.score,
+                    )
+                    raise RuntimeError(jev_gate.MESSAGE)
                 audit.record(
                     tool=name,
                     caller=caller,
@@ -371,9 +405,10 @@ def register_tool(*, name: str):
                     arguments=arguments,
                     workspace_id=workspace_id,
                     status="ok",
-                    error=unjudged,
+                    error=_unjudged(verdict, checked),
                     duration_ms=elapsed_ms(),
                     jev_score=verdict.score,
+                    answer_score=checked.score,
                 )
                 return result
             finally:
@@ -679,6 +714,17 @@ def _request(
 ) -> Any:
     _require_auth()
     _require_card_access(path, params)
+    return _honcho(method, path, body=body, params=params)
+
+
+def _honcho(
+    method: str,
+    path: str,
+    *,
+    body: dict[str, Any] | list[Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    """One Honcho API call, for a caller already let in."""
     url = f"{HONCHO_BASE_URL}{path}"
     with httpx.Client(timeout=TIMEOUT_SECONDS) as client:
         resp = client.request(method, url, json=body, params=params)
@@ -1398,14 +1444,104 @@ def get_queue_status(
     return _request("GET", f"/v3/workspaces/{ws}/queue/status", params=params)
 
 
-# --------------------------------------------------------------------- audit read
+# ------------------------------------------------------------- the dashboard's routes
+#
+# Two routes for the owner's dashboard, beside /mcp and never under it, so the
+# server's gate, which passes on /mcp alone, never lets a teammate reach them: the
+# audit log, and a trial of the Jev gate. HONCHO_AUDIT_READ turns both on, and both
+# take the bridge's own bearer token.
 
 
-def _audit_read_authorized(request: Any) -> bool:
+def _dashboard_authorized(request: Any) -> bool:
     if not OPTIONAL_BEARER_TOKEN:
         return False
     auth = request.headers.get("authorization", "")
     return secrets.compare_digest(auth, f"Bearer {OPTIONAL_BEARER_TOKEN}")
+
+
+#: The caller a trial names to Jev, in place of a teammate's email.
+TRIAL_CALLER = "guard-trial"
+
+
+def _verdict_view(verdict: jev_gate.Verdict) -> dict[str, Any]:
+    return {
+        "allowed": verdict.allowed,
+        "score": verdict.score,
+        "reason": verdict.reason,
+        "unjudged": verdict.unjudged,
+    }
+
+
+def guard_trial(
+    query: str, *, answer: str | None = None, project: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """What a teammate asking `query` would get, step by step, for the owner to try.
+
+    The query is judged as a teammate's `chat` is. If it may go on, the answer is
+    `answer` as the owner wrote it, else Honcho's own from `project`'s scope as a
+    teammate's would be, and it is judged as a teammate's answer is. `outcome` is
+    "refused" (the query), "withheld" (the answer), "passed", or "no_answer" when
+    Honcho could not answer; with neither an answer nor a project only the query is
+    judged. Nothing is recorded: a trial is not a teammate's call.
+    """
+    defaults = _resolve_defaults()
+    workspace = defaults["workspace_id"]
+    verdict = jev_gate.judge(
+        tool="chat", query=query, caller=TRIAL_CALLER, workspace_id=workspace
+    )
+    trial: dict[str, Any] = {
+        "gate": jev_gate.enabled_for("chat"),
+        "message": jev_gate.MESSAGE,
+        "query": _verdict_view(verdict),
+        "answer": None,
+        "answer_check": None,
+    }
+    if not verdict.allowed:
+        return {**trial, "outcome": "refused"}
+    result: Any
+    if answer is not None:
+        result = answer
+    elif project is not None:
+        subject = defaults["user_name"] or defaults["assistant_name"]
+        try:
+            result = _honcho(
+                "POST",
+                f"/v3/workspaces/{workspace}/peers/{subject}/chat",
+                body={"query": query, "reasoning_level": "low", "scope": project["id"]},
+            )
+        except (RuntimeError, httpx.HTTPError) as exc:
+            return {**trial, "outcome": "no_answer", "error": str(exc) or type(exc).__name__}
+    else:
+        return {**trial, "outcome": "passed"}
+    checked = jev_gate.judge_answer(
+        tool="chat", query=query, result=result, caller=TRIAL_CALLER, workspace_id=workspace
+    )
+    return {
+        **trial,
+        "answer": jev_gate.text_of(result),
+        "answer_check": _verdict_view(checked),
+        "outcome": "passed" if checked.allowed else "withheld",
+    }
+
+
+def _trial_input(body: Any) -> dict[str, Any] | str:
+    """guard_trial's arguments from a request body, or why they cannot be read."""
+    if not isinstance(body, dict):
+        return "the body is a JSON object"
+    query = body.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return "query takes the question to try"
+    answer = body.get("answer")
+    if answer is not None and (not isinstance(answer, str) or not answer.strip()):
+        return "answer takes the answer to try, or is left out"
+    project = body.get("project")
+    if project is not None:
+        project_id = project.get("id") if isinstance(project, dict) else None
+        if not isinstance(project_id, str) or not PROJECT_ID.fullmatch(project_id):
+            return "project takes {id, name} of a project, or is left out"
+        name = project.get("name")
+        project = {"id": project_id, "name": name if isinstance(name, str) and name.strip() else project_id}
+    return {"query": query, "answer": answer, "project": project}
 
 
 def _int_param(params: Any, name: str, default: int | None) -> int | None:
@@ -1431,7 +1567,7 @@ if audit.READ_ENABLED:
 
         from starlette.responses import JSONResponse
 
-        if not _audit_read_authorized(request):
+        if not _dashboard_authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         params = request.query_params
         try:
@@ -1448,6 +1584,34 @@ if audit.READ_ENABLED:
             logger.warning("audit read failed: %s: %s", type(exc).__name__, exc)
             return JSONResponse(
                 {"error": "audit read failed", "detail": str(exc)}, status_code=500
+            )
+        return JSONResponse(payload)
+
+    @mcp.custom_route("/guard-trial", methods=["POST"])
+    async def guard_trial_route(request: Any) -> Any:
+        """The owner's trial of the Jev gate (see guard_trial), from the dashboard."""
+        import asyncio
+
+        from starlette.responses import JSONResponse
+
+        if not _dashboard_authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        trial = _trial_input(body)
+        if isinstance(trial, str):
+            return JSONResponse({"error": "bad_request", "detail": trial}, status_code=400)
+        try:
+            payload = await asyncio.to_thread(
+                guard_trial, trial["query"], answer=trial["answer"], project=trial["project"]
+            )
+        except Exception as exc:  # noqa: BLE001 - reported to the dashboard as JSON
+            logger.warning("guard trial failed: %s", type(exc).__name__)
+            return JSONResponse(
+                {"error": "guard trial failed", "detail": type(exc).__name__},
+                status_code=500,
             )
         return JSONResponse(payload)
 
