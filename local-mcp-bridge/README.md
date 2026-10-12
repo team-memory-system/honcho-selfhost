@@ -81,7 +81,7 @@ and operational-inspection tool that is disabled in production.
 | `HONCHO_MCP_REQUIRE_AUTH` | false | fail startup when bearer is unavailable |
 | `HONCHO_MCP_REQUIRE_TOOL_CONFIG` | false | fail startup when tool state is unavailable |
 | `HONCHO_MCP_HIDE_PEER_CARDS` | false | omit card tools and reject card inclusion in session context for this process |
-| `HONCHO_MCP_SCOPE_FROM_GATE` | false | behind a team server's gate: answer the owner as usual and a teammate only from the projects the gate names (see below) |
+| `HONCHO_MCP_SCOPE_FROM_GATE` | false | behind a team server's gate: answer the owner as usual and a teammate only from the conversations in the folders the gate names (see below) |
 
 `X-Honcho-Workspace-ID`, `X-Honcho-User-Name`, and
 `X-Honcho-Assistant-Name` request headers override the corresponding defaults.
@@ -109,7 +109,7 @@ new URL, preserve its authentication headers, and restart the client from a
 shell with its existing `HONCHO_CHEN_*` environment variables loaded. Verify
 using `get_representation(peer_id="user_chen", observer_id="user_chen")`.
 
-## Projects behind a team server's gate
+## Folders behind a team server's gate
 
 A team server reaches this bridge only through its gate, which checks each
 caller's Cloudflare Access login, drops every `x-honcho-*` header the caller sent,
@@ -119,37 +119,50 @@ them:
 | `x-honcho-scope-mode` | Caller | The bridge |
 |---|---|---|
 | `all` | the server's owner | works as without the setting |
-| `projects` | a teammate | answers `chat` only, from the projects in `x-honcho-allowed-scopes` |
+| `folders` | a teammate | answers `chat` only, from the conversations in the folders in `x-honcho-allowed-folders` |
 | missing, repeated or anything else | | refuses every call |
 
-`x-honcho-allowed-scopes` is base64url, with or without padding, of a JSON list
-such as `[{"id": "p-0123456789ab", "name": "honcho"}]`: the projects the owner
-opened to that teammate. Each id is a Honcho scope and must match
-`^p-[0-9a-f]{12}$`. A list that is missing, repeated or malformed refuses the call.
+`x-honcho-allowed-folders` is base64url, with or without padding, of a UTF-8 JSON
+list such as `[{"path": "/Users/me/dev/honcho", "subfolders": true}]`: the folders
+the owner opened to that teammate. Each entry has exactly a non-empty `path` and a
+`subfolders` that is true or false. A list that is missing, repeated or malformed
+refuses the call, and so does an entry with any other key: the bridge cannot tell
+what it was meant to hold back, and reading past it could open more than the owner
+meant. An empty list is valid and opens nothing.
+
+A conversation is in an open folder when the folder it started in, the session's
+`metadata.cwd` as the collector records it, is that folder, or lies under it and
+the entry has `subfolders`. Both paths are compared with backslashes read as `/`,
+repeated `/` read as one, and a trailing `/` dropped, except from `/` itself or a
+drive root such as `C:/`; a root with `subfolders` opens every path under it. A
+path that starts with a drive letter ignores case, as Windows does, and any other
+path keeps it. A session without a `cwd` in text is in no folder.
 
 A teammate's `chat`:
 
-- takes `project`, an id or a name in any case. A project that is not open to
-  them is refused, and the refusal names the open ones.
-- without `project`, uses the only open project, or asks two to five one by one
-  and returns `{"answers": [{"project": name, "answer": ...}]}`. A project Honcho
-  could not answer, such as one with no conversation collected yet, has `error`
-  instead of `answer`; when none answers, the call fails. More than five are
-  refused, with their names.
-- is refused with no open project, and with `session_id` or `filters`.
-- is about the server's owner (`HONCHO_USER_NAME`), unless `peer_id` or
-  `target_peer_id` names another peer.
+- is one Honcho chat, about the server's owner (`HONCHO_USER_NAME`) unless
+  `peer_id` or `target_peer_id` names another peer, with
+  `filters: {"session_id": {"in": [...]}}` naming the sessions in the open
+  folders. Honcho recalls only from those sessions, and the answer comes back as
+  Honcho gave it.
+- is refused when the open folders hold no conversation, in the same words whether
+  nothing is open or what is open is empty, and when they hold more than 1000, the
+  most one Honcho chat takes; the owner then has to open fewer folders.
+- is refused with `session_id` or `filters`, and every other tool is refused.
 
-Every Honcho call carries exactly one `scope`, the project's id. Honcho answers a
-single scope as the scope itself, from that project's conversations only; for a
-list it keeps the peer in the path as the observer and mixes that peer's whole
-card into the answer. `project` is refused where it means nothing: from the owner,
-and on a bridge without the setting.
+The bridge lists the workspace's sessions (`POST
+/v3/workspaces/{ws}/sessions/list`, 100 to a page) and keeps the list for 60
+seconds, so a burst of questions lists them once and a conversation started now is
+open within a minute. Calls that arrive while the list is read wait for it. The
+folders themselves come with every call, so a folder the owner opens or closes
+applies to the next question.
 
 Refusals are recorded in the audit log as `denied`, before the Jev gate and before
-Honcho. The arguments of a teammate's call record the projects it asked as
-`projects`, whether or not the caller named one. The setting does not pin the
-workspace or the peers; the team server's bridge also sets
+Honcho. A session list that cannot be read is recorded as `error`, with its cause,
+while the teammate is told only that it could not be listed. The arguments of a
+teammate's call record the folders as the gate sent them, as `folders`, and how
+many conversations the answer was confined to, as `sessions`. The setting does not
+pin the workspace or the peers; the team server's bridge also sets
 `HONCHO_MCP_PIN_DEFAULTS=1` and `HONCHO_MCP_ENABLED_TOOLS=chat`.
 
 ## Upstream maintenance

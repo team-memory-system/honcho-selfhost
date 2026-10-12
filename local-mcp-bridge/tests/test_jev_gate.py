@@ -197,14 +197,17 @@ def test_a_work_answer_passes(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_every_piece_of_text_in_a_result_is_read() -> None:
     result = {
-        "answers": [
-            {"project": "flypiano", "answer": {"content": "학습 실험", "evidence": None}},
-            {"project": "cmux", "error": "Honcho could not answer"},
-        ],
-        "count": 2,
+        "content": "학습 실험",
+        "evidence": {
+            "messages": [
+                {"session": "flypiano", "text": "실험 두 개"},
+                {"session": "cmux", "text": None},
+            ],
+            "count": 2,
+        },
         "ok": True,
     }
-    assert jev_gate.text_of(result) == "flypiano\n학습 실험\ncmux\nHoncho could not answer"
+    assert jev_gate.text_of(result) == "학습 실험\nflypiano\n실험 두 개\ncmux"
     assert jev_gate.text_of("그대로") == "그대로"
     assert jev_gate.text_of(None) == ""
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import functools
 import inspect
 import json
@@ -10,8 +11,9 @@ import re
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 from fastmcp import FastMCP
@@ -104,18 +106,27 @@ PEER_ARGUMENTS = frozenset(
     }
 )
 
-#: Take each caller's projects from the gate of a team server. The gate checks the
+#: Take each caller's reach from the gate of a team server. The gate checks the
 #: caller's Cloudflare Access login, drops every x-honcho-* header the caller sent,
-#: and says who is calling: the server's owner (`all`) or a teammate (`projects`,
-#: with the projects the owner opened to them). Anything else is refused.
+#: and says who is calling: the server's owner (`all`) or a teammate (`folders`,
+#: with the folders the owner opened to them). Anything else is refused.
 SCOPE_FROM_GATE = _env_flag("HONCHO_MCP_SCOPE_FROM_GATE")
 SCOPE_MODE_HEADER = "x-honcho-scope-mode"
-ALLOWED_SCOPES_HEADER = "x-honcho-allowed-scopes"
-PROJECT_ID = re.compile(r"p-[0-9a-f]{12}")
+ALLOWED_FOLDERS_HEADER = "x-honcho-allowed-folders"
 
-#: A teammate's `chat` that names no project asks each open project in turn, up to
-#: this many.
-MAX_PROJECTS_ASKED = 5
+#: The most sessions one Honcho chat confines itself to
+#: (MAX_SESSION_ALLOWLIST_ENTRIES in Honcho's src/utils/filter.py). Folders holding
+#: more are refused here rather than sent to be refused by Honcho.
+MAX_SESSION_ALLOWLIST_ENTRIES = 1000
+
+#: How long a workspace's sessions, as listed, answer for which folder each one is
+#: in. A burst of questions lists them once, and a conversation started now is
+#: open within a minute.
+SESSION_LIST_TTL_SECONDS = 60.0
+#: Sessions asked for per page, the most Honcho's pagination returns.
+SESSION_PAGE_SIZE = 100
+#: Pages read before giving up, so a listing that never ends cannot hold a call.
+MAX_SESSION_PAGES = 1000
 
 if REQUIRE_AUTH and not OPTIONAL_BEARER_TOKEN:
     raise RuntimeError(
@@ -178,6 +189,14 @@ mcp = FastMCP(
 _tool_config_lock = threading.Lock()
 _tool_config_cache: dict[str, Any] = {"mtime": None, "disabled": DISABLED_TOOL_NAMES}
 _call_depth = threading.local()
+
+#: What the wrapper resolved for the call in progress: a teammate's reach, or None
+#: when the call is not confined. The tool body reads it instead of listing the
+#: sessions a second time; outside a wrapped call it holds `_UNRESOLVED`.
+_UNRESOLVED = object()
+_call_reach: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "honcho_mcp_call_reach", default=_UNRESOLVED
+)
 
 
 def _tool_is_registered(name: str) -> bool:
@@ -266,7 +285,7 @@ def register_tool(*, name: str):
 
     Every tool goes through here, so this is the single place that records what was
     asked and the single place a query can be refused: a disabled tool, a pinned
-    bridge's other workspace or peer, a call outside a teammate's projects, then the
+    bridge's other workspace or peer, a call outside a teammate's folders, then the
     Jev gate on the query and, once Honcho has answered, on the answer. Nested calls
     (``get_metadata`` reaching for ``inspect_workspace``) are logged once, at the
     outermost call.
@@ -289,6 +308,7 @@ def register_tool(*, name: str):
             def elapsed_ms() -> int:
                 return int((time.perf_counter() - started) * 1000)
 
+            reached: contextvars.Token[Any] | None = None
             # Set inside the try, so that a failure while gathering the call's own
             # details still restores the depth. A thread left at depth 1 would skip
             # the audit log for every later call that lands on it.
@@ -311,16 +331,21 @@ def register_tool(*, name: str):
                     raise RuntimeError(f"Tool is disabled on this MCP server: {name}")
 
                 violation = _pin_violation(arguments)
+                failure: str | None = None
+                reach: TeammateReach | None = None
                 if not violation:
                     try:
-                        projects = _projects_asked(name, arguments)
+                        reach = _teammate_reach(name, arguments)
                     except RuntimeError as exc:
                         violation = str(exc)
-                    else:
-                        if projects is not None:
-                            # Recorded whether or not the caller named one, so the
-                            # log says which projects each answer came from.
-                            arguments["projects"] = projects
+                if reach is not None:
+                    # Recorded on every teammate's call, refused or answered, so the
+                    # log says which folders an answer came from and how many
+                    # conversations they held.
+                    arguments["folders"] = reach.folders
+                    if reach.sessions is not None:
+                        arguments["sessions"] = len(reach.sessions)
+                    violation, failure = reach.refusal, reach.failure
                 if violation:
                     audit.record(
                         tool=name,
@@ -328,11 +353,14 @@ def register_tool(*, name: str):
                         caller_source=caller_source,
                         arguments=arguments,
                         workspace_id=workspace_id,
-                        status="denied",
-                        error=violation,
+                        # A failure the caller hears of only as a refusal keeps its
+                        # cause here, for the owner.
+                        status="error" if failure else "denied",
+                        error=failure or violation,
                         duration_ms=elapsed_ms(),
                     )
                     raise RuntimeError(violation)
+                reached = _call_reach.set(reach)
 
                 query = audit.query_text_of(arguments, limit=None) or ""
                 verdict = jev_gate.judge(
@@ -412,6 +440,8 @@ def register_tool(*, name: str):
                 )
                 return result
             finally:
+                if reached is not None:
+                    _call_reach.reset(reached)
                 _call_depth.value = depth
 
         return mcp.tool(name=name)(wrapper)
@@ -543,33 +573,45 @@ def _gate_header(headers: Any, name: str) -> str | None:
     return values[0] if len(values) == 1 else None
 
 
-def _decode_projects(raw: str | None) -> list[dict[str, str]]:
-    """The gate's allowed list: base64url, padded or not, of JSON [{"id", "name"}].
+#: base64url's alphabet, with or without its padding.
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]*={0,2}")
 
-    Raises ValueError or TypeError for anything else, including an id that is not a
-    project id.
+
+def _folder_entry(item: Any) -> dict[str, Any]:
+    """One open folder as the gate or the owner sends it, or TypeError/ValueError.
+
+    Exactly {"path": non-empty text, "subfolders": true or false}. A key the bridge
+    does not read is refused rather than ignored: it could only have been meant to
+    narrow the folder, and ignoring it would open more than the owner meant.
     """
-    if raw is None:
-        raise ValueError("no list")
-    padded = raw + "=" * (-len(raw) % 4)
-    items = json.loads(base64.b64decode(padded, altchars=b"-_", validate=True))
-    if not isinstance(items, list):
+    if not isinstance(item, dict):
+        raise TypeError("not a folder")
+    if set(item) != {"path", "subfolders"}:
+        raise ValueError("not exactly path and subfolders")
+    if not isinstance(item["path"], str) or not isinstance(item["subfolders"], bool):
+        raise TypeError("path is not text, or subfolders is not true or false")
+    if not item["path"]:
+        raise ValueError("no path")
+    return item
+
+
+def _decode_folders(raw: str | None) -> list[dict[str, Any]]:
+    """The gate's open folders, kept as sent. An empty list opens nothing.
+
+    The header is base64url, padded or not, of UTF-8 JSON [{"path", "subfolders"}].
+    Raises ValueError or TypeError for anything else.
+    """
+    if raw is None or not _BASE64URL.fullmatch(raw):
+        raise ValueError("not base64url")
+    text = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+    folders = json.loads(text)
+    if not isinstance(folders, list):
         raise TypeError("not a list")
-    projects: dict[str, dict[str, str]] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            raise TypeError("not an object")
-        project_id, name = item.get("id"), item.get("name")
-        if not isinstance(project_id, str) or not PROJECT_ID.fullmatch(project_id):
-            raise ValueError("not a project id")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("no name")
-        projects.setdefault(project_id, {"id": project_id, "name": name})
-    return list(projects.values())
+    return [_folder_entry(item) for item in folders]
 
 
-def _gate_projects() -> list[dict[str, str]] | None:
-    """The projects the gate opened to this caller, or None when it opened them all.
+def _gate_folders() -> list[dict[str, Any]] | None:
+    """The folders the gate opened to this caller, or None when it opened everything.
 
     Fails closed: without an HTTP request, with a header missing or repeated, an
     unknown mode, or a list that does not read, the call is refused (RuntimeError).
@@ -581,112 +623,238 @@ def _gate_projects() -> list[dict[str, str]] | None:
     mode = _gate_header(headers, SCOPE_MODE_HEADER)
     if mode == "all":
         return None
-    if mode != "projects":
+    if mode != "folders":
         raise RuntimeError(
             "This MCP server takes its scope from its gate, and "
             f"{SCOPE_MODE_HEADER} is missing, repeated or unknown"
         )
     try:
-        return _decode_projects(_gate_header(headers, ALLOWED_SCOPES_HEADER))
-    except (TypeError, ValueError) as exc:
+        return _decode_folders(_gate_header(headers, ALLOWED_FOLDERS_HEADER))
+    except (TypeError, ValueError, RecursionError) as exc:
         raise RuntimeError(
             "This MCP server takes its scope from its gate, and "
-            f"{ALLOWED_SCOPES_HEADER} is missing, repeated or malformed"
+            f"{ALLOWED_FOLDERS_HEADER} is missing, repeated or malformed"
         ) from exc
 
 
-def _find_project(opened: list[dict[str, str]], wanted: str) -> dict[str, str]:
-    """The open project that `wanted` names, by id or by name, in any case."""
-    key = wanted.strip().casefold()
-    matches = [project for project in opened if project["id"] == key] or [
-        project for project in opened if project["name"].strip().casefold() == key
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    if matches:
-        ids = ", ".join(project["id"] for project in matches)
-        raise RuntimeError(
-            "Several projects open to you on this MCP server have that name; "
-            f"name one by id: {ids}"
+#: A path that starts at a Windows drive, once its backslashes read as "/".
+_DRIVE_PATH = re.compile(r"[A-Za-z]:/")
+_REPEATED_SLASHES = re.compile(r"/{2,}")
+
+
+def _norm_path(path: str) -> str:
+    """One spelling per folder, so a session's folder and an open folder compare.
+
+    Backslashes read as "/", repeated "/" as one, and a trailing "/" is dropped
+    except from a root ("/" or "C:/"). A path on a Windows drive ignores case, as
+    Windows does; any other path keeps it.
+    """
+    text = _REPEATED_SLASHES.sub("/", path.replace("\\", "/"))
+    drive = _DRIVE_PATH.match(text) is not None
+    root = 3 if drive else 1
+    if len(text) > root and text.endswith("/"):
+        text = text[:-1]
+    return text.casefold() if drive else text
+
+
+def _folder_matcher(folders: list[dict[str, Any]]) -> Callable[[str | None], bool]:
+    """Whether a session's folder, spelled by `_norm_path`, is open under `folders`.
+
+    A session is open when its folder is one of them, or lies under one that opens
+    its subfolders. Each folder above the session's is looked up once, so a long
+    list of folders costs no more per session than a short one.
+    """
+    exact = {_norm_path(folder["path"]) for folder in folders}
+    trees = {_norm_path(folder["path"]) for folder in folders if folder["subfolders"]}
+
+    def holds(cwd: str | None) -> bool:
+        if cwd is None:
+            return False
+        if cwd in exact:
+            return True
+        if not trees:
+            return False
+        # The folders above cwd end where one of its "/" starts, /a above /a/b, and
+        # a root keeps its "/": "/" above /a, "c:/" above c:/a.
+        cut = cwd.find("/")
+        while cut != -1:
+            if cwd[:cut] in trees or cwd[: cut + 1] in trees:
+                return True
+            cut = cwd.find("/", cut + 1)
+        return False
+
+    return holds
+
+
+#: The clock the session lists are timed by. Tests replace it.
+_clock = time.monotonic
+
+_session_lists_lock = threading.Lock()
+#: Each workspace's sessions as last listed, and when: (listed_at, ((id, folder),
+#: ...)), the folder spelled by `_norm_path`, or None for a session without one.
+_session_lists: dict[str, tuple[float, tuple[tuple[str, str | None], ...]]] = {}
+
+
+def _list_sessions(workspace_id: str) -> tuple[tuple[str, str | None], ...]:
+    """Every session in the workspace, by id, with the folder it started in.
+
+    The folder is the session's `metadata.cwd`, which the collector records; a
+    session without one in text is in no folder. Raises TypeError or ValueError for
+    a listing that does not read, and whatever `_honcho` raises for one that fails.
+    """
+    path = f"/v3/workspaces/{workspace_id}/sessions/list"
+    sessions: dict[str, str | None] = {}
+    page = 1
+    while True:
+        listed = _honcho(
+            "POST", path, body={}, params={"page": page, "size": SESSION_PAGE_SIZE}
         )
-    # The same words for every name that is not open: a refusal hints at no project.
-    raise RuntimeError("That project is not open to you on this MCP server")
+        items = listed.get("items") if isinstance(listed, dict) else None
+        pages = listed.get("pages") if isinstance(listed, dict) else None
+        if not isinstance(items, list) or not isinstance(pages, int):
+            raise TypeError(f"Honcho's sessions, page {page}, do not read as a page")
+        if pages > MAX_SESSION_PAGES:
+            raise ValueError(
+                f"Honcho lists {pages} pages of sessions, more than the "
+                f"{MAX_SESSION_PAGES} this MCP server reads"
+            )
+        for item in items:
+            session_id = item.get("id") if isinstance(item, dict) else None
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError("Honcho listed a session without an id")
+            metadata = item.get("metadata")
+            cwd = metadata.get("cwd") if isinstance(metadata, dict) else None
+            # A session that moves across a page boundary while the pages are read
+            # shows up twice; it is one session.
+            sessions.setdefault(
+                session_id, _norm_path(cwd) if isinstance(cwd, str) else None
+            )
+        if page >= pages:
+            return tuple(sessions.items())
+        page += 1
 
 
-def _projects_asked(
-    tool: str, arguments: dict[str, Any]
-) -> list[dict[str, str]] | None:
-    """The projects one call answers from, or None when it is not confined to any.
+def _workspace_sessions(workspace_id: str) -> tuple[tuple[str, str | None], ...]:
+    """The workspace's sessions as listed at most SESSION_LIST_TTL_SECONDS ago.
+
+    One listing at a time: a call that arrives while one runs waits for it and
+    takes its result, so a burst of questions lists the sessions once. A listing
+    that fails is not kept, and the next call lists again.
+    """
+    with _session_lists_lock:
+        started = _clock()
+        kept = _session_lists.get(workspace_id)
+        if kept is not None and started - kept[0] < SESSION_LIST_TTL_SECONDS:
+            return kept[1]
+        sessions = _list_sessions(workspace_id)
+        # Lists past their time are dropped here, so naming many workspaces does
+        # not grow the cache. Each is timed from when its listing began, so nothing
+        # it missed is held back longer than the time-to-live.
+        for name, (listed_at, _) in list(_session_lists.items()):
+            if started - listed_at >= SESSION_LIST_TTL_SECONDS:
+                del _session_lists[name]
+        _session_lists[workspace_id] = (started, sessions)
+        return sessions
+
+
+def _open_sessions(workspace_id: str, folders: list[dict[str, Any]]) -> list[str]:
+    """The sessions in `folders`, by id, in the order Honcho lists them.
+
+    Worked out when each call arrives, against the sessions as listed at most a
+    minute ago: a folder the owner opens or closes applies to the next question,
+    and a conversation started in an open folder joins within a minute.
+    """
+    if not folders:
+        return []
+    holds = _folder_matcher(folders)
+    return [
+        session_id
+        for session_id, cwd in _workspace_sessions(workspace_id)
+        if holds(cwd)
+    ]
+
+
+#: The refusal when the open folders hold no conversation. The same words whether
+#: nothing is open or what is open is empty, so it says nothing about the memory.
+NO_CONVERSATION = "No conversation in the folders open to you on this MCP server"
+
+
+def _allowlist_refusal(sessions: list[str]) -> str | None:
+    """Why one Honcho chat cannot be confined to `sessions`, or None when it can."""
+    if not sessions:
+        return NO_CONVERSATION
+    if len(sessions) > MAX_SESSION_ALLOWLIST_ENTRIES:
+        return (
+            "The folders open to you on this MCP server hold more than "
+            f"{MAX_SESSION_ALLOWLIST_ENTRIES} conversations, more than one answer "
+            "can draw on; the owner has to open fewer folders"
+        )
+    return None
+
+
+class TeammateReach(NamedTuple):
+    """What one teammate's call may draw on, and why it is refused if it is."""
+
+    #: The folders the gate opened to them, as it sent them.
+    folders: list[dict[str, Any]]
+    #: The sessions in those folders, by id, or None when they were not listed.
+    sessions: list[str] | None = None
+    #: Why the call is refused, if it is.
+    refusal: str | None = None
+    #: The failure a refusal stands in for, kept for the audit log alone.
+    failure: str | None = None
+
+
+def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | None:
+    """What one call may draw on, or None when it is not confined.
 
     Only a bridge behind a team server's gate confines calls, and only a teammate's:
-    they may `chat`, about the project they name or about each open project when
-    they name none. Raises RuntimeError, with the reason, for a refused call.
+    they may `chat`, answered in one Honcho call from the sessions in the folders
+    the owner opened to them. A gate header that does not read raises RuntimeError.
+    Once the folders are known, a refusal comes back in the reach instead, so the
+    audit log can say which folders and how many conversations it was about.
     """
-    project = arguments.get("project")
-    opened = _gate_projects() if SCOPE_FROM_GATE else None
-    if opened is None:
-        if project and not SCOPE_FROM_GATE:
-            raise RuntimeError("project cannot be used on this MCP server; omit it")
-        if project:
-            raise RuntimeError(
-                "project is not needed: every project on this MCP server is open "
-                "to you; omit it"
-            )
+    folders = _gate_folders() if SCOPE_FROM_GATE else None
+    if folders is None:
         return None
     if tool != "chat":
-        raise RuntimeError(
-            f"{tool} cannot be used with projects on this MCP server; use chat"
+        return TeammateReach(
+            folders,
+            refusal=f"{tool} cannot be used with folders on this MCP server; use chat",
         )
-    if not opened:
-        raise RuntimeError("No project on this MCP server is open to you")
-    # Honcho takes a scope instead of these, never with them.
+    # A teammate is answered from every conversation open to them, and the bridge
+    # names those sessions to Honcho itself.
     if arguments.get("session_id"):
-        raise RuntimeError(
-            "session_id cannot be used with projects on this MCP server; omit it"
+        return TeammateReach(
+            folders,
+            refusal=(
+                "session_id cannot be used with folders on this MCP server; omit it"
+            ),
         )
     if arguments.get("filters"):
-        raise RuntimeError(
-            "filters cannot be used with projects on this MCP server; omit them"
+        return TeammateReach(
+            folders,
+            refusal="filters cannot be used with folders on this MCP server; omit them",
         )
-    if project:
-        return [_find_project(opened, project)]
-    if len(opened) > MAX_PROJECTS_ASKED:
-        names = ", ".join(item["name"] for item in opened)
-        raise RuntimeError(
-            f"{len(opened)} projects are open to you on this MCP server, more than "
-            f"{MAX_PROJECTS_ASKED} to ask at once; name one with project: {names}"
+    # Listing the sessions is a Honcho call too, made only for a caller let in.
+    _require_auth()
+    workspace_id = _resolve_defaults(workspace_id=arguments.get("workspace_id"))[
+        "workspace_id"
+    ]
+    try:
+        sessions = _open_sessions(workspace_id, folders)
+    except Exception as exc:  # noqa: BLE001 - refused and recorded, never a crash
+        # The teammate hears only that the list could not be read; the cause goes
+        # to the owner's audit log.
+        return TeammateReach(
+            folders,
+            refusal=(
+                "The conversations in the folders open to you could not be listed "
+                "on this MCP server; try again later"
+            ),
+            failure=f"listing the sessions failed: {type(exc).__name__}: {exc}",
         )
-    return opened
-
-
-def _ask_each_project(
-    path: str, body: dict[str, Any], projects: list[dict[str, str]]
-) -> Any:
-    """Ask Honcho once per project, each call confined to that project's scope.
-
-    Never a list of scopes: Honcho answers one scope as the scope itself, but for a
-    list it keeps the path peer as the observer and mixes that peer's whole card
-    into the answer. Several projects are asked one by one.
-    """
-
-    def ask(project: dict[str, str]) -> Any:
-        return _request("POST", path, body={**body, "scope": project["id"]})
-
-    if len(projects) == 1:
-        return ask(projects[0])
-    answers: list[dict[str, Any]] = []
-    failures: list[RuntimeError] = []
-    for project in projects:
-        try:
-            answers.append({"project": project["name"], "answer": ask(project)})
-        except RuntimeError as exc:
-            # Honcho refused this project alone, typically one with no conversation
-            # yet, which has no scope. The others still answer.
-            failures.append(exc)
-            answers.append({"project": project["name"], "error": str(exc)})
-    if len(failures) == len(projects):
-        raise failures[0]
-    return {"answers": answers}
+    return TeammateReach(folders, sessions, _allowlist_refusal(sessions))
 
 
 def _require_card_access(path: str, params: dict[str, Any] | None) -> None:
@@ -998,36 +1166,37 @@ def chat(
     session_id: str | None = None,
     reasoning_level: str = "low",
     workspace_id: str | None = None,
-    project: str | None = None,
 ) -> Any:
     """Ask Honcho what it knows about a peer using natural language.
 
-    On a team server a teammate is answered only from the projects its owner opened
-    to them, about the owner unless peer_id or target_peer_id names another peer.
-    `project` picks one of them, by id or by name, in any case. Without it, a single
-    open project is used, and two to five are each asked and returned as
-    {"answers": [{"project": name, "answer": ...}]} (a project Honcho could not
-    answer has "error" instead of "answer"); with more, name one. session_id cannot
-    be used with projects. Anywhere else, omit project.
+    On a team server a teammate is answered from the conversations in the folders
+    its owner opened to them, all of them in this one call, about the owner unless
+    peer_id or target_peer_id names another peer. session_id cannot be used there.
     """
-    projects = _projects_asked("chat", {"project": project, "session_id": session_id})
+    reach = _call_reach.get()
+    if reach is _UNRESOLVED:
+        # Called outside the wrapper, which works this out once per call.
+        reach = _teammate_reach(
+            "chat", {"session_id": session_id, "workspace_id": workspace_id}
+        )
     defaults = _resolve_defaults(workspace_id=workspace_id)
     ws = defaults["workspace_id"]
-    if projects is not None:
-        # With a scope Honcho answers as the scope itself, and the peer in the path
-        # is only the one asked about. That is the server's owner, whose work the
-        # projects hold, unless the caller names another peer.
+    if reach is not None:
+        if reach.refusal:
+            raise RuntimeError(reach.refusal)
+        # Honcho recalls only from the sessions listed. The peer in the path is the
+        # one asked about: the server's owner, whose work the folders hold, unless
+        # the caller names another peer.
         subject = peer_id or defaults["user_name"] or defaults["assistant_name"]
         body = _clean_none(
             {
                 "query": query,
                 "target": target_peer_id,
                 "reasoning_level": reasoning_level,
+                "filters": {"session_id": {"in": reach.sessions}},
             }
         )
-        return _ask_each_project(
-            f"/v3/workspaces/{ws}/peers/{subject}/chat", body, projects
-        )
+        return _request("POST", f"/v3/workspaces/{ws}/peers/{subject}/chat", body=body)
     observer = peer_id or defaults["assistant_name"]
     body = _clean_none(
         {
@@ -1473,16 +1642,20 @@ def _verdict_view(verdict: jev_gate.Verdict) -> dict[str, Any]:
 
 
 def guard_trial(
-    query: str, *, answer: str | None = None, project: dict[str, str] | None = None
+    query: str,
+    *,
+    answer: str | None = None,
+    folders: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """What a teammate asking `query` would get, step by step, for the owner to try.
 
     The query is judged as a teammate's `chat` is. If it may go on, the answer is
-    `answer` as the owner wrote it, else Honcho's own from `project`'s scope as a
-    teammate's would be, and it is judged as a teammate's answer is. `outcome` is
-    "refused" (the query), "withheld" (the answer), "passed", or "no_answer" when
-    Honcho could not answer; with neither an answer nor a project only the query is
-    judged. Nothing is recorded: a trial is not a teammate's call.
+    `answer` as the owner wrote it, else Honcho's own from the conversations in
+    `folders`, confined as a teammate's chat is, and it is judged as a teammate's
+    answer is. `outcome` is "refused" (the query), "withheld" (the answer),
+    "passed", or "no_answer" when Honcho could not answer, or the folders hold no
+    conversation or more than one chat takes; with neither an answer nor folders
+    only the query is judged. Nothing is recorded: a trial is not a teammate's call.
     """
     defaults = _resolve_defaults()
     workspace = defaults["workspace_id"]
@@ -1501,15 +1674,25 @@ def guard_trial(
     result: Any
     if answer is not None:
         result = answer
-    elif project is not None:
+    elif folders is not None:
+        # Honcho is asked as a teammate's chat asks it: about the owner, from the
+        # sessions in the folders, refused where a teammate's chat is refused.
         subject = defaults["user_name"] or defaults["assistant_name"]
         try:
+            sessions = _open_sessions(workspace, folders)
+            refusal = _allowlist_refusal(sessions)
+            if refusal is not None:
+                return {**trial, "outcome": "no_answer", "error": refusal}
             result = _honcho(
                 "POST",
                 f"/v3/workspaces/{workspace}/peers/{subject}/chat",
-                body={"query": query, "reasoning_level": "low", "scope": project["id"]},
+                body={
+                    "query": query,
+                    "reasoning_level": "low",
+                    "filters": {"session_id": {"in": sessions}},
+                },
             )
-        except (RuntimeError, httpx.HTTPError) as exc:
+        except (RuntimeError, httpx.HTTPError, TypeError, ValueError) as exc:
             return {**trial, "outcome": "no_answer", "error": str(exc) or type(exc).__name__}
     else:
         return {**trial, "outcome": "passed"}
@@ -1524,6 +1707,11 @@ def guard_trial(
     }
 
 
+#: The most folders a trial takes, and the longest path in one.
+MAX_TRIAL_FOLDERS = 500
+MAX_TRIAL_PATH = 4096
+
+
 def _trial_input(body: Any) -> dict[str, Any] | str:
     """guard_trial's arguments from a request body, or why they cannot be read."""
     if not isinstance(body, dict):
@@ -1534,14 +1722,21 @@ def _trial_input(body: Any) -> dict[str, Any] | str:
     answer = body.get("answer")
     if answer is not None and (not isinstance(answer, str) or not answer.strip()):
         return "answer takes the answer to try, or is left out"
-    project = body.get("project")
-    if project is not None:
-        project_id = project.get("id") if isinstance(project, dict) else None
-        if not isinstance(project_id, str) or not PROJECT_ID.fullmatch(project_id):
-            return "project takes {id, name} of a project, or is left out"
-        name = project.get("name")
-        project = {"id": project_id, "name": name if isinstance(name, str) and name.strip() else project_id}
-    return {"query": query, "answer": answer, "project": project}
+    folders = body.get("folders")
+    if folders is not None:
+        try:
+            if not isinstance(folders, list) or len(folders) > MAX_TRIAL_FOLDERS:
+                raise ValueError("not a list of folders")
+            for item in folders:
+                if len(_folder_entry(item)["path"]) > MAX_TRIAL_PATH:
+                    raise ValueError("a path too long")
+        except (TypeError, ValueError):
+            return (
+                f"folders takes at most {MAX_TRIAL_FOLDERS} folders, each "
+                f'{{"path": at most {MAX_TRIAL_PATH} characters, "subfolders": '
+                "true or false}, or is left out"
+            )
+    return {"query": query, "answer": answer, "folders": folders}
 
 
 def _int_param(params: Any, name: str, default: int | None) -> int | None:
@@ -1605,7 +1800,10 @@ if audit.READ_ENABLED:
             return JSONResponse({"error": "bad_request", "detail": trial}, status_code=400)
         try:
             payload = await asyncio.to_thread(
-                guard_trial, trial["query"], answer=trial["answer"], project=trial["project"]
+                guard_trial,
+                trial["query"],
+                answer=trial["answer"],
+                folders=trial["folders"],
             )
         except Exception as exc:  # noqa: BLE001 - reported to the dashboard as JSON
             logger.warning("guard trial failed: %s", type(exc).__name__)

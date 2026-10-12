@@ -327,8 +327,8 @@ async function readAudit(req, res) {
 
 /**
  * The owner tries the Jev gate: the bridge judges a question as a teammate's, then
- * the answer, written or Honcho's own from one project, and says what the teammate
- * would have got. The body goes on as it came; the bridge reads it.
+ * the answer, written or Honcho's own from the given folders, and says what the
+ * teammate would have got. The body goes on as it came; the bridge reads it.
  */
 async function tryGuard(req, res) {
   if (!trialUrl) {

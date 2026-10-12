@@ -218,9 +218,9 @@ def judge_answer(
 ) -> Verdict:
     """Decide whether a tool's result may go back to the teammate who asked.
 
-    Every piece of text in the result is read, so an answer nested in a list of
-    projects is judged like a single one. A long answer is judged in overlapping
-    pieces, and the first piece refused or left unjudged decides.
+    Every piece of text in the result is read, however deep it is nested, so no
+    part of it leaves unjudged. A long answer is judged in overlapping pieces, and
+    the first piece refused or left unjudged decides.
     """
     if not enabled_for(tool):
         return Verdict(allowed=True, score=None, reason="gate off")
