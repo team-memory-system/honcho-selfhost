@@ -7,7 +7,8 @@
     "commit": "06ed1929cf017c333a87c41d130bb6a0605d91c0"
   },
   "patches": [
-    "patches/0001-selfhost-core.patch"
+    "patches/0001-selfhost-core.patch",
+    "patches/0002-allowlist-chat-without-peer-card.patch"
   ],
   "localPaths": [
     "local-dashboard",

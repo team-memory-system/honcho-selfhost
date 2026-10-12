@@ -1,0 +1,375 @@
+diff --git a/src/dialectic/chat.py b/src/dialectic/chat.py
+index 16e8df6..4735042 100644
+--- a/src/dialectic/chat.py
++++ b/src/dialectic/chat.py
+@@ -103,7 +103,12 @@ async def agentic_chat(
+ 
+         observer_peer_card = None
+         observed_peer_card = None
+-        if configuration.peer_card.use:
++        # A peer card is one aggregate over every session the observer has seen,
++        # with no session dimension (crud/peer_card.py), so it cannot be narrowed
++        # to an allowlist and would carry facts from sessions outside it. Drop
++        # both cards under an allowlist — the rule session context and the
++        # get_peer_card tool already follow.
++        if configuration.peer_card.use and session_allowlist is None:
+             observer_peer_card = await crud.get_peer_card(
+                 db, workspace_name, observer=observer, observed=observer
+             )
+@@ -186,7 +191,12 @@ async def agentic_chat_stream(
+ 
+         observer_peer_card = None
+         observed_peer_card = None
+-        if configuration.peer_card.use:
++        # A peer card is one aggregate over every session the observer has seen,
++        # with no session dimension (crud/peer_card.py), so it cannot be narrowed
++        # to an allowlist and would carry facts from sessions outside it. Drop
++        # both cards under an allowlist — the rule session context and the
++        # get_peer_card tool already follow.
++        if configuration.peer_card.use and session_allowlist is None:
+             observer_peer_card = await crud.get_peer_card(
+                 db, workspace_name, observer=observer, observed=observer
+             )
+diff --git a/src/dialectic/core.py b/src/dialectic/core.py
+index 4b4540f..c1a440d 100644
+--- a/src/dialectic/core.py
++++ b/src/dialectic/core.py
+@@ -39,6 +39,7 @@ from src.telemetry.logging import (
+ )
+ from src.telemetry.prometheus.metrics import DialecticComponents, TokenTypes
+ from src.utils.agent_tools import (
++    _TOOL_HANDLERS,  # pyright: ignore[reportPrivateUsage]
+     DIALECTIC_TOOLS,
+     DIALECTIC_TOOLS_MINIMAL,
+     create_tool_executor,
+@@ -397,6 +398,12 @@ class DialecticAgent:
+     async def _create_tool_executor(self) -> Callable[[str, dict[str, Any]], Any]:
+         """Build the tool executor. Subclasses override to change tool scoping
+         (e.g. WorkspaceDialecticAgent uses the workspace executor)."""
++        # The default lookup runs any name in the shared handler table, offered
++        # or not, and the tool loop passes on whatever name the model emits.
++        # Some of those handlers ignore an allowlist (get_recent_observations,
++        # get_most_derived_observations, extract_preferences), so under one only
++        # the pair loadout runs: each of its handlers honors it or refuses.
++        pair_tools = {tool.get("name") for tool in DIALECTIC_TOOLS}
+         return await create_tool_executor(
+             workspace_name=self.workspace_name,
+             session_name=self.session_name,
+@@ -408,6 +415,11 @@ class DialecticAgent:
+             agent_type="dialectic",
+             parent_category="dialectic",
+             evidence=self.evidence,
++            handler_resolver=(
++                lambda name: _TOOL_HANDLERS.get(name) if name in pair_tools else None
++            )
++            if self.session_allowlist is not None
++            else None,
+         )
+ 
+     def _prefetch_heading(self) -> str:
+diff --git a/tests/dialectic/test_allowlist_confinement.py b/tests/dialectic/test_allowlist_confinement.py
+new file mode 100644
+index 0000000..115d8de
+--- /dev/null
++++ b/tests/dialectic/test_allowlist_confinement.py
+@@ -0,0 +1,300 @@
++"""What a session allowlist keeps out of the pair dialectic.
++
++A peer card is one aggregate over every session its observer has seen, with no
++session dimension, so under an allowlist the chat entry points must neither read
++nor pass one. The route tests mock `agentic_chat` wholesale
++(`mock_llm_call_functions` in tests/conftest.py), so these call the entry points
++directly, as tests/dialectic/test_scope_preflight.py does.
++
++The allowlist bounds the tools as well: the tool loop hands the executor any name
++the model emits, so the executor must not run a handler outside the pair loadout,
++several of which ignore the allowlist.
++"""
++
++from collections.abc import AsyncIterator, Callable, Mapping
++from types import SimpleNamespace
++from typing import Any
++from unittest.mock import AsyncMock, patch
++
++import pytest
++from nanoid import generate as generate_nanoid
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from src import crud, models, schemas
++from src.config import settings
++from src.dialectic.chat import agentic_chat, agentic_chat_stream
++from src.dialectic.core import DialecticAgent
++from src.llm import (
++    HonchoLLMCallResponse,
++    HonchoLLMCallStreamChunk,
++    StreamingResponseWithMetadata,
++)
++
++OBSERVER_CARD = ["Name: Mina", "INSTRUCTION: Answer in Korean"]
++OBSERVED_CARD = ["Name: Joon", "Left the payments team in August"]
++OUTSIDER = "Joon is weighing an offer from another company"
++
++ENTRY_POINTS = pytest.mark.parametrize(
++    "stream", [False, True], ids=["agentic_chat", "agentic_chat_stream"]
++)
++
++
++@pytest.fixture
++async def pair(
++    db_session: AsyncSession,
++    sample_data: tuple[models.Workspace, models.Peer],
++    monkeypatch: pytest.MonkeyPatch,
++) -> SimpleNamespace:
++    """An observer holding both peer cards, and a conclusion outside the allowlist.
++
++    `inside` is the session the allowlist names. `outside` holds a derived
++    conclusion that only an unscoped read can reach.
++    """
++    monkeypatch.setattr(settings.PEER_CARD, "ENABLED", True)
++    # The conclusion is written straight to postgres, so recall has to go
++    # through pgvector rather than the migrated vector store.
++    monkeypatch.setattr(settings.VECTOR_STORE, "MIGRATED", False)
++
++    workspace, observer = sample_data
++    observed = models.Peer(name=str(generate_nanoid()), workspace_name=workspace.name)
++    db_session.add(observed)
++    await db_session.flush()
++
++    sessions: list[models.Session] = []
++    for _ in range(2):
++        result = await crud.get_or_create_session(
++            db_session,
++            schemas.SessionCreate(
++                name=str(generate_nanoid()),
++                peers={observed.name: schemas.SessionPeerConfig(observe_me=True)},
++            ),
++            workspace.name,
++        )
++        sessions.append(result.resource)
++    inside, outside = sessions
++
++    db_session.add(
++        models.Collection(
++            workspace_name=workspace.name,
++            observer=observer.name,
++            observed=observed.name,
++        )
++    )
++    await db_session.flush()
++    db_session.add(
++        models.Document(
++            workspace_name=workspace.name,
++            observer=observer.name,
++            observed=observed.name,
++            content=OUTSIDER,
++            embedding=[0.1] * 1536,
++            session_name=outside.name,
++            level="deductive",
++        )
++    )
++    await db_session.commit()
++
++    for card, subject in (
++        (OBSERVER_CARD, observer.name),
++        (OBSERVED_CARD, observed.name),
++    ):
++        await crud.set_peer_card(
++            db_session, workspace.name, card, observer=observer.name, observed=subject
++        )
++
++    return SimpleNamespace(
++        workspace=workspace.name,
++        observer=observer.name,
++        observed=observed.name,
++        inside=inside.name,
++    )
++
++
++def chat_kwargs(pair: SimpleNamespace, session_allowlist: list[str] | None) -> Any:
++    """A directional chat, so both the asker's and the subject's card apply."""
++    return {
++        "workspace_name": pair.workspace,
++        "session_name": None,
++        "query": "What do you know about Joon?",
++        "observer": pair.observer,
++        "observed": pair.observed,
++        "session_allowlist": session_allowlist,
++    }
++
++
++async def run_chat(stream: bool, **kwargs: Any) -> str:
++    if stream:
++        return "".join([chunk async for chunk in agentic_chat_stream(**kwargs)])
++    return await agentic_chat(**kwargs)
++
++
++async def chat_with_agent_stubbed(
++    stream: bool, **kwargs: Any
++) -> tuple[Mapping[str, Any], AsyncMock]:
++    """Run one entry point with DialecticAgent stubbed.
++
++    Returns the keyword arguments the agent was built with, and a spy on
++    `crud.get_peer_card` that still reads the stored cards.
++    """
++
++    async def answer_stream(*_args: Any, **_kwargs: Any) -> AsyncIterator[str]:
++        yield "answered"
++
++    card_reads = AsyncMock(wraps=crud.get_peer_card)
++    with (
++        patch("src.dialectic.chat.DialecticAgent") as agent_cls,
++        patch.object(crud, "get_peer_card", new=card_reads),
++    ):
++        agent_cls.return_value.answer = AsyncMock(return_value="answered")
++        agent_cls.return_value.answer_stream = answer_stream
++        assert await run_chat(stream, **kwargs) == "answered"
++    return agent_cls.call_args.kwargs, card_reads
++
++
++def llm_response() -> HonchoLLMCallResponse[str]:
++    return HonchoLLMCallResponse(
++        content="answered",
++        input_tokens=10,
++        output_tokens=5,
++        finish_reasons=["end_turn"],
++    )
++
++
++def llm_stream() -> StreamingResponseWithMetadata:
++    async def chunks() -> AsyncIterator[HonchoLLMCallStreamChunk]:
++        yield HonchoLLMCallStreamChunk(content="answered")
++        yield HonchoLLMCallStreamChunk(content="", is_done=True)
++
++    return StreamingResponseWithMetadata(
++        chunks(),
++        tool_calls_made=[],
++        input_tokens=10,
++        output_tokens=5,
++        cache_creation_input_tokens=0,
++        cache_read_input_tokens=0,
++        iterations=1,
++    )
++
++
++@pytest.mark.asyncio
++@ENTRY_POINTS
++@pytest.mark.parametrize("allowlist", ["named", "empty"])
++async def test_allowlisted_chat_reads_and_passes_no_peer_card(
++    pair: SimpleNamespace, stream: bool, allowlist: str
++):
++    """Neither card is read, the asker's or the subject's. An empty allowlist,
++    which recalls nothing, is no exception."""
++    session_allowlist = [pair.inside] if allowlist == "named" else []
++
++    agent_kwargs, card_reads = await chat_with_agent_stubbed(
++        stream, **chat_kwargs(pair, session_allowlist)
++    )
++
++    card_reads.assert_not_awaited()
++    assert agent_kwargs["observer_peer_card"] is None
++    assert agent_kwargs["observed_peer_card"] is None
++    assert agent_kwargs["session_allowlist"] == session_allowlist
++
++
++@pytest.mark.asyncio
++@ENTRY_POINTS
++async def test_chat_without_allowlist_still_uses_both_cards(
++    pair: SimpleNamespace, stream: bool
++):
++    agent_kwargs, card_reads = await chat_with_agent_stubbed(
++        stream, **chat_kwargs(pair, None)
++    )
++
++    assert card_reads.await_count == 2
++    assert agent_kwargs["observer_peer_card"] == OBSERVER_CARD
++    assert agent_kwargs["observed_peer_card"] == OBSERVED_CARD
++
++
++@pytest.mark.asyncio
++@ENTRY_POINTS
++@pytest.mark.parametrize("scoped", [True, False], ids=["allowlist", "no-allowlist"])
++async def test_card_text_reaches_the_model_only_without_an_allowlist(
++    pair: SimpleNamespace, stream: bool, scoped: bool
++):
++    """End to end through the real agent, with only the LLM call mocked.
++
++    This checks what the model is handed rather than how chat.py wires it, so it
++    still fails if an upstream change moves card loading into the agent.
++    """
++    llm_call = AsyncMock(return_value=llm_stream() if stream else llm_response())
++    with patch("src.dialectic.core.honcho_llm_call", new=llm_call):
++        answer = await run_chat(
++            stream, **chat_kwargs(pair, [pair.inside] if scoped else None)
++        )
++
++    assert answer == "answered"
++    assert llm_call.await_args is not None, "the agent never called the LLM"
++    handed = "\n".join(m["content"] for m in llm_call.await_args.kwargs["messages"])
++    for fact in (*OBSERVER_CARD, *OBSERVED_CARD):
++        assert (fact in handed) is not scoped, fact
++
++
++async def executor_handed_to_the_model(
++    pair: SimpleNamespace, session_allowlist: list[str] | None
++) -> Callable[[str, dict[str, Any]], Any]:
++    """The tool executor a real agent passes to the tool loop."""
++    agent = DialecticAgent(
++        workspace_name=pair.workspace,
++        session_name=None,
++        observer=pair.observer,
++        observed=pair.observed,
++        session_allowlist=session_allowlist,
++    )
++    llm_call = AsyncMock(return_value=llm_response())
++    with patch("src.dialectic.core.honcho_llm_call", new=llm_call):
++        await agent.answer("What do you know about Joon?")
++    assert llm_call.await_args is not None, "the agent never called the LLM"
++    return llm_call.await_args.kwargs["tool_executor"]
++
++
++# Handlers in the shared table that the pair loadout does not offer: reads that
++# ignore an allowlist, writes, and a card read.
++UNOFFERED_TOOLS = (
++    "get_most_derived_observations",
++    "get_recent_observations",
++    "extract_preferences",
++    "create_observations",
++    "update_peer_card",
++    "delete_observations",
++    "get_peer_card",
++)
++
++
++@pytest.mark.asyncio
++async def test_allowlisted_executor_refuses_tools_outside_the_pair_loadout(
++    pair: SimpleNamespace,
++):
++    executor = await executor_handed_to_the_model(pair, [pair.inside])
++
++    for name in UNOFFERED_TOOLS:
++        assert await executor(name, {}) == f"Unknown tool: {name}"
++
++
++@pytest.mark.asyncio
++async def test_allowlisted_executor_still_runs_the_pair_loadout(
++    pair: SimpleNamespace,
++):
++    """Its handlers honor the allowlist, or refuse with their own explanation."""
++    executor = await executor_handed_to_the_model(pair, [pair.inside])
++
++    chain = await executor("get_reasoning_chain", {"observation_id": "any"})
++    assert chain.startswith("Reasoning-chain traversal is unavailable")
++    recalled = await executor("search_memory", {"query": "job offer"})
++    assert not recalled.startswith("Unknown tool")
++    assert OUTSIDER not in recalled
++
++
++@pytest.mark.asyncio
++async def test_executor_without_allowlist_keeps_the_whole_handler_table(
++    pair: SimpleNamespace,
++):
++    """Unscoped dispatch is upstream's. It is also the read an allowlisted
++    executor must refuse: this handler takes no allowlist."""
++    executor = await executor_handed_to_the_model(pair, None)
++
++    assert OUTSIDER in await executor("get_most_derived_observations", {})
