@@ -108,11 +108,20 @@ PEER_ARGUMENTS = frozenset(
 
 #: Take each caller's reach from the gate of a team server. The gate checks the
 #: caller's Cloudflare Access login, drops every x-honcho-* header the caller sent,
-#: and says who is calling: the server's owner (`all`) or a teammate (`folders`,
-#: with the folders the owner opened to them). Anything else is refused.
+#: and says who is calling: the server's owner (`all`), a teammate (`folders`, with
+#: the folders the owner opened to them and the apps whose conversations without a
+#: folder they opened), or a teammate the owner turned off for now (`off`).
+#: Anything else is refused.
 SCOPE_FROM_GATE = _env_flag("HONCHO_MCP_SCOPE_FROM_GATE")
 SCOPE_MODE_HEADER = "x-honcho-scope-mode"
 ALLOWED_FOLDERS_HEADER = "x-honcho-allowed-folders"
+ALLOWED_SOURCES_HEADER = "x-honcho-allowed-sources"
+
+#: What a teammate the owner turned off hears, whatever they call.
+TURNED_OFF = (
+    "The owner of this memory has turned your chat off for now. You can ask again "
+    "once they turn it back on."
+)
 
 #: The most sessions one Honcho chat confines itself to
 #: (MAX_SESSION_ALLOWLIST_ENTRIES in Honcho's src/utils/filter.py). Folders holding
@@ -340,9 +349,11 @@ def register_tool(*, name: str):
                         violation = str(exc)
                 if reach is not None:
                     # Recorded on every teammate's call, refused or answered, so the
-                    # log says which folders an answer came from and how many
-                    # conversations they held.
+                    # log says which folders (and apps) an answer came from and how
+                    # many conversations they held.
                     arguments["folders"] = reach.folders
+                    if reach.sources:
+                        arguments["sources"] = list(reach.sources)
                     if reach.sessions is not None:
                         arguments["sessions"] = len(reach.sessions)
                     violation, failure = reach.refusal, reach.failure
@@ -559,17 +570,21 @@ def _pin_violation(arguments: dict[str, Any]) -> str | None:
     return None
 
 
+def _gate_values(headers: Any, name: str) -> list[str]:
+    """Every copy of one header, in the order sent."""
+    getlist = getattr(headers, "getlist", None)
+    if callable(getlist):
+        return list(getlist(name))
+    value = headers.get(name)
+    return [] if value is None else [value]
+
+
 def _gate_header(headers: Any, name: str) -> str | None:
     """One header the gate sets, or None when it is missing or repeated.
 
     The gate sends each exactly once, so a second copy did not come from the gate.
     """
-    getlist = getattr(headers, "getlist", None)
-    if callable(getlist):
-        values = list(getlist(name))
-    else:
-        value = headers.get(name)
-        values = [] if value is None else [value]
+    values = _gate_values(headers, name)
     return values[0] if len(values) == 1 else None
 
 
@@ -610,11 +625,64 @@ def _decode_folders(raw: str | None) -> list[dict[str, Any]]:
     return [_folder_entry(item) for item in folders]
 
 
-def _gate_folders() -> list[dict[str, Any]] | None:
-    """The folders the gate opened to this caller, or None when it opened everything.
+#: An app's name as a session records it (`metadata.source`, "chatgpt" for a
+#: ChatGPT import). A session with anything else there is of the app "unknown".
+_SOURCE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,31}")
+UNKNOWN_SOURCE = "unknown"
 
-    Fails closed: without an HTTP request, with a header missing or repeated, an
-    unknown mode, or a list that does not read, the call is refused (RuntimeError).
+
+def _session_source(metadata: Any) -> str:
+    """The app a session came from, by the rule the owner's app counts them by."""
+    source = metadata.get("source") if isinstance(metadata, dict) else None
+    if isinstance(source, str) and _SOURCE.fullmatch(source):
+        return source
+    return UNKNOWN_SOURCE
+
+
+def _source_entry(item: Any) -> str:
+    """One app whose conversations without a folder are open, or TypeError/ValueError."""
+    if not isinstance(item, str):
+        raise TypeError("not an app name")
+    if not _SOURCE.fullmatch(item):
+        raise ValueError("not an app name")
+    return item
+
+
+def _decode_sources(raw: str | None) -> list[str]:
+    """The apps whose conversations without a folder the gate opened, once each.
+
+    The header is base64url, padded or not, of UTF-8 JSON ["chatgpt", ...]. A gate
+    from before it sends none, which opens none. Raises ValueError or TypeError for
+    anything else.
+    """
+    if raw is None:
+        return []
+    if not _BASE64URL.fullmatch(raw):
+        raise ValueError("not base64url")
+    text = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+    sources = json.loads(text)
+    if not isinstance(sources, list):
+        raise TypeError("not a list")
+    return list(dict.fromkeys(_source_entry(item) for item in sources))
+
+
+class GateScope(NamedTuple):
+    """What the gate opened to a teammate."""
+
+    #: The folders, as the gate sent them.
+    folders: list[dict[str, Any]]
+    #: The apps whose conversations without a folder are open.
+    sources: list[str]
+    #: The owner turned this teammate off for now: every call is refused.
+    off: bool = False
+
+
+def _gate_scope() -> GateScope | None:
+    """What the gate opened to this caller, or None when it opened everything.
+
+    Fails closed: without an HTTP request, with the mode or the folders missing or
+    repeated, an unknown mode, a repeated list of apps, or a list that does not
+    read, the call is refused (RuntimeError).
     """
     try:
         headers = get_http_request().headers
@@ -623,18 +691,31 @@ def _gate_folders() -> list[dict[str, Any]] | None:
     mode = _gate_header(headers, SCOPE_MODE_HEADER)
     if mode == "all":
         return None
+    if mode == "off":
+        return GateScope([], [], off=True)
     if mode != "folders":
         raise RuntimeError(
             "This MCP server takes its scope from its gate, and "
             f"{SCOPE_MODE_HEADER} is missing, repeated or unknown"
         )
     try:
-        return _decode_folders(_gate_header(headers, ALLOWED_FOLDERS_HEADER))
+        folders = _decode_folders(_gate_header(headers, ALLOWED_FOLDERS_HEADER))
     except (TypeError, ValueError, RecursionError) as exc:
         raise RuntimeError(
             "This MCP server takes its scope from its gate, and "
             f"{ALLOWED_FOLDERS_HEADER} is missing, repeated or malformed"
         ) from exc
+    sent = _gate_values(headers, ALLOWED_SOURCES_HEADER)
+    try:
+        if len(sent) > 1:
+            raise ValueError("repeated")
+        sources = _decode_sources(sent[0] if sent else None)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise RuntimeError(
+            "This MCP server takes its scope from its gate, and "
+            f"{ALLOWED_SOURCES_HEADER} is repeated or malformed"
+        ) from exc
+    return GateScope(folders, sources)
 
 
 #: A path that starts at a Windows drive, once its backslashes read as "/".
@@ -690,20 +771,23 @@ def _folder_matcher(folders: list[dict[str, Any]]) -> Callable[[str | None], boo
 _clock = time.monotonic
 
 _session_lists_lock = threading.Lock()
-#: Each workspace's sessions as last listed, and when: (listed_at, ((id, folder),
-#: ...)), the folder spelled by `_norm_path`, or None for a session without one.
-_session_lists: dict[str, tuple[float, tuple[tuple[str, str | None], ...]]] = {}
+#: One session as listed: its id, the folder it started in, spelled by `_norm_path`,
+#: and for a session without a folder the app it came from (None for one with).
+ListedSession = tuple[str, str | None, str | None]
+#: Each workspace's sessions as last listed, and when: (listed_at, sessions).
+_session_lists: dict[str, tuple[float, tuple[ListedSession, ...]]] = {}
 
 
-def _list_sessions(workspace_id: str) -> tuple[tuple[str, str | None], ...]:
+def _list_sessions(workspace_id: str) -> tuple[ListedSession, ...]:
     """Every session in the workspace, by id, with the folder it started in.
 
     The folder is the session's `metadata.cwd`, which the collector records; a
-    session without one in text is in no folder. Raises TypeError or ValueError for
-    a listing that does not read, and whatever `_honcho` raises for one that fails.
+    session without one in text is in no folder, and is known by its app instead
+    (`_session_source`). Raises TypeError or ValueError for a listing that does not
+    read, and whatever `_honcho` raises for one that fails.
     """
     path = f"/v3/workspaces/{workspace_id}/sessions/list"
-    sessions: dict[str, str | None] = {}
+    sessions: dict[str, tuple[str | None, str | None]] = {}
     page = 1
     while True:
         listed = _honcho(
@@ -724,17 +808,22 @@ def _list_sessions(workspace_id: str) -> tuple[tuple[str, str | None], ...]:
                 raise ValueError("Honcho listed a session without an id")
             metadata = item.get("metadata")
             cwd = metadata.get("cwd") if isinstance(metadata, dict) else None
+            folder = _norm_path(cwd) if isinstance(cwd, str) and cwd else None
             # A session that moves across a page boundary while the pages are read
             # shows up twice; it is one session.
             sessions.setdefault(
-                session_id, _norm_path(cwd) if isinstance(cwd, str) else None
+                session_id,
+                (folder, None if folder is not None else _session_source(metadata)),
             )
         if page >= pages:
-            return tuple(sessions.items())
+            return tuple(
+                (session_id, folder, source)
+                for session_id, (folder, source) in sessions.items()
+            )
         page += 1
 
 
-def _workspace_sessions(workspace_id: str) -> tuple[tuple[str, str | None], ...]:
+def _workspace_sessions(workspace_id: str) -> tuple[ListedSession, ...]:
     """The workspace's sessions as listed at most SESSION_LIST_TTL_SECONDS ago.
 
     One listing at a time: a call that arrives while one runs waits for it and
@@ -757,20 +846,26 @@ def _workspace_sessions(workspace_id: str) -> tuple[tuple[str, str | None], ...]
         return sessions
 
 
-def _open_sessions(workspace_id: str, folders: list[dict[str, Any]]) -> list[str]:
-    """The sessions in `folders`, by id, in the order Honcho lists them.
+def _open_sessions(
+    workspace_id: str,
+    folders: list[dict[str, Any]],
+    sources: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    """The sessions in `folders`, and those without a folder from `sources`, by id.
 
-    Worked out when each call arrives, against the sessions as listed at most a
-    minute ago: a folder the owner opens or closes applies to the next question,
-    and a conversation started in an open folder joins within a minute.
+    In the order Honcho lists them. Worked out when each call arrives, against the
+    sessions as listed at most a minute ago: a folder the owner opens or closes
+    applies to the next question, and a conversation started in an open folder, or
+    one more ChatGPT conversation brought in, joins within a minute.
     """
-    if not folders:
+    if not folders and not sources:
         return []
     holds = _folder_matcher(folders)
+    apps = set(sources)
     return [
         session_id
-        for session_id, cwd in _workspace_sessions(workspace_id)
-        if holds(cwd)
+        for session_id, cwd, source in _workspace_sessions(workspace_id)
+        if holds(cwd) or (cwd is None and source in apps)
     ]
 
 
@@ -797,12 +892,14 @@ class TeammateReach(NamedTuple):
 
     #: The folders the gate opened to them, as it sent them.
     folders: list[dict[str, Any]]
-    #: The sessions in those folders, by id, or None when they were not listed.
+    #: The sessions open to them, by id, or None when they were not listed.
     sessions: list[str] | None = None
     #: Why the call is refused, if it is.
     refusal: str | None = None
     #: The failure a refusal stands in for, kept for the audit log alone.
     failure: str | None = None
+    #: The apps whose conversations without a folder the gate opened to them.
+    sources: tuple[str, ...] = ()
 
 
 def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | None:
@@ -810,17 +907,23 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
 
     Only a bridge behind a team server's gate confines calls, and only a teammate's:
     they may `chat`, answered in one Honcho call from the sessions in the folders
-    the owner opened to them. A gate header that does not read raises RuntimeError.
-    Once the folders are known, a refusal comes back in the reach instead, so the
-    audit log can say which folders and how many conversations it was about.
+    the owner opened to them, and those without a folder from the apps they opened.
+    A teammate the owner turned off is refused whatever they call. A gate header
+    that does not read raises RuntimeError. Once the folders are known, a refusal
+    comes back in the reach instead, so the audit log can say which folders and how
+    many conversations it was about.
     """
-    folders = _gate_folders() if SCOPE_FROM_GATE else None
-    if folders is None:
+    scope = _gate_scope() if SCOPE_FROM_GATE else None
+    if scope is None:
         return None
+    folders, sources = scope.folders, tuple(scope.sources)
+    if scope.off:
+        return TeammateReach(folders, refusal=TURNED_OFF)
     if tool != "chat":
         return TeammateReach(
             folders,
             refusal=f"{tool} cannot be used with folders on this MCP server; use chat",
+            sources=sources,
         )
     # A teammate is answered from every conversation open to them, and the bridge
     # names those sessions to Honcho itself.
@@ -830,11 +933,13 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
             refusal=(
                 "session_id cannot be used with folders on this MCP server; omit it"
             ),
+            sources=sources,
         )
     if arguments.get("filters"):
         return TeammateReach(
             folders,
             refusal="filters cannot be used with folders on this MCP server; omit them",
+            sources=sources,
         )
     # Listing the sessions is a Honcho call too, made only for a caller let in.
     _require_auth()
@@ -842,7 +947,7 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
         "workspace_id"
     ]
     try:
-        sessions = _open_sessions(workspace_id, folders)
+        sessions = _open_sessions(workspace_id, folders, sources)
     except Exception as exc:  # noqa: BLE001 - refused and recorded, never a crash
         # The teammate hears only that the list could not be read; the cause goes
         # to the owner's audit log.
@@ -853,8 +958,11 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
                 "on this MCP server; try again later"
             ),
             failure=f"listing the sessions failed: {type(exc).__name__}: {exc}",
+            sources=sources,
         )
-    return TeammateReach(folders, sessions, _allowlist_refusal(sessions))
+    return TeammateReach(
+        folders, sessions, _allowlist_refusal(sessions), sources=sources
+    )
 
 
 def _require_card_access(path: str, params: dict[str, Any] | None) -> None:
@@ -1170,8 +1278,9 @@ def chat(
     """Ask Honcho what it knows about a peer using natural language.
 
     On a team server a teammate is answered from the conversations in the folders
-    its owner opened to them, all of them in this one call, about the owner unless
-    peer_id or target_peer_id names another peer. session_id cannot be used there.
+    its owner opened to them, and from those without a folder of the apps opened
+    (ChatGPT imports), all of them in this one call, about the owner unless peer_id
+    or target_peer_id names another peer. session_id cannot be used there.
     """
     reach = _call_reach.get()
     if reach is _UNRESOLVED:
@@ -1646,16 +1755,18 @@ def guard_trial(
     *,
     answer: str | None = None,
     folders: list[dict[str, Any]] | None = None,
+    sources: list[str] | None = None,
 ) -> dict[str, Any]:
     """What a teammate asking `query` would get, step by step, for the owner to try.
 
     The query is judged as a teammate's `chat` is. If it may go on, the answer is
     `answer` as the owner wrote it, else Honcho's own from the conversations in
-    `folders`, confined as a teammate's chat is, and it is judged as a teammate's
-    answer is. `outcome` is "refused" (the query), "withheld" (the answer),
-    "passed", or "no_answer" when Honcho could not answer, or the folders hold no
-    conversation or more than one chat takes; with neither an answer nor folders
-    only the query is judged. Nothing is recorded: a trial is not a teammate's call.
+    `folders` and those without a folder of the apps in `sources`, confined as a
+    teammate's chat is, and it is judged as a teammate's answer is. `outcome` is
+    "refused" (the query), "withheld" (the answer), "passed", or "no_answer" when
+    Honcho could not answer, or what is open holds no conversation or more than one
+    chat takes; with neither an answer nor folders or apps only the query is judged.
+    Nothing is recorded: a trial is not a teammate's call.
     """
     defaults = _resolve_defaults()
     workspace = defaults["workspace_id"]
@@ -1674,12 +1785,12 @@ def guard_trial(
     result: Any
     if answer is not None:
         result = answer
-    elif folders is not None:
+    elif folders is not None or sources is not None:
         # Honcho is asked as a teammate's chat asks it: about the owner, from the
-        # sessions in the folders, refused where a teammate's chat is refused.
+        # sessions open, refused where a teammate's chat is refused.
         subject = defaults["user_name"] or defaults["assistant_name"]
         try:
-            sessions = _open_sessions(workspace, folders)
+            sessions = _open_sessions(workspace, folders or [], sources or [])
             refusal = _allowlist_refusal(sessions)
             if refusal is not None:
                 return {**trial, "outcome": "no_answer", "error": refusal}
@@ -1707,9 +1818,10 @@ def guard_trial(
     }
 
 
-#: The most folders a trial takes, and the longest path in one.
+#: The most folders a trial takes, the longest path in one, and the most apps.
 MAX_TRIAL_FOLDERS = 500
 MAX_TRIAL_PATH = 4096
+MAX_TRIAL_SOURCES = 32
 
 
 def _trial_input(body: Any) -> dict[str, Any] | str:
@@ -1736,7 +1848,18 @@ def _trial_input(body: Any) -> dict[str, Any] | str:
                 f'{{"path": at most {MAX_TRIAL_PATH} characters, "subfolders": '
                 "true or false}, or is left out"
             )
-    return {"query": query, "answer": answer, "folders": folders}
+    sources = body.get("sources")
+    if sources is not None:
+        try:
+            if not isinstance(sources, list) or len(sources) > MAX_TRIAL_SOURCES:
+                raise ValueError("not a list of apps")
+            sources = list(dict.fromkeys(_source_entry(item) for item in sources))
+        except (TypeError, ValueError):
+            return (
+                f"sources takes at most {MAX_TRIAL_SOURCES} app names such as "
+                '"chatgpt", or is left out'
+            )
+    return {"query": query, "answer": answer, "folders": folders, "sources": sources}
 
 
 def _int_param(params: Any, name: str, default: int | None) -> int | None:
@@ -1804,6 +1927,7 @@ if audit.READ_ENABLED:
                 trial["query"],
                 answer=trial["answer"],
                 folders=trial["folders"],
+                sources=trial["sources"],
             )
         except Exception as exc:  # noqa: BLE001 - reported to the dashboard as JSON
             logger.warning("guard trial failed: %s", type(exc).__name__)

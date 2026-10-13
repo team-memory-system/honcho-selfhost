@@ -22,7 +22,8 @@ import server
 FOLDERS = [{"path": "/Users/me/dev/flypiano", "subfolders": True}]
 QUERY = "flypiano 요즘 어떻게 돼 가?"
 
-#: The sessions Honcho holds, by id, with the folder each started in.
+#: The sessions Honcho holds, by id, with the folder each started in (and the app,
+#: for one without a folder).
 SESSIONS = (
     ("s-flypiano", "/Users/me/dev/flypiano"),
     ("s-api", "/Users/me/dev/flypiano/api"),
@@ -76,7 +77,10 @@ def _honcho(
             if listing is not None:
                 raise listing
             page, size = kwargs["params"]["page"], kwargs["params"]["size"]
-            items = [{"id": sid, "metadata": {"cwd": cwd}} for sid, cwd in sessions]
+            items = [
+                {"id": sid, "metadata": {"cwd": cwd, **({"source": app[0]} if app else {})}}
+                for sid, cwd, *app in sessions
+            ]
             return {
                 "items": items[(page - 1) * size : page * size],
                 "total": len(items),
@@ -284,6 +288,25 @@ def test_with_neither_answer_nor_folders_only_the_query_is_judged(
     assert [item["kind"] for item in asked] == ["query"]
 
 
+def test_a_trial_opens_the_apps_a_teammate_has_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ChatGPT conversations have no folder; a trial opens them as a teammate's chat does."""
+    _jev(monkeypatch)
+    sessions = (*SESSIONS, ("g-1", None, "chatgpt"), ("c-1", None, "claude"))
+    calls = _honcho(monkeypatch, {"content": "학습 실험"}, sessions=sessions)
+
+    trial = server.guard_trial(QUERY, folders=FOLDERS, sources=["chatgpt"])
+    alone = server.guard_trial(QUERY, sources=["chatgpt"])
+
+    assert (trial["outcome"], alone["outcome"]) == ("passed", "passed")
+    chats = [call for call in calls if call["path"].endswith("/chat")]
+    assert [chat["body"]["filters"]["session_id"]["in"] for chat in chats] == [
+        ["s-flypiano", "s-api", "g-1"],
+        ["g-1"],
+    ]
+
+
 def test_with_the_gate_off_the_trial_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(jev_gate, "ENABLED", False)
     _honcho(monkeypatch, {"content": "학습 실험"})
@@ -316,6 +339,12 @@ def test_with_the_gate_off_the_trial_says_so(monkeypatch: pytest.MonkeyPatch) ->
         {"query": "q", "folders": [{"path": "/a", "subfolders": True, "name": "a"}]},
         {"query": "q", "folders": [{"path": "/" + "a" * 4096, "subfolders": True}]},
         {"query": "q", "folders": [{"path": "/a", "subfolders": True}] * 501},
+        {"query": "q", "sources": "chatgpt"},
+        {"query": "q", "sources": {"chatgpt": True}},
+        {"query": "q", "sources": [5]},
+        {"query": "q", "sources": ["ChatGPT"]},
+        {"query": "q", "sources": [""]},
+        {"query": "q", "sources": ["chatgpt"] * 33},
     ],
 )
 def test_a_trial_takes_a_query_and_at_most_an_answer_and_folders(body: Any) -> None:
@@ -325,12 +354,19 @@ def test_a_trial_takes_a_query_and_at_most_an_answer_and_folders(body: Any) -> N
 def test_a_trial_reads_only_what_it_takes() -> None:
     assert server._trial_input(
         {"query": "q", "answer": None, "folders": FOLDERS, "peer_id": "x"}
-    ) == {"query": "q", "answer": None, "folders": FOLDERS}
+    ) == {"query": "q", "answer": None, "folders": FOLDERS, "sources": None}
     assert server._trial_input({"query": "q", "answer": "a"}) == {
         "query": "q",
         "answer": "a",
         "folders": None,
+        "sources": None,
     }
+    assert server._trial_input(
+        {"query": "q", "sources": ["chatgpt", "agy", "chatgpt"]}
+    )["sources"] == ["chatgpt", "agy"]
+    assert server._trial_input({"query": "q", "sources": ["x"] * 32})["sources"] == [
+        "x"
+    ]
     longest = [{"path": "/" + "a" * 4095, "subfolders": False}] * 500
     assert server._trial_input({"query": "q", "folders": longest})["folders"] == longest
     assert server._trial_input({"query": "q", "folders": []})["folders"] == []

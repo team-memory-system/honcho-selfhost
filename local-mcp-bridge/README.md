@@ -113,13 +113,13 @@ using `get_representation(peer_id="user_chen", observer_id="user_chen")`.
 
 A team server reaches this bridge only through its gate, which checks each
 caller's Cloudflare Access login, drops every `x-honcho-*` header the caller sent,
-and sends two of its own. With `HONCHO_MCP_SCOPE_FROM_GATE=1` every tool call reads
-them:
+and sends its own. With `HONCHO_MCP_SCOPE_FROM_GATE=1` every tool call reads them:
 
 | `x-honcho-scope-mode` | Caller | The bridge |
 |---|---|---|
 | `all` | the server's owner | works as without the setting |
-| `folders` | a teammate | answers `chat` only, from the conversations in the folders in `x-honcho-allowed-folders` |
+| `folders` | a teammate | answers `chat` only, from the conversations in the folders in `x-honcho-allowed-folders` and of the apps in `x-honcho-allowed-sources` |
+| `off` | a teammate the owner turned off for now | refuses every call, saying the owner turned their chat off and that they can ask again once it is back on |
 | missing, repeated or anything else | | refuses every call |
 
 `x-honcho-allowed-folders` is base64url, with or without padding, of a UTF-8 JSON
@@ -136,7 +136,18 @@ the entry has `subfolders`. Both paths are compared with backslashes read as `/`
 repeated `/` read as one, and a trailing `/` dropped, except from `/` itself or a
 drive root such as `C:/`; a root with `subfolders` opens every path under it. A
 path that starts with a drive letter ignores case, as Windows does, and any other
-path keeps it. A session without a `cwd` in text is in no folder.
+path keeps it. A session without a `cwd` in text, or with an empty one, is in no
+folder.
+
+A conversation in no folder, such as a ChatGPT import, opens by the app it came
+from instead: its session's `metadata.source` when that is 1 to 32 of `a-z`, `0-9`,
+`_`, `.` and `-` starting with a letter or digit, else `unknown`.
+`x-honcho-allowed-sources` is base64url, with or without padding, of a UTF-8 JSON
+list of such names, `["chatgpt"]` for every ChatGPT import. The gate sends it only
+when some app is open, and without it none is; a list that is repeated or
+malformed, or holds anything but such a name, refuses the call. An app opens only
+its conversations in no folder: a session with a folder is open by its folder
+alone.
 
 A teammate's `chat`:
 
@@ -145,9 +156,10 @@ A teammate's `chat`:
   `filters: {"session_id": {"in": [...]}}` naming the sessions in the open
   folders. Honcho recalls only from those sessions, and the answer comes back as
   Honcho gave it.
-- is refused when the open folders hold no conversation, in the same words whether
-  nothing is open or what is open is empty, and when they hold more than 1000, the
-  most one Honcho chat takes; the owner then has to open fewer folders.
+- is refused when the open folders and apps hold no conversation, in the same
+  words whether nothing is open or what is open is empty, and when they hold more
+  than 1000, the most one Honcho chat takes; the owner then has to open fewer
+  folders.
 - is refused with `session_id` or `filters`, and every other tool is refused.
 
 The bridge lists the workspace's sessions (`POST
@@ -160,8 +172,9 @@ applies to the next question.
 Refusals are recorded in the audit log as `denied`, before the Jev gate and before
 Honcho. A session list that cannot be read is recorded as `error`, with its cause,
 while the teammate is told only that it could not be listed. The arguments of a
-teammate's call record the folders as the gate sent them, as `folders`, and how
-many conversations the answer was confined to, as `sessions`. The setting does not
+teammate's call record the folders and apps as the gate sent them, as `folders`
+and `sources`, and how many conversations the answer was confined to, as
+`sessions`. The setting does not
 pin the workspace or the peers; the team server's bridge also sets
 `HONCHO_MCP_PIN_DEFAULTS=1` and `HONCHO_MCP_ENABLED_TOOLS=chat`.
 

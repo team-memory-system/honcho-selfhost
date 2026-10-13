@@ -664,7 +664,7 @@ def test_a_burst_of_questions_lists_the_sessions_once(
         thread.join(5)
 
     assert len(honcho.listings) == 1
-    assert lists == [(("s1", "/work"),)] * 5
+    assert lists == [(("s1", "/work", None),)] * 5
 
 
 def test_each_workspace_has_its_own_list(
@@ -685,6 +685,239 @@ def test_each_workspace_has_its_own_list(
     clock[0] += server.SESSION_LIST_TTL_SECONDS
     server._open_sessions("two", [_folder("/work")])
     assert set(server._session_lists) == {"two"}
+
+
+# ------------------------------------------------- conversations without a folder
+
+
+def _chatgpt(session_id: str) -> dict[str, Any]:
+    """A ChatGPT conversation as an import records it: an app and no folder."""
+    return {"id": session_id, "metadata": {"source": "chatgpt", "title": "t"}}
+
+
+def _teammate_with(
+    folders: list[dict[str, Any]], sources: Any, *, padded: bool = False
+) -> dict[str, str]:
+    headers = _teammate(*folders)
+    headers["x-honcho-allowed-sources"] = (
+        sources if isinstance(sources, str) else _encoded(sources, padded=padded)
+    )
+    return headers
+
+
+def test_an_opened_app_adds_its_conversations_without_a_folder(
+    gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
+) -> None:
+    honcho.add("s-team", "/work/team")
+    honcho.add_item(_chatgpt("g-1"))
+    honcho.add("s-private", "/work/private")
+    honcho.add_item({"id": "g-folder", "metadata": {"source": "chatgpt", "cwd": "/x"}})
+    honcho.add_item({"id": "c-loose", "metadata": {"source": "claude"}})
+    honcho.add_item(_chatgpt("g-2"))
+    opened = [_folder("/work/team", True)]
+    gate(_teammate_with(opened, ["chatgpt"]))
+
+    server.chat("q")
+
+    # A ChatGPT session that has a folder goes by its folder, and another app's
+    # conversation without a folder stays closed.
+    assert _allowlist(honcho.chats[0]) == ["s-team", "g-1", "g-2"]
+    row = audited[0]
+    assert row["status"] == "ok"
+    assert row["arguments"]["folders"] == opened
+    assert row["arguments"]["sources"] == ["chatgpt"]
+    assert row["arguments"]["sessions"] == 3
+
+
+def test_an_app_alone_opens_without_any_folder(
+    gate: Any, honcho: FakeHoncho
+) -> None:
+    honcho.add("s-team", "/work/team")
+    honcho.add_item(_chatgpt("g-1"))
+    gate(_teammate_with([], ["chatgpt"]))
+
+    server.chat("q")
+
+    assert _allowlist(honcho.chats[0]) == ["g-1"]
+
+
+def test_without_the_apps_header_no_app_is_open(
+    gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
+) -> None:
+    """A gate from before apps opens folders only, as it did."""
+    honcho.add("s-team", "/work/team")
+    honcho.add_item(_chatgpt("g-1"))
+    gate(_teammate(_folder("/work/team")))
+
+    server.chat("q")
+
+    assert _allowlist(honcho.chats[0]) == ["s-team"]
+    assert "sources" not in audited[0]["arguments"]
+
+
+def test_an_app_with_no_conversation_is_refused_as_an_empty_folder(
+    gate: Any, honcho: FakeHoncho
+) -> None:
+    honcho.add("s-team", "/work/team")
+    gate(_teammate_with([], ["chatgpt"]))
+    with pytest.raises(RuntimeError, match=f"^{NO_CONVERSATION}$"):
+        server.chat("q")
+    assert honcho.chats == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "app"),
+    [
+        pytest.param({"source": "chatgpt"}, "chatgpt", id="chatgpt"),
+        pytest.param({"source": "agy"}, "agy", id="agy"),
+        pytest.param({"source": "a.b_c-1"}, "a.b_c-1", id="punctuation"),
+        pytest.param({}, "unknown", id="no-source"),
+        pytest.param({"source": None}, "unknown", id="source-null"),
+        pytest.param({"source": 12}, "unknown", id="source-number"),
+        pytest.param({"source": ""}, "unknown", id="source-empty"),
+        pytest.param({"source": "ChatGPT"}, "unknown", id="capitals"),
+        pytest.param({"source": "chat gpt"}, "unknown", id="space"),
+        pytest.param({"source": "x" * 33}, "unknown", id="too-long"),
+        pytest.param({"source": "-x"}, "unknown", id="leading-dash"),
+        pytest.param(None, "unknown", id="metadata-null"),
+    ],
+)
+def test_a_conversation_without_a_folder_is_known_by_its_app(
+    honcho: FakeHoncho, metadata: Any, app: str
+) -> None:
+    assert server._session_source(metadata) == app
+    honcho.add_item({"id": "s1", "metadata": metadata})
+    assert server._open_sessions(server.DEFAULT_WORKSPACE_ID, [], [app]) == ["s1"]
+
+
+def test_unknown_opens_the_conversations_of_no_known_app(honcho: FakeHoncho) -> None:
+    honcho.add_item({"id": "s1", "metadata": {}})
+    honcho.add_item(_chatgpt("g-1"))
+    assert server._open_sessions(server.DEFAULT_WORKSPACE_ID, [], ["unknown"]) == [
+        "s1"
+    ]
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_the_app_list_reads_with_or_without_padding(
+    gate: Any, honcho: FakeHoncho, padded: bool
+) -> None:
+    honcho.add_item(_chatgpt("g-1"))
+    sources = ["chatgpt"]
+    assert _encoded(sources, padded=padded).endswith("=") is padded, "needs padding"
+    gate(_teammate_with([], sources, padded=padded))
+
+    server.chat("q")
+
+    assert _allowlist(honcho.chats[0]) == ["g-1"]
+
+
+@pytest.mark.parametrize(
+    "sources",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("not base64!", id="not-base64"),
+        pytest.param(_base64url(b"not json"), id="not-json"),
+        pytest.param(_encoded("chatgpt"), id="text"),
+        pytest.param(_encoded({"chatgpt": True}), id="an-object"),
+        pytest.param(_encoded([12]), id="a-number"),
+        pytest.param(_encoded(["ChatGPT"]), id="capitals"),
+        pytest.param(_encoded(["chatgpt", ""]), id="one-empty"),
+        pytest.param(_encoded([{"source": "chatgpt"}]), id="an-entry"),
+    ],
+)
+def test_an_unreadable_app_list_is_refused(
+    gate: Any,
+    audited: list[dict[str, Any]],
+    honcho: FakeHoncho,
+    sources: str,
+) -> None:
+    gate(_teammate_with([_folder("/work")], sources))
+
+    with pytest.raises(
+        RuntimeError, match="x-honcho-allowed-sources is repeated or malformed$"
+    ):
+        server.chat("q")
+
+    assert honcho.calls == []
+    assert audited[0]["status"] == "denied"
+
+
+def test_a_repeated_app_list_is_refused(gate: Any, honcho: FakeHoncho) -> None:
+    honcho.add_item(_chatgpt("g-1"))
+    gate(
+        Headers(
+            raw=[
+                (b"x-honcho-scope-mode", b"folders"),
+                (b"x-honcho-allowed-folders", _encoded([]).encode()),
+                (b"x-honcho-allowed-sources", _encoded([]).encode()),
+                (b"x-honcho-allowed-sources", _encoded(["chatgpt"]).encode()),
+            ]
+        )
+    )
+    with pytest.raises(RuntimeError, match="x-honcho-allowed-sources is repeated"):
+        server.chat("q")
+    assert honcho.calls == []
+
+
+def test_an_app_list_means_nothing_to_the_owner(gate: Any, honcho: FakeHoncho) -> None:
+    gate({**OWNER, "x-honcho-allowed-sources": "not base64!"})
+    server.chat("q")
+    assert "filters" not in honcho.chats[0]["body"]
+
+
+# ------------------------------------------------------------ a teammate turned off
+
+
+def _turned_off() -> dict[str, str]:
+    return {
+        "cf-access-authenticated-user-email": "mate@example.com",
+        "x-honcho-scope-mode": "off",
+    }
+
+
+def test_a_teammate_turned_off_is_refused_before_anything_is_asked(
+    gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
+) -> None:
+    honcho.add("s1", "/work")
+    gate(_turned_off())
+
+    with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
+        server.chat("q")
+
+    assert honcho.calls == []
+    assert len(audited) == 1
+    row = audited[0]
+    assert (row["status"], row["caller"]) == ("denied", "mate@example.com")
+    assert row["error"] == server.TURNED_OFF
+    assert row["arguments"]["folders"] == []
+    assert "sessions" not in row["arguments"]
+
+
+def test_a_teammate_turned_off_hears_the_same_for_every_tool(
+    gate: Any, honcho: FakeHoncho
+) -> None:
+    gate(_turned_off())
+    with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
+        server.search("q")
+    with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
+        server.chat("q", session_id="s1")
+    assert honcho.calls == []
+
+
+def test_the_words_a_teammate_turned_off_hears_say_nothing_of_the_memory() -> None:
+    assert server.TURNED_OFF == (
+        "The owner of this memory has turned your chat off for now. You can ask "
+        "again once they turn it back on."
+    )
+
+
+def test_off_ignores_any_folders_sent_with_it(gate: Any, honcho: FakeHoncho) -> None:
+    honcho.add("s1", "/work")
+    gate({**_turned_off(), "x-honcho-allowed-folders": _encoded([_folder("/work")])})
+    with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
+        server.chat("q")
+    assert honcho.calls == []
 
 
 # --------------------------------------------------------------------- refusals
@@ -792,6 +1025,8 @@ def test_the_old_project_list_is_not_read(gate: Any, honcho: FakeHoncho) -> None
             id="folders-in-capitals",
         ),
         pytest.param({"x-honcho-scope-mode": "owner"}, id="unknown"),
+        pytest.param({"x-honcho-scope-mode": "OFF"}, id="off-in-capitals"),
+        pytest.param({"x-honcho-scope-mode": "paused"}, id="paused"),
         pytest.param(
             {
                 "x-honcho-scope-mode": "projects",
