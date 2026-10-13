@@ -89,6 +89,8 @@ class FakeHoncho:
                 "created_at": "2026-10-09T01:00:00Z",
             }
         ]
+        #: What each search finds, from the call, in place of `found`.
+        self.search_answer: Callable[[dict[str, Any]], Any] | None = None
         #: An exception the session list raises, or a page it returns, instead.
         self.listing: Any = None
         #: Run as each page of sessions is asked for.
@@ -130,6 +132,8 @@ class FakeHoncho:
         if path.endswith("/chat"):
             return self.answer
         if path.endswith("/search"):
+            if self.search_answer is not None:
+                return self.search_answer(self.calls[-1])
             return self.found
         return {"ok": True}
 
@@ -423,38 +427,39 @@ def test_no_conversation_in_the_open_folders_is_refused(
     assert row["arguments"]["sessions"] == 0
 
 
-def test_more_sessions_than_one_chat_takes_are_refused(
-    gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
+def test_more_sessions_than_one_search_names_are_searched_a_share_at_a_time(
+    gate: Any, honcho: FakeHoncho, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Honcho takes at most 1000 sessions in one allowlist."""
-    for n in range(1001):
+    """Each share is one search; the answers merge best first, each share's first first."""
+    monkeypatch.setattr(server, "MAX_SESSIONS_PER_SEARCH", 4)
+    for n in range(10):
         honcho.add(f"s{n}", "/work")
     gate(_teammate(_folder("/work")))
+    answers = {
+        "s0": [{"id": "a1", "session_id": "s0", "content": "a1"}, {"id": "a2", "session_id": "s1", "content": "a2"}],
+        "s4": [{"id": "b1", "session_id": "s4", "content": "b1"}],
+        "s8": [{"id": "c1", "session_id": "s8", "content": "c1"}, {"id": "c2", "session_id": "s9", "content": "c2"}],
+    }
+    honcho.search_answer = lambda call: answers[_allowlist(call)[0]]
 
-    with pytest.raises(RuntimeError) as refused:
-        server.search_messages("q")
+    found = server.search_messages("q", limit=4)
 
-    assert str(refused.value) == (
-        "The folders open to you on this MCP server hold more than 1000 "
-        "conversations, more than one search can cover; the owner has to open "
-        "fewer folders"
-    )
-    assert honcho.searches == []
-    row = audited[0]
-    assert (row["status"], row["error"]) == ("denied", str(refused.value))
-    assert row["arguments"]["sessions"] == 1001
+    assert sorted(_allowlist(call)[0] for call in honcho.searches) == ["s0", "s4", "s8"]
+    assert sorted(len(_allowlist(call)) for call in honcho.searches) == [2, 4, 4]
+    assert [item["content"] for item in found["messages"]] == ["a1", "b1", "c1", "a2"]
 
 
-def test_as_many_sessions_as_one_chat_takes_are_asked(
+def test_as_many_sessions_as_one_search_names_are_one_search(
     gate: Any, honcho: FakeHoncho
 ) -> None:
-    for n in range(1000):
+    for n in range(1001):
         honcho.add(f"s{n}", "/work")
     gate(_teammate(_folder("/work")))
 
     server.search_messages("q")
 
-    assert len(_allowlist(honcho.searches[0])) == 1000
+    assert len(honcho.searches) == 1
+    assert len(_allowlist(honcho.searches[0])) == 1001
 
 
 @pytest.mark.parametrize(

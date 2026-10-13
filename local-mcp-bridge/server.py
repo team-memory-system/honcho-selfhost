@@ -136,10 +136,15 @@ TEAMMATE_TOOLS = (
     "search_conclusions",
 )
 
-#: The most sessions one Honcho request confines itself to
-#: (MAX_SESSION_ALLOWLIST_ENTRIES in Honcho's src/utils/filter.py). Folders holding
-#: more are refused here rather than sent to be refused by Honcho.
-MAX_SESSION_ALLOWLIST_ENTRIES = 1000
+#: The most sessions one search names in its `session_id` filter. Honcho caps that
+#: filter only on chat and representation (MAX_SESSION_ALLOWLIST_ENTRIES, 1000, in
+#: its src/utils/filter.py), not on message or conclusion search; there each id is a
+#: bound parameter of one Postgres query, which takes at most 32,767. A teammate
+#: with more sessions open is searched a share at a time, the shares at once, and
+#: the answers merged (_scoped_items).
+MAX_SESSIONS_PER_SEARCH = 20_000
+#: Shares searched at the same time.
+SEARCH_SHARE_WORKERS = 4
 
 #: How long a workspace's sessions, as listed, answer for which folder each one is
 #: in. A burst of questions lists them once, and a conversation started now is
@@ -941,16 +946,51 @@ NOT_OPEN = "No conversation with that id is open to you on this MCP server"
 
 
 def _allowlist_refusal(sessions: list[str]) -> str | None:
-    """Why one Honcho request cannot be confined to `sessions`, or None when it can."""
-    if not sessions:
-        return NO_CONVERSATION
-    if len(sessions) > MAX_SESSION_ALLOWLIST_ENTRIES:
-        return (
-            "The folders open to you on this MCP server hold more than "
-            f"{MAX_SESSION_ALLOWLIST_ENTRIES} conversations, more than one search "
-            "can cover; the owner has to open fewer folders"
+    """Why a search cannot be confined to `sessions`, or None when it can."""
+    return None if sessions else NO_CONVERSATION
+
+
+def _scoped_items(
+    sessions: list[str] | None,
+    ask: Callable[[dict[str, Any] | None], Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """What `ask` finds, confined to `sessions` (None: not confined).
+
+    `ask` makes one Honcho search with the `session_id` filter it is given. Up to
+    MAX_SESSIONS_PER_SEARCH sessions that is one search; more are searched a share
+    at a time, all at once, each share asked for `limit`, and the answers merged
+    best first: every share's first, then every share's second, and so on, since
+    Honcho returns no score to compare them by. The first `limit` are kept.
+    """
+    if sessions is None:
+        return _items(ask(None))
+    shares = [
+        sessions[start : start + MAX_SESSIONS_PER_SEARCH]
+        for start in range(0, len(sessions), MAX_SESSIONS_PER_SEARCH)
+    ]
+    if len(shares) == 1:
+        return _items(ask({"in": shares[0]}))
+    with ThreadPoolExecutor(max_workers=min(SEARCH_SHARE_WORKERS, len(shares))) as pool:
+        answers = list(
+            pool.map(
+                lambda share: _items(contextvars.copy_context().run(ask, {"in": share})),
+                shares,
+            )
         )
-    return None
+    merged: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    for rank in range(max(len(answer) for answer in answers)):
+        for answer in answers:
+            if rank >= len(answer):
+                continue
+            item = answer[rank]
+            key = item.get("id") or (item.get("session_id"), item.get("content"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged[:limit]
 
 
 class TeammateReach(NamedTuple):
@@ -1837,9 +1877,9 @@ def _open_conversation(reach: TeammateReach | None, conversation_id: str) -> Non
         raise RuntimeError(NOT_OPEN)
 
 
-def _session_scope(reach: TeammateReach | None) -> Any:
-    """The `session_id` filter that holds a teammate to their sessions, or None."""
-    return None if reach is None else {"in": list(reach.sessions or ())}
+def _reach_sessions(reach: TeammateReach | None) -> list[str] | None:
+    """The sessions a teammate is held to, or None for a call that is not confined."""
+    return None if reach is None else list(reach.sessions or ())
 
 
 def _items(answer: Any) -> list[dict[str, Any]]:
@@ -2014,9 +2054,6 @@ def search_messages(
         _open_conversation(reach, conversation_id)
     workspace_id = _resolve_defaults()["workspace_id"]
     filters: dict[str, Any] = {}
-    scope = conversation_id or _session_scope(reach)
-    if scope is not None:
-        filters["session_id"] = scope
     times = {
         name: moment.isoformat()
         for name, moment in (
@@ -2027,24 +2064,32 @@ def search_messages(
     }
     if times:
         filters["created_at"] = times
-    found = _request(
-        "POST",
-        f"/v3/workspaces/{workspace_id}/search",
-        body=_clean_none(
-            {
-                "query": query,
-                "limit": int(_clamp(limit, 1, MAX_FOUND_MESSAGES)),
-                "filters": filters or None,
-            }
-        ),
-    )
+    if conversation_id:
+        filters["session_id"] = conversation_id
+    size = int(_clamp(limit, 1, MAX_FOUND_MESSAGES))
+    _require_auth()
+
+    def ask(scope: dict[str, Any] | None) -> Any:
+        return _honcho(
+            "POST",
+            f"/v3/workspaces/{workspace_id}/search",
+            body=_clean_none(
+                {
+                    "query": query,
+                    "limit": size,
+                    "filters": ({**filters, "session_id": scope} if scope else filters) or None,
+                }
+            ),
+        )
+
+    found = _scoped_items(None if conversation_id else _reach_sessions(reach), ask, size)
     return {
         "messages": [
             {
                 "conversation_id": item.get("session_id"),
                 **_said(item, SEARCH_MESSAGE_CHARS),
             }
-            for item in _items(found)
+            for item in found
         ]
     }
 
@@ -2116,16 +2161,21 @@ def search_conclusions(
     filters: dict[str, Any] = {"observer": owner, "observed": owner}
     if reach is not None:
         filters["level"] = "explicit"
-        filters["session_id"] = _session_scope(reach)
-    found = _request(
-        "POST",
-        f"/v3/workspaces/{workspace_id}/conclusions/query",
-        body={
-            "query": query,
-            "top_k": int(_clamp(limit, 1, MAX_FOUND_CONCLUSIONS)),
-            "filters": filters,
-        },
-    )
+    size = int(_clamp(limit, 1, MAX_FOUND_CONCLUSIONS))
+    _require_auth()
+
+    def ask(scope: dict[str, Any] | None) -> Any:
+        return _honcho(
+            "POST",
+            f"/v3/workspaces/{workspace_id}/conclusions/query",
+            body={
+                "query": query,
+                "top_k": size,
+                "filters": {**filters, "session_id": scope} if scope else filters,
+            },
+        )
+
+    found = _scoped_items(_reach_sessions(reach), ask, size)
     last_ran = {
         session.id: session.last_at for session in _workspace_sessions(workspace_id)
     }
@@ -2198,7 +2248,7 @@ def guard_trial(
     folder of the apps in `sources` (`found`), and that is judged as what a
     teammate reads is. `outcome` is "refused" (the query), "withheld" (what they
     would read), "passed", or "no_answer" when the search could not run, or what is
-    open holds no conversation or more than one search covers; with neither an
+    open holds no conversation; with neither an
     answer nor folders or apps only the query is judged. Nothing is recorded: a
     trial is not a teammate's call.
     """
@@ -2228,20 +2278,20 @@ def guard_trial(
             refusal = _allowlist_refusal(sessions)
             if refusal is not None:
                 return {**trial, "outcome": "no_answer", "error": refusal}
-            searched = _honcho(
-                "POST",
-                f"/v3/workspaces/{workspace}/search",
-                body={
-                    "query": query,
-                    "limit": TRIAL_FOUND,
-                    "filters": {"session_id": {"in": sessions}},
-                },
+            searched = _scoped_items(
+                sessions,
+                lambda scope: _honcho(
+                    "POST",
+                    f"/v3/workspaces/{workspace}/search",
+                    body={"query": query, "limit": TRIAL_FOUND, "filters": {"session_id": scope}},
+                ),
+                TRIAL_FOUND,
             )
         except (RuntimeError, httpx.HTTPError, TypeError, ValueError) as exc:
             return {**trial, "outcome": "no_answer", "error": str(exc) or type(exc).__name__}
         found = [
             {"conversation_id": item.get("session_id"), **_said(item, SEARCH_MESSAGE_CHARS)}
-            for item in _items(searched)
+            for item in searched
         ]
         result = {"messages": found}
     else:

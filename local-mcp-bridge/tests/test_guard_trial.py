@@ -281,7 +281,7 @@ def test_folders_with_no_conversation_are_no_answer(
     assert [item["kind"] for item in asked] == ["query"]
 
 
-def test_folders_holding_more_than_one_search_covers_are_no_answer(
+def test_folders_holding_more_than_a_thousand_conversations_are_searched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _jev(monkeypatch)
@@ -290,9 +290,10 @@ def test_folders_holding_more_than_one_search_covers_are_no_answer(
 
     trial = server.guard_trial(QUERY, folders=FOLDERS)
 
-    assert trial["outcome"] == "no_answer"
-    assert trial["error"].endswith("the owner has to open fewer folders")
-    assert not [call for call in calls if call["path"].endswith("/search")]
+    assert trial["outcome"] != "no_answer"
+    searches = [call for call in calls if call["path"].endswith("/search")]
+    assert len(searches) == 1
+    assert len(searches[0]["body"]["filters"]["session_id"]["in"]) == 1001
 
 
 def test_with_neither_answer_nor_folders_only_the_query_is_judged(

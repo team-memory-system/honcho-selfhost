@@ -172,8 +172,10 @@ Each takes `question`, the teammate's own words: the audit log keeps it as the
 call's query, and the Jev gate judges it with the words searched for. Times are
 Honcho's, in UTC; a bare date is a whole UTC day. A call is refused when the open
 folders and apps hold no conversation, in the same words whether nothing is open or
-what is open is empty, and when they hold more than 1000, the most one Honcho
-request takes; the owner then has to open fewer folders. A conversation named by id
+what is open is empty. Any number may be open: a search names up to 20,000
+sessions in its filter (each a bound parameter of one Postgres query), and more are
+searched a share at a time, at once, the answers merged each share's best first,
+since Honcho returns no score. A conversation named by id
 that is not open is refused in the same words whether it is closed or does not
 exist. Every other tool, `chat` among them, is refused.
 
