@@ -16,7 +16,8 @@ companion services separate. It remains AGPL-3.0.
 - `local-mcp-bridge/`, `local-dashboard/`: our independent HTTP companion services.
 - `.build/honcho/`: generated, ignored, patched runtime source. Never hand-edit it.
 
-`honcho-agent-bridge` remains the collector/installer. It installs
+`team-memory` (the plugin people install; `honcho-agent-bridge` until 0.6.7)
+remains the collector/installer. It installs
 `team-memory-system/subscription-gateway` through the gateway CLI. One Honcho and one DB
 belong to each person; their several machines feed that same server.
 
