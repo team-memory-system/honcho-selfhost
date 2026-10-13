@@ -21,12 +21,13 @@ from typing import Any
 
 logger = logging.getLogger("honcho.mcp.audit")
 
-#: Parameter names that carry the text a caller actually typed, best first.
+#: Parameter names that carry the text a caller actually typed, best first. A
+#: teammate's tools take the person's own question beside the words searched for.
 QUERY_PARAMS = (
+    "question",
     "query",
     "search_query",
     "queries",
-    "question",
     "prompt",
     "text",
 )

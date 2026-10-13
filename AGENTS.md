@@ -103,9 +103,9 @@ nothing at all. The Jev gate is off unless `HONCHO_JEV_GATE` is set; with
 It judges the query before Honcho sees it and the answer before the caller does,
 and a withheld answer gets the query's own refusal. With `HONCHO_AUDIT_READ` the
 bridge also serves `POST /guard-trial` to the dashboard (`guard_trial`): a question
-judged as a teammate's, then the answer the owner wrote or Honcho's own from the
-conversations in the given folders, confined as a teammate's chat is, judged as
-theirs, with nothing recorded.
+judged as a teammate's, then the answer the owner wrote or what a teammate's search
+for it finds in the conversations in the given folders, judged as what a teammate
+reads, with nothing recorded.
 
 ## Open items an agent should know about
 

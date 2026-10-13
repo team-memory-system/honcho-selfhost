@@ -1,10 +1,11 @@
-"""A teammate's `chat` answers only from the conversations in their open folders.
+"""A teammate reads only the conversations in their open folders.
 
 Behind a team server's gate (`HONCHO_MCP_SCOPE_FROM_GATE`), two headers say who is
 calling: the owner (`all`) or a teammate (`folders`, with the folders the owner
 opened to them). These tests hold the rules: the owner is answered as before, a
-teammate's question is one Honcho chat confined to the sessions whose folder is
-open, and anything the bridge cannot read is refused before it reaches Honcho.
+teammate's search is one Honcho search confined to the sessions whose folder is
+open, and anything the bridge cannot read is refused before it reaches Honcho. The
+other tools a teammate calls are tested in test_teammate_tools.py.
 """
 
 from __future__ import annotations
@@ -64,17 +65,30 @@ def _chat_path(peer: str) -> str:
     return f"/v3/workspaces/{server.DEFAULT_WORKSPACE_ID}/peers/{peer}/chat"
 
 
+SEARCH_PATH = f"/v3/workspaces/{server.DEFAULT_WORKSPACE_ID}/search"
+
+
 def _allowlist(call: dict[str, Any]) -> list[str]:
     return call["body"]["filters"]["session_id"]["in"]
 
 
 class FakeHoncho:
-    """Honcho's session list and chat answered locally, with every call kept."""
+    """Honcho's session list, search and chat answered locally, with every call kept."""
 
     def __init__(self) -> None:
         self.workspaces: dict[str, list[Any]] = {}
         self.calls: list[dict[str, Any]] = []
         self.answer: Any = {"content": "배포는 금요일에 했습니다.", "evidence": None}
+        #: What a search finds.
+        self.found: list[dict[str, Any]] = [
+            {
+                "id": "m1",
+                "session_id": "s1",
+                "peer_id": "me",
+                "content": "배포는 금요일에 했습니다.",
+                "created_at": "2026-10-09T01:00:00Z",
+            }
+        ]
         #: An exception the session list raises, or a page it returns, instead.
         self.listing: Any = None
         #: Run as each page of sessions is asked for.
@@ -115,6 +129,8 @@ class FakeHoncho:
             }
         if path.endswith("/chat"):
             return self.answer
+        if path.endswith("/search"):
+            return self.found
         return {"ok": True}
 
     @property
@@ -124,6 +140,10 @@ class FakeHoncho:
     @property
     def chats(self) -> list[dict[str, Any]]:
         return [call for call in self.calls if call["path"].endswith("/chat")]
+
+    @property
+    def searches(self) -> list[dict[str, Any]]:
+        return [call for call in self.calls if call["path"].endswith("/search")]
 
 
 @pytest.fixture(autouse=True)
@@ -186,7 +206,7 @@ def test_the_setting_is_read_at_startup(monkeypatch: pytest.MonkeyPatch) -> None
         importlib.reload(server)
 
 
-def test_without_the_setting_chat_is_unchanged(
+def test_without_the_setting_nothing_is_confined(
     monkeypatch: pytest.MonkeyPatch, audited: list[dict[str, Any]], honcho: FakeHoncho
 ) -> None:
     """The gate's headers mean nothing to a bridge that does not take them."""
@@ -198,17 +218,24 @@ def test_without_the_setting_chat_is_unchanged(
     )
     honcho.add("s1", "/work")
 
+    server.search_messages("q")
     server.chat("q", session_id="s1")
 
     assert honcho.calls == [
         {
             "method": "POST",
+            "path": SEARCH_PATH,
+            "body": {"query": "q", "limit": 10},
+            "params": None,
+        },
+        {
+            "method": "POST",
             "path": _chat_path(server.DEFAULT_ASSISTANT_NAME),
             "body": {"query": "q", "session_id": "s1", "reasoning_level": "low"},
             "params": None,
-        }
+        },
     ]
-    assert audited[0]["status"] == "ok"
+    assert [row["status"] for row in audited] == ["ok", "ok"]
     assert not {"folders", "sessions"} & set(audited[0]["arguments"])
 
 
@@ -264,23 +291,20 @@ def test_a_teammates_reach_does_not_outlive_their_call(
     """The next call on the same thread, the owner's here, is not confined."""
     honcho.add("s1", "/work")
     gate(_teammate(_folder("/work")))
-    server.chat("q")
+    server.search_messages("q")
     assert server._call_reach.get() is server._UNRESOLVED
 
     gate(OWNER)
-    server.chat("q")
+    server.search_messages("q")
 
-    assert [call["path"] for call in honcho.chats] == [
-        _chat_path(server.DEFAULT_USER_NAME),
-        _chat_path(server.DEFAULT_ASSISTANT_NAME),
-    ]
-    assert "filters" not in honcho.chats[1]["body"]
+    assert _allowlist(honcho.searches[0]) == ["s1"]
+    assert "filters" not in honcho.searches[1]["body"]
 
 
-# --------------------------------------------------------------- a teammate's chat
+# ------------------------------------------------------------- a teammate's search
 
 
-def test_a_teammates_question_is_one_chat_confined_to_the_open_folders(
+def test_a_teammates_search_is_one_search_confined_to_the_open_folders(
     gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
 ) -> None:
     honcho.add("s-team", "/work/team")
@@ -290,7 +314,18 @@ def test_a_teammates_question_is_one_chat_confined_to_the_open_folders(
     opened = [_folder("/work/team", True)]
     gate(_teammate(*opened))
 
-    assert server.chat("지난주 배포 어땠어?") is honcho.answer
+    found = server.search_messages("배포", question="지난주 배포 어땠어?")
+
+    assert found == {
+        "messages": [
+            {
+                "conversation_id": "s1",
+                "at": "2026-10-09T01:00:00Z",
+                "speaker": "me",
+                "content": "배포는 금요일에 했습니다.",
+            }
+        ]
+    }
 
     assert honcho.listings == [
         {
@@ -300,13 +335,13 @@ def test_a_teammates_question_is_one_chat_confined_to_the_open_folders(
             "params": {"page": 1, "size": 100},
         }
     ]
-    assert honcho.chats == [
+    assert honcho.searches == [
         {
             "method": "POST",
-            "path": _chat_path(server.DEFAULT_USER_NAME),
+            "path": SEARCH_PATH,
             "body": {
-                "query": "지난주 배포 어땠어?",
-                "reasoning_level": "low",
+                "query": "배포",
+                "limit": 10,
                 "filters": {"session_id": {"in": ["s-team", "s-api"]}},
             },
             "params": None,
@@ -317,30 +352,21 @@ def test_a_teammates_question_is_one_chat_confined_to_the_open_folders(
     assert (row["status"], row["caller"]) == ("ok", "mate@example.com")
     assert row["arguments"]["folders"] == opened
     assert row["arguments"]["sessions"] == 2
+    assert row["arguments"]["question"] == "지난주 배포 어땠어?"
 
 
-def test_the_owner_is_asked_about_unless_a_peer_is_named(
-    gate: Any, honcho: FakeHoncho
+def test_a_teammate_cannot_chat(
+    gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
 ) -> None:
-    """The allowlist confines recall; the path names only whom the question is about."""
+    """Their own agent searches and answers; the owner's model never runs for them."""
     honcho.add("s1", "/work")
     gate(_teammate(_folder("/work")))
 
-    server.chat("q")
-    server.chat("q", peer_id="assistant_codex")
-    server.chat("q", target_peer_id="assistant_codex", reasoning_level="high")
+    with pytest.raises(RuntimeError, match="^chat cannot be used with folders"):
+        server.chat("q")
 
-    assert [
-        (call["path"], call["body"].get("target"), call["body"]["reasoning_level"])
-        for call in honcho.chats
-    ] == [
-        (_chat_path(server.DEFAULT_USER_NAME), None, "low"),
-        (_chat_path("assistant_codex"), None, "low"),
-        (_chat_path(server.DEFAULT_USER_NAME), "assistant_codex", "high"),
-    ]
-    for call in honcho.chats:
-        assert _allowlist(call) == ["s1"]
-        assert not {"scope", "session_id"} & set(call["body"])
+    assert honcho.calls == []
+    assert audited[0]["status"] == "denied"
 
 
 def test_every_page_of_sessions_is_read(gate: Any, honcho: FakeHoncho) -> None:
@@ -348,12 +374,12 @@ def test_every_page_of_sessions_is_read(gate: Any, honcho: FakeHoncho) -> None:
         honcho.add(f"s{n:03}", "/work" if n % 2 == 0 else "/elsewhere")
     gate(_teammate(_folder("/work")))
 
-    server.chat("q")
+    server.search_messages("q")
 
     assert [call["params"] for call in honcho.listings] == [
         {"page": page, "size": 100} for page in (1, 2, 3)
     ]
-    assert _allowlist(honcho.chats[0]) == [f"s{n:03}" for n in range(0, 250, 2)]
+    assert _allowlist(honcho.searches[0]) == [f"s{n:03}" for n in range(0, 250, 2)]
 
 
 def test_a_session_listed_twice_is_asked_once(gate: Any, honcho: FakeHoncho) -> None:
@@ -362,9 +388,9 @@ def test_a_session_listed_twice_is_asked_once(gate: Any, honcho: FakeHoncho) -> 
     honcho.add("s1", "/work")
     gate(_teammate(_folder("/work")))
 
-    server.chat("q")
+    server.search_messages("q")
 
-    assert _allowlist(honcho.chats[0]) == ["s1"]
+    assert _allowlist(honcho.searches[0]) == ["s1"]
 
 
 @pytest.mark.parametrize(
@@ -385,10 +411,10 @@ def test_no_conversation_in_the_open_folders_is_refused(
     gate(_teammate(*opened))
 
     with pytest.raises(RuntimeError) as refused:
-        server.chat("q")
+        server.search_messages("q")
 
     assert str(refused.value) == NO_CONVERSATION
-    assert honcho.chats == []
+    assert honcho.searches == []
     # With nothing open there is nothing to list.
     assert len(honcho.listings) == (1 if opened else 0)
     row = audited[0]
@@ -406,14 +432,14 @@ def test_more_sessions_than_one_chat_takes_are_refused(
     gate(_teammate(_folder("/work")))
 
     with pytest.raises(RuntimeError) as refused:
-        server.chat("q")
+        server.search_messages("q")
 
     assert str(refused.value) == (
         "The folders open to you on this MCP server hold more than 1000 "
-        "conversations, more than one answer can draw on; the owner has to open "
+        "conversations, more than one search can cover; the owner has to open "
         "fewer folders"
     )
-    assert honcho.chats == []
+    assert honcho.searches == []
     row = audited[0]
     assert (row["status"], row["error"]) == ("denied", str(refused.value))
     assert row["arguments"]["sessions"] == 1001
@@ -426,9 +452,9 @@ def test_as_many_sessions_as_one_chat_takes_are_asked(
         honcho.add(f"s{n}", "/work")
     gate(_teammate(_folder("/work")))
 
-    server.chat("q")
+    server.search_messages("q")
 
-    assert len(_allowlist(honcho.chats[0])) == 1000
+    assert len(_allowlist(honcho.searches[0])) == 1000
 
 
 @pytest.mark.parametrize(
@@ -450,10 +476,10 @@ def test_a_session_list_that_does_not_read_is_refused_and_recorded(
     gate(_teammate(_folder("/work")))
 
     with pytest.raises(RuntimeError) as refused:
-        server.chat("q")
+        server.search_messages("q")
 
     assert str(refused.value) == NOT_LISTED
-    assert honcho.chats == []
+    assert honcho.searches == []
     row = audited[0]
     assert row["status"] == "error"
     assert row["error"].startswith("listing the sessions failed: ")
@@ -468,30 +494,33 @@ def test_a_failed_list_is_not_kept(
     honcho.listing = RuntimeError("Honcho API 503")
     gate(_teammate(_folder("/work")))
     with pytest.raises(RuntimeError, match="could not be listed"):
-        server.chat("q")
+        server.search_messages("q")
 
     honcho.listing = None
-    server.chat("q")
+    server.search_messages("q")
 
     assert len(honcho.listings) == 2
-    assert _allowlist(honcho.chats[0]) == ["s1"]
+    assert _allowlist(honcho.searches[0]) == ["s1"]
 
 
-def test_chat_outside_the_wrapper_still_confines_a_teammate(
+def test_a_tool_outside_the_wrapper_still_confines_a_teammate(
     gate: Any, honcho: FakeHoncho
 ) -> None:
-    """The wrapper works the reach out once per call; without it, chat does."""
+    """The wrapper works the reach out once per call; without it, the tool does."""
     honcho.add("s1", "/work")
     honcho.add("s2", "/elsewhere")
     gate(_teammate(_folder("/work")))
 
-    server.chat.__wrapped__("q")
-    assert _allowlist(honcho.chats[0]) == ["s1"]
+    server.search_messages.__wrapped__("q")
+    assert _allowlist(honcho.searches[0]) == ["s1"]
+    with pytest.raises(RuntimeError, match="^chat cannot be used with folders"):
+        server.chat.__wrapped__("q")
 
     gate(_teammate(_folder("/nothing-here")))
     with pytest.raises(RuntimeError, match=f"^{NO_CONVERSATION}$"):
-        server.chat.__wrapped__("q")
-    assert len(honcho.chats) == 1
+        server.search_messages.__wrapped__("q")
+    assert len(honcho.searches) == 1
+    assert honcho.chats == []
 
 
 # ------------------------------------------------------------ matching folders
@@ -606,17 +635,17 @@ def test_the_session_list_is_kept_for_a_minute(
     honcho.add("s1", "/work")
     gate(_teammate(_folder("/work")))
 
-    server.chat("q")
+    server.search_messages("q")
     honcho.add("s2", "/work")  # a conversation started after the list was read
     clock[0] += server.SESSION_LIST_TTL_SECONDS - 1
-    server.chat("q")
+    server.search_messages("q")
     assert len(honcho.listings) == 1
 
     clock[0] += 1
-    server.chat("q")
+    server.search_messages("q")
 
     assert len(honcho.listings) == 2
-    assert [_allowlist(call) for call in honcho.chats] == [["s1"], ["s1"], ["s1", "s2"]]
+    assert [_allowlist(call) for call in honcho.searches] == [["s1"], ["s1"], ["s1", "s2"]]
 
 
 def test_the_folders_are_read_on_every_call(
@@ -627,12 +656,12 @@ def test_the_folders_are_read_on_every_call(
     honcho.add("s2", "/work/b")
 
     gate(_teammate(_folder("/work/a"), _folder("/work/b")))
-    server.chat("q")
+    server.search_messages("q")
     gate(_teammate(_folder("/work/a")))
-    server.chat("q")
+    server.search_messages("q")
 
     assert len(honcho.listings) == 1
-    assert [_allowlist(call) for call in honcho.chats] == [["s1", "s2"], ["s1"]]
+    assert [_allowlist(call) for call in honcho.searches] == [["s1", "s2"], ["s1"]]
 
 
 def test_a_burst_of_questions_lists_the_sessions_once(
@@ -664,7 +693,8 @@ def test_a_burst_of_questions_lists_the_sessions_once(
         thread.join(5)
 
     assert len(honcho.listings) == 1
-    assert lists == [(("s1", "/work", None),)] * 5
+    assert [[session.id for session in listed] for listed in lists] == [["s1"]] * 5
+    assert all(listed is lists[0] for listed in lists)
 
 
 def test_each_workspace_has_its_own_list(
@@ -717,11 +747,11 @@ def test_an_opened_app_adds_its_conversations_without_a_folder(
     opened = [_folder("/work/team", True)]
     gate(_teammate_with(opened, ["chatgpt"]))
 
-    server.chat("q")
+    server.search_messages("q")
 
     # A ChatGPT session that has a folder goes by its folder, and another app's
     # conversation without a folder stays closed.
-    assert _allowlist(honcho.chats[0]) == ["s-team", "g-1", "g-2"]
+    assert _allowlist(honcho.searches[0]) == ["s-team", "g-1", "g-2"]
     row = audited[0]
     assert row["status"] == "ok"
     assert row["arguments"]["folders"] == opened
@@ -736,9 +766,9 @@ def test_an_app_alone_opens_without_any_folder(
     honcho.add_item(_chatgpt("g-1"))
     gate(_teammate_with([], ["chatgpt"]))
 
-    server.chat("q")
+    server.search_messages("q")
 
-    assert _allowlist(honcho.chats[0]) == ["g-1"]
+    assert _allowlist(honcho.searches[0]) == ["g-1"]
 
 
 def test_without_the_apps_header_no_app_is_open(
@@ -749,9 +779,9 @@ def test_without_the_apps_header_no_app_is_open(
     honcho.add_item(_chatgpt("g-1"))
     gate(_teammate(_folder("/work/team")))
 
-    server.chat("q")
+    server.search_messages("q")
 
-    assert _allowlist(honcho.chats[0]) == ["s-team"]
+    assert _allowlist(honcho.searches[0]) == ["s-team"]
     assert "sources" not in audited[0]["arguments"]
 
 
@@ -761,8 +791,8 @@ def test_an_app_with_no_conversation_is_refused_as_an_empty_folder(
     honcho.add("s-team", "/work/team")
     gate(_teammate_with([], ["chatgpt"]))
     with pytest.raises(RuntimeError, match=f"^{NO_CONVERSATION}$"):
-        server.chat("q")
-    assert honcho.chats == []
+        server.search_messages("q")
+    assert honcho.searches == []
 
 
 @pytest.mark.parametrize(
@@ -807,9 +837,9 @@ def test_the_app_list_reads_with_or_without_padding(
     assert _encoded(sources, padded=padded).endswith("=") is padded, "needs padding"
     gate(_teammate_with([], sources, padded=padded))
 
-    server.chat("q")
+    server.search_messages("q")
 
-    assert _allowlist(honcho.chats[0]) == ["g-1"]
+    assert _allowlist(honcho.searches[0]) == ["g-1"]
 
 
 @pytest.mark.parametrize(
@@ -837,7 +867,7 @@ def test_an_unreadable_app_list_is_refused(
     with pytest.raises(
         RuntimeError, match="x-honcho-allowed-sources is repeated or malformed$"
     ):
-        server.chat("q")
+        server.search_messages("q")
 
     assert honcho.calls == []
     assert audited[0]["status"] == "denied"
@@ -856,14 +886,14 @@ def test_a_repeated_app_list_is_refused(gate: Any, honcho: FakeHoncho) -> None:
         )
     )
     with pytest.raises(RuntimeError, match="x-honcho-allowed-sources is repeated"):
-        server.chat("q")
+        server.search_messages("q")
     assert honcho.calls == []
 
 
 def test_an_app_list_means_nothing_to_the_owner(gate: Any, honcho: FakeHoncho) -> None:
     gate({**OWNER, "x-honcho-allowed-sources": "not base64!"})
-    server.chat("q")
-    assert "filters" not in honcho.chats[0]["body"]
+    server.search_messages("q")
+    assert "filters" not in honcho.searches[0]["body"]
 
 
 # ------------------------------------------------------------ a teammate turned off
@@ -883,7 +913,7 @@ def test_a_teammate_turned_off_is_refused_before_anything_is_asked(
     gate(_turned_off())
 
     with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
-        server.chat("q")
+        server.search_messages("q")
 
     assert honcho.calls == []
     assert len(audited) == 1
@@ -901,13 +931,15 @@ def test_a_teammate_turned_off_hears_the_same_for_every_tool(
     with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
         server.search("q")
     with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
-        server.chat("q", session_id="s1")
+        server.read_conversation("s1")
+    with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
+        server.search_messages("q")
     assert honcho.calls == []
 
 
 def test_the_words_a_teammate_turned_off_hears_say_nothing_of_the_memory() -> None:
     assert server.TURNED_OFF == (
-        "The owner of this memory has turned your chat off for now. You can ask "
+        "The owner of this memory has turned your access off for now. You can ask "
         "again once they turn it back on."
     )
 
@@ -916,7 +948,7 @@ def test_off_ignores_any_folders_sent_with_it(gate: Any, honcho: FakeHoncho) -> 
     honcho.add("s1", "/work")
     gate({**_turned_off(), "x-honcho-allowed-folders": _encoded([_folder("/work")])})
     with pytest.raises(RuntimeError, match=f"^{server.TURNED_OFF}$"):
-        server.chat("q")
+        server.search_messages("q")
     assert honcho.calls == []
 
 
@@ -972,7 +1004,7 @@ def test_an_unreadable_folder_list_is_refused(
         RuntimeError,
         match="x-honcho-allowed-folders is missing, repeated or malformed$",
     ):
-        server.chat("q")
+        server.search_messages("q")
 
     assert honcho.calls == []
     assert audited[0]["status"] == "denied"
@@ -995,16 +1027,16 @@ def test_the_folder_list_reads_with_or_without_padding(
     honcho.add("s1", "/work")
     gate({"x-honcho-scope-mode": "folders", "x-honcho-allowed-folders": encoded})
 
-    server.chat("q")
+    server.search_messages("q")
 
-    assert _allowlist(honcho.chats[0]) == ["s1"]
+    assert _allowlist(honcho.searches[0]) == ["s1"]
 
 
 def test_the_old_project_list_is_not_read(gate: Any, honcho: FakeHoncho) -> None:
     project = _encoded([{"id": "p-0123456789ab", "name": "honcho"}])
     gate({"x-honcho-scope-mode": "folders", "x-honcho-allowed-scopes": project})
     with pytest.raises(RuntimeError, match="x-honcho-allowed-folders is missing"):
-        server.chat("q")
+        server.search_messages("q")
     assert honcho.calls == []
 
 
@@ -1048,7 +1080,7 @@ def test_a_missing_or_unknown_mode_is_refused(
     gate(headers)
 
     with pytest.raises(RuntimeError, match="x-honcho-scope-mode is missing"):
-        server.chat("q")
+        server.search_messages("q")
 
     assert honcho.calls == []
     assert audited[0]["status"] == "denied"
@@ -1068,7 +1100,7 @@ def test_a_repeated_gate_header_is_refused(gate: Any, honcho: FakeHoncho) -> Non
         )
     )
     with pytest.raises(RuntimeError, match="x-honcho-scope-mode is missing, repeated"):
-        server.chat("q")
+        server.search_messages("q")
 
     gate(
         Headers(
@@ -1080,7 +1112,7 @@ def test_a_repeated_gate_header_is_refused(gate: Any, honcho: FakeHoncho) -> Non
         )
     )
     with pytest.raises(RuntimeError, match="x-honcho-allowed-folders is missing"):
-        server.chat("q")
+        server.search_messages("q")
 
     assert honcho.calls == []
 
@@ -1097,7 +1129,7 @@ def test_a_call_without_an_http_request_is_refused(
     monkeypatch.setattr(server, "get_http_request", no_request)
 
     with pytest.raises(RuntimeError, match="x-honcho-scope-mode is missing"):
-        server.chat("q")
+        server.search_messages("q")
     assert honcho.calls == []
 
 
@@ -1113,16 +1145,16 @@ def test_no_session_is_listed_for_a_caller_without_the_token(
     gate(_teammate(_folder("/work")))
 
     with pytest.raises(RuntimeError, match="^Unauthorized"):
-        server.chat("q")
+        server.search_messages("q")
     assert honcho.calls == []
     assert audited[0]["status"] == "denied"
 
     gate({**_teammate(_folder("/work")), "authorization": "Bearer team-token"})
-    server.chat("q")
-    assert _allowlist(honcho.chats[0]) == ["s1"]
+    server.search_messages("q")
+    assert _allowlist(honcho.searches[0]) == ["s1"]
 
 
-def test_a_teammate_may_only_chat(
+def test_a_teammate_may_only_use_their_own_tools(
     gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
 ) -> None:
     """Any other tool would read past the folders, whatever the tool list says."""
@@ -1131,7 +1163,11 @@ def test_a_teammate_may_only_chat(
 
     with pytest.raises(
         RuntimeError,
-        match="^search cannot be used with folders on this MCP server; use chat$",
+        match=(
+            "^search cannot be used with folders on this MCP server; use "
+            "list_conversations, search_messages, read_conversation, "
+            "search_conclusions$"
+        ),
     ):
         server.search("q")
 
@@ -1142,35 +1178,24 @@ def test_a_teammate_may_only_chat(
     assert "sessions" not in row["arguments"]
 
 
-def test_session_id_is_refused_with_folders(
-    gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
+@pytest.mark.parametrize("asked", ["s-closed", "s-made-up"])
+def test_a_conversation_not_open_is_refused_by_id(
+    gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho, asked: str
 ) -> None:
-    """The bridge names the sessions itself; a teammate's own is not taken."""
+    """The same words for a closed conversation and one that does not exist."""
     honcho.add("s1", "/work")
+    honcho.add("s-closed", "/private")
     gate(_teammate(_folder("/work")))
 
-    with pytest.raises(
-        RuntimeError,
-        match="^session_id cannot be used with folders on this MCP server; omit it$",
-    ):
-        server.chat("q", session_id="s1")
+    with pytest.raises(RuntimeError, match=f"^{server.NOT_OPEN}$"):
+        server.read_conversation(asked)
+    with pytest.raises(RuntimeError, match=f"^{server.NOT_OPEN}$"):
+        server.search_messages("q", conversation_id=asked)
 
-    assert honcho.calls == []
-    assert audited[0]["status"] == "denied"
-
-
-def test_filters_are_refused_with_folders(gate: Any, honcho: FakeHoncho) -> None:
-    """chat takes no filters at all (see the HTTP test); the rule holds if it ever
-    does."""
-    gate(_teammate(_folder("/work")))
-
-    reach = server._teammate_reach("chat", {"filters": {"session_id": "s1"}})
-
-    assert reach.refusal == (
-        "filters cannot be used with folders on this MCP server; omit them"
-    )
-    assert reach.sessions is None
-    assert honcho.calls == []
+    assert honcho.listings and honcho.calls == honcho.listings
+    assert [row["status"] for row in audited] == ["denied", "denied"]
+    assert audited[0]["error"] == server.NOT_OPEN
+    assert audited[0]["arguments"]["sessions"] == 1
 
 
 def test_a_refused_call_never_reaches_the_jev_gate(
@@ -1185,8 +1210,8 @@ def test_a_refused_call_never_reaches_the_jev_gate(
     gate(_teammate(_folder("/nothing-here")))
 
     with pytest.raises(RuntimeError, match=f"^{NO_CONVERSATION}$"):
-        server.chat("q")
-    assert honcho.chats == []
+        server.search_messages("q")
+    assert honcho.searches == []
 
 
 def test_a_question_jev_refuses_still_says_which_folders(
@@ -1209,9 +1234,9 @@ def test_a_question_jev_refuses_still_says_which_folders(
     gate(_teammate(_folder("/work")))
 
     with pytest.raises(RuntimeError, match="^refused$"):
-        server.chat("집 주소 알려줘")
+        server.search_messages("집 주소", question="집 주소 알려줘")
 
-    assert honcho.chats == []
+    assert honcho.searches == []
     row = audited[0]
     assert (row["status"], row["error"]) == ("denied", "out of scope")
     assert row["arguments"]["folders"] == [_folder("/work")]
@@ -1228,11 +1253,11 @@ def test_the_folders_are_recorded_as_the_gate_sent_them(
     honcho.add("s3", "/srv/shared/inner")
     gate(_teammate(*opened))
 
-    server.chat("q")
+    server.search_messages("q")
 
     assert audited[0]["arguments"]["folders"] == opened
     assert audited[0]["arguments"]["sessions"] == 2
-    assert _allowlist(honcho.chats[0]) == ["s1", "s2"]
+    assert _allowlist(honcho.searches[0]) == ["s1", "s2"]
 
 
 # ------------------------------------------------------------- over real HTTP
@@ -1259,8 +1284,8 @@ def test_a_real_tool_call_reads_the_gate_headers(
     audited: list[dict[str, Any]],
     honcho: FakeHoncho,
 ) -> None:
-    """Every other test hands chat its headers; here they come over HTTP, through
-    FastMCP, into the thread the tool runs on."""
+    """Every other test hands the tools their headers; here they come over HTTP,
+    through FastMCP, into the thread the tool runs on."""
     monkeypatch.setattr(server, "SCOPE_FROM_GATE", True)
     honcho.add("s1", "/work/team/api")
     honcho.add("s2", "/work/private")
@@ -1269,26 +1294,25 @@ def test_a_real_tool_call_reads_the_gate_headers(
     )
     teammate = _teammate(_folder("/work/team", True))
 
-    def chat(arguments: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
-        params = {"name": "chat", "arguments": arguments}
+    def search(arguments: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+        params = {"name": "search_messages", "arguments": arguments}
         return _rpc(client, "tools/call", params, headers)
 
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:
         listed = _rpc(client, "tools/list", {}, teammate)
-        answered = chat({"query": "q"}, teammate)
-        ungated = chat({"query": "q"}, {})
-        named = chat({"query": "q", "project": "team"}, teammate)
-        filtered = chat({"query": "q", "filters": {"session_id": "s2"}}, teammate)
+        answered = search({"query": "q", "question": "배포 언제 했어?"}, teammate)
+        ungated = search({"query": "q"}, {})
+        filtered = search({"query": "q", "filters": {"session_id": "s2"}}, teammate)
 
-    (chat_tool,) = [tool for tool in listed["tools"] if tool["name"] == "chat"]
-    assert "project" not in chat_tool["inputSchema"]["properties"]
-    assert answered["structuredContent"] == honcho.answer
+    (tool,) = [tool for tool in listed["tools"] if tool["name"] == "search_messages"]
+    assert "filters" not in tool["inputSchema"]["properties"]
+    assert answered["structuredContent"]["messages"][0]["conversation_id"] == "s1"
     assert ungated["isError"]
     assert "x-honcho-scope-mode is missing" in ungated["content"][0]["text"]
-    assert named["isError"], "chat has no project argument to send"
-    assert filtered["isError"], "chat has no filters argument to send"
-    assert [_allowlist(call) for call in honcho.chats] == [["s1"]]
-    # The project and filters calls never reached the tool, so they left no row.
+    assert filtered["isError"], "search_messages has no filters argument to send"
+    assert [_allowlist(call) for call in honcho.searches] == [["s1"]]
+    # The filters call never reached the tool, so it left no row.
     assert [row["status"] for row in audited] == ["ok", "denied"]
     assert audited[0]["caller"] == "mate@example.com"
     assert audited[0]["arguments"]["sessions"] == 1
+    assert audited[0]["arguments"]["question"] == "배포 언제 했어?"

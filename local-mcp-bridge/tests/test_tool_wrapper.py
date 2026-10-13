@@ -44,13 +44,17 @@ ALL_TOOLS = frozenset(
         "inspect_session",
         "inspect_workspace",
         "list_conclusions",
+        "list_conversations",
         "list_peers",
         "list_sessions",
         "list_workspaces",
         "query_conclusions",
+        "read_conversation",
         "remove_peers_from_session",
         "schedule_dream",
         "search",
+        "search_conclusions",
+        "search_messages",
         "server_info",
         "set_metadata",
         "set_peer_card",
@@ -110,7 +114,7 @@ def no_upstream(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
 
 def test_every_tool_is_still_registered(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The wrapper must not swallow a tool. 31 names, plus nothing extra."""
+    """The wrapper must not swallow a tool. 35 names, plus nothing extra."""
     fresh = _reload_server(
         monkeypatch,
         {
@@ -130,7 +134,7 @@ def test_every_tool_is_still_registered(monkeypatch: pytest.MonkeyPatch) -> None
 def test_the_tool_count_is_pinned() -> None:
     """A tool added upstream has to be added here too, so nobody widens a bridge
     by accident when the denylist is the only thing standing in the way."""
-    assert len(ALL_TOOLS) == 31
+    assert len(ALL_TOOLS) == 35
 
 
 def test_an_allowlist_beats_the_config_file(monkeypatch: pytest.MonkeyPatch) -> None:

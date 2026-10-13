@@ -12,8 +12,11 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
+from urllib.parse import quote
 
 import httpx
 from fastmcp import FastMCP
@@ -119,11 +122,21 @@ ALLOWED_SOURCES_HEADER = "x-honcho-allowed-sources"
 
 #: What a teammate the owner turned off hears, whatever they call.
 TURNED_OFF = (
-    "The owner of this memory has turned your chat off for now. You can ask again "
+    "The owner of this memory has turned your access off for now. You can ask again "
     "once they turn it back on."
 )
 
-#: The most sessions one Honcho chat confines itself to
+#: What a teammate may call. Their own agent lists, searches and reads the
+#: conversations open to them, and writes the answer itself; each tool answers only
+#: from those conversations.
+TEAMMATE_TOOLS = (
+    "list_conversations",
+    "search_messages",
+    "read_conversation",
+    "search_conclusions",
+)
+
+#: The most sessions one Honcho request confines itself to
 #: (MAX_SESSION_ALLOWLIST_ENTRIES in Honcho's src/utils/filter.py). Folders holding
 #: more are refused here rather than sent to be refused by Honcho.
 MAX_SESSION_ALLOWLIST_ENTRIES = 1000
@@ -280,6 +293,20 @@ def _audit_workspace(arguments: dict[str, Any]) -> str | None:
         return arguments.get("workspace_id")
 
 
+def _judged_text(arguments: dict[str, Any]) -> str:
+    """What the Jev gate reads of a call: every piece of the caller's own words.
+
+    A teammate's tool takes their question beside the words searched for, and both
+    are judged, so neither can carry what the other would not.
+    """
+    texts: list[str] = []
+    for name in audit.QUERY_PARAMS:
+        text = audit.query_text_of({name: arguments.get(name)}, limit=None)
+        if text and text not in texts:
+            texts.append(text)
+    return "\n".join(texts)
+
+
 def _unjudged(*verdicts: jev_gate.Verdict) -> str | None:
     """Why a call let through went without a judgment, once per distinct reason."""
     reasons: list[str] = []
@@ -373,7 +400,7 @@ def register_tool(*, name: str):
                     raise RuntimeError(violation)
                 reached = _call_reach.set(reach)
 
-                query = audit.query_text_of(arguments, limit=None) or ""
+                query = _judged_text(arguments)
                 verdict = jev_gate.judge(
                     tool=name, query=query, caller=caller, workspace_id=workspace_id
                 )
@@ -771,11 +798,54 @@ def _folder_matcher(folders: list[dict[str, Any]]) -> Callable[[str | None], boo
 _clock = time.monotonic
 
 _session_lists_lock = threading.Lock()
-#: One session as listed: its id, the folder it started in, spelled by `_norm_path`,
-#: and for a session without a folder the app it came from (None for one with).
-ListedSession = tuple[str, str | None, str | None]
+
+
+def _text_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+class ListedSession(NamedTuple):
+    """One session as listed."""
+
+    id: str
+    #: The folder it started in, spelled by `_norm_path`, or None.
+    folder: str | None
+    #: For a session without a folder, the app it came from; None for one with.
+    source: str | None
+    #: The folder as the session recorded it, for showing.
+    cwd: str | None = None
+    #: The app it came from, folder or not (`_session_source`).
+    app: str | None = None
+    #: When its last turn was, as the collector recorded it, else when it last
+    #: brought messages in, else when Honcho made the session.
+    last_at: str | None = None
+    #: The project and git branch the collector recorded, if any.
+    project: str | None = None
+    branch: str | None = None
+
+
 #: Each workspace's sessions as last listed, and when: (listed_at, sessions).
 _session_lists: dict[str, tuple[float, tuple[ListedSession, ...]]] = {}
+
+
+def _listed_session(session_id: str, item: dict[str, Any]) -> ListedSession:
+    metadata = item.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    cwd = _text_or_none(metadata.get("cwd"))
+    folder = _norm_path(cwd) if cwd else None
+    app = _session_source(metadata)
+    return ListedSession(
+        id=session_id,
+        folder=folder,
+        source=None if folder is not None else app,
+        cwd=cwd,
+        app=app,
+        last_at=_text_or_none(metadata.get("last_turn_at"))
+        or _text_or_none(metadata.get("last_imported_at"))
+        or _text_or_none(item.get("created_at")),
+        project=_text_or_none(metadata.get("project_name")),
+        branch=_text_or_none(metadata.get("git_branch")),
+    )
 
 
 def _list_sessions(workspace_id: str) -> tuple[ListedSession, ...]:
@@ -787,7 +857,7 @@ def _list_sessions(workspace_id: str) -> tuple[ListedSession, ...]:
     read, and whatever `_honcho` raises for one that fails.
     """
     path = f"/v3/workspaces/{workspace_id}/sessions/list"
-    sessions: dict[str, tuple[str | None, str | None]] = {}
+    sessions: dict[str, ListedSession] = {}
     page = 1
     while True:
         listed = _honcho(
@@ -806,20 +876,12 @@ def _list_sessions(workspace_id: str) -> tuple[ListedSession, ...]:
             session_id = item.get("id") if isinstance(item, dict) else None
             if not isinstance(session_id, str) or not session_id:
                 raise ValueError("Honcho listed a session without an id")
-            metadata = item.get("metadata")
-            cwd = metadata.get("cwd") if isinstance(metadata, dict) else None
-            folder = _norm_path(cwd) if isinstance(cwd, str) and cwd else None
             # A session that moves across a page boundary while the pages are read
             # shows up twice; it is one session.
-            sessions.setdefault(
-                session_id,
-                (folder, None if folder is not None else _session_source(metadata)),
-            )
+            if session_id not in sessions:
+                sessions[session_id] = _listed_session(session_id, item)
         if page >= pages:
-            return tuple(
-                (session_id, folder, source)
-                for session_id, (folder, source) in sessions.items()
-            )
+            return tuple(sessions.values())
         page += 1
 
 
@@ -863,9 +925,9 @@ def _open_sessions(
     holds = _folder_matcher(folders)
     apps = set(sources)
     return [
-        session_id
-        for session_id, cwd, source in _workspace_sessions(workspace_id)
-        if holds(cwd) or (cwd is None and source in apps)
+        session.id
+        for session in _workspace_sessions(workspace_id)
+        if holds(session.folder) or (session.folder is None and session.source in apps)
     ]
 
 
@@ -873,16 +935,20 @@ def _open_sessions(
 #: nothing is open or what is open is empty, so it says nothing about the memory.
 NO_CONVERSATION = "No conversation in the folders open to you on this MCP server"
 
+#: The refusal of a conversation named by id that is not open to the caller. The same
+#: words whether it is closed or there is no such conversation.
+NOT_OPEN = "No conversation with that id is open to you on this MCP server"
+
 
 def _allowlist_refusal(sessions: list[str]) -> str | None:
-    """Why one Honcho chat cannot be confined to `sessions`, or None when it can."""
+    """Why one Honcho request cannot be confined to `sessions`, or None when it can."""
     if not sessions:
         return NO_CONVERSATION
     if len(sessions) > MAX_SESSION_ALLOWLIST_ENTRIES:
         return (
             "The folders open to you on this MCP server hold more than "
-            f"{MAX_SESSION_ALLOWLIST_ENTRIES} conversations, more than one answer "
-            "can draw on; the owner has to open fewer folders"
+            f"{MAX_SESSION_ALLOWLIST_ENTRIES} conversations, more than one search "
+            "can cover; the owner has to open fewer folders"
         )
     return None
 
@@ -906,12 +972,12 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
     """What one call may draw on, or None when it is not confined.
 
     Only a bridge behind a team server's gate confines calls, and only a teammate's:
-    they may `chat`, answered in one Honcho call from the sessions in the folders
-    the owner opened to them, and those without a folder from the apps they opened.
-    A teammate the owner turned off is refused whatever they call. A gate header
-    that does not read raises RuntimeError. Once the folders are known, a refusal
-    comes back in the reach instead, so the audit log can say which folders and how
-    many conversations it was about.
+    they may call the TEAMMATE_TOOLS, each held to the sessions in the folders the
+    owner opened to them and those without a folder from the apps they opened. A
+    teammate the owner turned off is refused whatever they call. A gate header that
+    does not read raises RuntimeError. Once the folders are known, a refusal comes
+    back in the reach instead, so the audit log can say which folders and how many
+    conversations it was about.
     """
     scope = _gate_scope() if SCOPE_FROM_GATE else None
     if scope is None:
@@ -919,26 +985,13 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
     folders, sources = scope.folders, tuple(scope.sources)
     if scope.off:
         return TeammateReach(folders, refusal=TURNED_OFF)
-    if tool != "chat":
-        return TeammateReach(
-            folders,
-            refusal=f"{tool} cannot be used with folders on this MCP server; use chat",
-            sources=sources,
-        )
-    # A teammate is answered from every conversation open to them, and the bridge
-    # names those sessions to Honcho itself.
-    if arguments.get("session_id"):
+    if tool not in TEAMMATE_TOOLS:
         return TeammateReach(
             folders,
             refusal=(
-                "session_id cannot be used with folders on this MCP server; omit it"
+                f"{tool} cannot be used with folders on this MCP server; use "
+                f"{', '.join(TEAMMATE_TOOLS)}"
             ),
-            sources=sources,
-        )
-    if arguments.get("filters"):
-        return TeammateReach(
-            folders,
-            refusal="filters cannot be used with folders on this MCP server; omit them",
             sources=sources,
         )
     # Listing the sessions is a Honcho call too, made only for a caller let in.
@@ -946,6 +999,7 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
     workspace_id = _resolve_defaults(workspace_id=arguments.get("workspace_id"))[
         "workspace_id"
     ]
+    asked = arguments.get("conversation_id")
     try:
         sessions = _open_sessions(workspace_id, folders, sources)
     except Exception as exc:  # noqa: BLE001 - refused and recorded, never a crash
@@ -960,9 +1014,10 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
             failure=f"listing the sessions failed: {type(exc).__name__}: {exc}",
             sources=sources,
         )
-    return TeammateReach(
-        folders, sessions, _allowlist_refusal(sessions), sources=sources
-    )
+    refusal = _allowlist_refusal(sessions)
+    if refusal is None and asked and asked not in sessions:
+        refusal = NOT_OPEN
+    return TeammateReach(folders, sessions, refusal, sources=sources)
 
 
 def _require_card_access(path: str, params: dict[str, Any] | None) -> None:
@@ -1277,35 +1332,17 @@ def chat(
 ) -> Any:
     """Ask Honcho what it knows about a peer using natural language.
 
-    On a team server a teammate is answered from the conversations in the folders
-    its owner opened to them, and from those without a folder of the apps opened
-    (ChatGPT imports), all of them in this one call, about the owner unless peer_id
-    or target_peer_id names another peer. session_id cannot be used there.
+    A teammate on a team server cannot call it: their own agent searches and reads
+    the conversations open to them instead (TEAMMATE_TOOLS).
     """
     reach = _call_reach.get()
     if reach is _UNRESOLVED:
-        # Called outside the wrapper, which works this out once per call.
-        reach = _teammate_reach(
-            "chat", {"session_id": session_id, "workspace_id": workspace_id}
-        )
+        # Called outside the wrapper, which refuses a teammate's chat.
+        reach = _teammate_reach("chat", {})
+    if reach is not None:
+        raise RuntimeError(reach.refusal or "chat cannot be used on this MCP server")
     defaults = _resolve_defaults(workspace_id=workspace_id)
     ws = defaults["workspace_id"]
-    if reach is not None:
-        if reach.refusal:
-            raise RuntimeError(reach.refusal)
-        # Honcho recalls only from the sessions listed. The peer in the path is the
-        # one asked about: the server's owner, whose work the folders hold, unless
-        # the caller names another peer.
-        subject = peer_id or defaults["user_name"] or defaults["assistant_name"]
-        body = _clean_none(
-            {
-                "query": query,
-                "target": target_peer_id,
-                "reasoning_level": reasoning_level,
-                "filters": {"session_id": {"in": reach.sessions}},
-            }
-        )
-        return _request("POST", f"/v3/workspaces/{ws}/peers/{subject}/chat", body=body)
     observer = peer_id or defaults["assistant_name"]
     body = _clean_none(
         {
@@ -1722,6 +1759,388 @@ def get_queue_status(
     return _request("GET", f"/v3/workspaces/{ws}/queue/status", params=params)
 
 
+# ------------------------------------------------ conversations, for a teammate
+#
+# What a teammate's own agent reads to answer from the conversations open to them,
+# the way the owner's agent reads its own memory: the list of conversations, a
+# search over their messages, one conversation in order, and the facts Honcho drew
+# from them. On a team server each holds a teammate to the sessions open to them;
+# the owner, and a bridge outside a team, reach every session. Times are Honcho's,
+# in UTC: the asking side shows them in its own time zone.
+
+#: The longest message a search shows, and a read; the rest is cut and counted.
+SEARCH_MESSAGE_CHARS = 1500
+READ_MESSAGE_CHARS = 3000
+#: How much of a conversation's first message its row in the list shows.
+OPENING_CHARS = 200
+#: The most conversations one list shows, messages one search finds, messages one
+#: read shows, and facts one search of them finds.
+MAX_LISTED_CONVERSATIONS = 100
+MAX_FOUND_MESSAGES = 30
+MAX_READ_MESSAGES = 50
+MAX_FOUND_CONCLUSIONS = 30
+#: Conversations whose start is looked up at once.
+HEAD_WORKERS = 8
+#: Conversation starts kept at most; all are dropped when there are more.
+MAX_KEPT_HEADS = 20_000
+
+_EPOCH = datetime.min.replace(tzinfo=UTC)
+_DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _clip(text: Any, size: int) -> str:
+    flat = "" if text is None else str(text)
+    if len(flat) <= size:
+        return flat
+    return f"{flat[:size]} …[{len(flat) - size} more characters]"
+
+
+def _moment(value: Any) -> datetime | None:
+    """A time as Honcho or the collector wrote it, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def _bound(value: str | None, name: str, *, end: bool = False) -> datetime | None:
+    """A time the caller gave, or None. A bare date is that whole day in UTC."""
+    if value is None or not str(value).strip():
+        return None
+    text = str(value).strip()
+    moment = _moment(text)
+    if moment is None:
+        raise RuntimeError(
+            f"{name} takes a date or a time, such as 2026-10-12 or "
+            "2026-10-12T09:00:00+09:00"
+        )
+    if end and _DATE_ONLY.fullmatch(text):
+        moment += timedelta(days=1, microseconds=-1)
+    return moment
+
+
+def _reach_of(tool: str) -> TeammateReach | None:
+    """The reach the wrapper worked out for this call, or the same worked out here."""
+    reach = _call_reach.get()
+    if reach is _UNRESOLVED:
+        reach = _teammate_reach(tool, {})
+    if reach is not None and reach.refusal:
+        raise RuntimeError(reach.refusal)
+    return reach
+
+
+def _open_conversation(reach: TeammateReach | None, conversation_id: str) -> None:
+    if reach is not None and conversation_id not in (reach.sessions or ()):
+        raise RuntimeError(NOT_OPEN)
+
+
+def _session_scope(reach: TeammateReach | None) -> Any:
+    """The `session_id` filter that holds a teammate to their sessions, or None."""
+    return None if reach is None else {"in": list(reach.sessions or ())}
+
+
+def _items(answer: Any) -> list[dict[str, Any]]:
+    """The items of a Honcho answer, as a list or a page of one."""
+    items = answer.get("items") if isinstance(answer, dict) else answer
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _said(item: dict[str, Any], size: int) -> dict[str, Any]:
+    """One message as a teammate reads it: when, who, and what, cut to `size`."""
+    return {
+        "at": item.get("created_at"),
+        "speaker": item.get("peer_id"),
+        "content": _clip(item.get("content"), size),
+    }
+
+
+_heads_lock = threading.Lock()
+#: Each conversation's start as last looked up, by (workspace, session):
+#: (the session's last_at then, the start). A session that brings in more
+#: messages changes its last_at, and its start is looked up again.
+_heads: dict[tuple[str, str], tuple[str | None, dict[str, Any]]] = {}
+
+
+def _conversation_head(
+    workspace_id: str, session: ListedSession, owner: str
+) -> dict[str, Any]:
+    """When a conversation started, how many messages it has, and how it opened."""
+    key = (workspace_id, session.id)
+    with _heads_lock:
+        kept = _heads.get(key)
+    if kept is not None and kept[0] == session.last_at:
+        return kept[1]
+    try:
+        page = _honcho(
+            "POST",
+            f"/v3/workspaces/{workspace_id}/sessions/{quote(session.id, safe='')}"
+            "/messages/list",
+            body={},
+            params={"page": 1, "size": 5},
+        )
+    except Exception as exc:  # noqa: BLE001 - one unreadable conversation is shown bare
+        logger.warning("conversation start not read: %s", type(exc).__name__)
+        return {"started_at": None, "messages": None, "opening": ""}
+    items = _items(page)
+    opening = next((item for item in items if item.get("peer_id") == owner), None)
+    opening = opening or (items[0] if items else None)
+    total = page.get("total") if isinstance(page, dict) else None
+    head = {
+        "started_at": items[0].get("created_at") if items else None,
+        "messages": total if isinstance(total, int) else None,
+        "opening": _clip(" ".join(str(opening.get("content") or "").split()), OPENING_CHARS)
+        if opening
+        else "",
+    }
+    with _heads_lock:
+        if len(_heads) >= MAX_KEPT_HEADS:
+            _heads.clear()
+        _heads[key] = (session.last_at, head)
+    return head
+
+
+def _heads_of(
+    workspace_id: str, sessions: list[ListedSession], owner: str
+) -> dict[str, dict[str, Any]]:
+    if not sessions:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(HEAD_WORKERS, len(sessions))) as pool:
+        heads = list(
+            pool.map(lambda item: _conversation_head(workspace_id, item, owner), sessions)
+        )
+    return {session.id: head for session, head in zip(sessions, heads, strict=True)}
+
+
+@register_tool(name="list_conversations")
+def list_conversations(
+    *,
+    since: str | None = None,
+    until: str | None = None,
+    contains: str | None = None,
+    limit: int = 30,
+    question: str | None = None,
+) -> dict[str, Any]:
+    """The conversations you may read, the most recently active first.
+
+    Each comes with its id, when it started and last ran, how many messages it has,
+    its folder, app, project and git branch, and how it opened. `since` keeps those
+    active on or after a time and `until` those started on or before one (a date or
+    an ISO time; a bare date is a whole day in UTC); `contains` keeps those whose
+    folder, project, branch or opening holds every word given. `question` is what
+    your user asked, in their own words: the memory's owner sees it in their log.
+    """
+    reach = _reach_of("list_conversations")
+    _require_auth()
+    defaults = _resolve_defaults()
+    workspace_id, owner = defaults["workspace_id"], defaults["user_name"]
+    start = _bound(since, "since")
+    end = _bound(until, "until", end=True)
+    words = [word.casefold() for word in (contains or "").split()]
+    sessions = list(_workspace_sessions(workspace_id))
+    if reach is not None:
+        allowed = set(reach.sessions or ())
+        sessions = [session for session in sessions if session.id in allowed]
+    if start is not None:
+        sessions = [
+            session
+            for session in sessions
+            if (_moment(session.last_at) or start) >= start
+        ]
+    sessions.sort(key=lambda session: _moment(session.last_at) or _EPOCH, reverse=True)
+    shown_size = int(_clamp(limit, 1, MAX_LISTED_CONVERSATIONS))
+    if end is not None or words:
+        # Both need each conversation's start: looked up for every one left, and
+        # kept until the conversation brings in more messages.
+        heads = _heads_of(workspace_id, sessions, owner)
+
+        def kept(session: ListedSession) -> bool:
+            head = heads[session.id]
+            started = _moment(head["started_at"]) or _moment(session.last_at)
+            if end is not None and started is not None and started > end:
+                return False
+            said = " ".join(
+                [session.cwd or "", session.project or "", session.branch or "", head["opening"]]
+            ).casefold()
+            return all(word in said for word in words)
+
+        sessions = [session for session in sessions if kept(session)]
+        shown = sessions[:shown_size]
+    else:
+        shown = sessions[:shown_size]
+        heads = _heads_of(workspace_id, shown, owner)
+    return {
+        "conversations": [
+            {
+                "id": session.id,
+                "started_at": heads[session.id]["started_at"],
+                "last_at": session.last_at,
+                "messages": heads[session.id]["messages"],
+                "folder": session.cwd,
+                "app": session.app,
+                "project": session.project,
+                "branch": session.branch,
+                "opening": heads[session.id]["opening"],
+            }
+            for session in shown
+        ],
+        "total": len(sessions),
+        "shown": len(shown),
+    }
+
+
+@register_tool(name="search_messages")
+def search_messages(
+    query: str,
+    *,
+    limit: int = 10,
+    since: str | None = None,
+    until: str | None = None,
+    conversation_id: str | None = None,
+    question: str | None = None,
+) -> dict[str, Any]:
+    """Search the messages of the conversations you may read, by meaning.
+
+    Both the user's messages and their agents' are searched; each match comes with
+    its conversation, when it was said and by whom. `since` and `until` hold the
+    search to a stretch of time (a date or an ISO time; a bare date is a whole day
+    in UTC), and `conversation_id` to one conversation. `question` is what your user
+    asked, in their own words: the memory's owner sees it in their log.
+    """
+    reach = _reach_of("search_messages")
+    if conversation_id:
+        _open_conversation(reach, conversation_id)
+    workspace_id = _resolve_defaults()["workspace_id"]
+    filters: dict[str, Any] = {}
+    scope = conversation_id or _session_scope(reach)
+    if scope is not None:
+        filters["session_id"] = scope
+    times = {
+        name: moment.isoformat()
+        for name, moment in (
+            ("gte", _bound(since, "since")),
+            ("lte", _bound(until, "until", end=True)),
+        )
+        if moment is not None
+    }
+    if times:
+        filters["created_at"] = times
+    found = _request(
+        "POST",
+        f"/v3/workspaces/{workspace_id}/search",
+        body=_clean_none(
+            {
+                "query": query,
+                "limit": int(_clamp(limit, 1, MAX_FOUND_MESSAGES)),
+                "filters": filters or None,
+            }
+        ),
+    )
+    return {
+        "messages": [
+            {
+                "conversation_id": item.get("session_id"),
+                **_said(item, SEARCH_MESSAGE_CHARS),
+            }
+            for item in _items(found)
+        ]
+    }
+
+
+@register_tool(name="read_conversation")
+def read_conversation(
+    conversation_id: str,
+    *,
+    page: int = 1,
+    size: int = 20,
+    newest_first: bool = False,
+    question: str | None = None,
+) -> dict[str, Any]:
+    """Read one conversation you may read, in order, a page at a time.
+
+    Page 1 is its start, or with `newest_first` its latest messages. `question` is
+    what your user asked, in their own words: the memory's owner sees it in their
+    log.
+    """
+    reach = _reach_of("read_conversation")
+    _open_conversation(reach, conversation_id)
+    workspace_id = _resolve_defaults()["workspace_id"]
+    listed = _request(
+        "POST",
+        f"/v3/workspaces/{workspace_id}/sessions/{quote(conversation_id, safe='')}"
+        "/messages/list",
+        body={},
+        params={
+            "page": int(_clamp(page, 1, 1_000_000)),
+            "size": int(_clamp(size, 1, MAX_READ_MESSAGES)),
+            "reverse": str(bool(newest_first)).lower(),
+        },
+    )
+    session = next(
+        (item for item in _workspace_sessions(workspace_id) if item.id == conversation_id),
+        None,
+    )
+    page_of = listed if isinstance(listed, dict) else {}
+    return {
+        "id": conversation_id,
+        "folder": session.cwd if session else None,
+        "app": session.app if session else None,
+        "total": page_of.get("total"),
+        "page": page_of.get("page"),
+        "pages": page_of.get("pages"),
+        "newest_first": bool(newest_first),
+        "messages": [_said(item, READ_MESSAGE_CHARS) for item in _items(listed)],
+    }
+
+
+@register_tool(name="search_conclusions")
+def search_conclusions(
+    query: str,
+    *,
+    limit: int = 10,
+    question: str | None = None,
+) -> dict[str, Any]:
+    """Search the facts Honcho drew about the memory's owner from the conversations
+    you may read, by meaning: one sentence each, with the conversation it came from
+    and when that conversation last ran.
+
+    A teammate gets only the facts drawn from one conversation at a time: those that
+    combine several could carry what is not open to them. `question` is what your
+    user asked, in their own words: the memory's owner sees it in their log.
+    """
+    reach = _reach_of("search_conclusions")
+    defaults = _resolve_defaults()
+    workspace_id, owner = defaults["workspace_id"], defaults["user_name"]
+    filters: dict[str, Any] = {"observer": owner, "observed": owner}
+    if reach is not None:
+        filters["level"] = "explicit"
+        filters["session_id"] = _session_scope(reach)
+    found = _request(
+        "POST",
+        f"/v3/workspaces/{workspace_id}/conclusions/query",
+        body={
+            "query": query,
+            "top_k": int(_clamp(limit, 1, MAX_FOUND_CONCLUSIONS)),
+            "filters": filters,
+        },
+    )
+    last_ran = {
+        session.id: session.last_at for session in _workspace_sessions(workspace_id)
+    }
+    return {
+        "conclusions": [
+            {
+                "conversation_id": item.get("session_id"),
+                "conversation_last_at": last_ran.get(item.get("session_id")),
+                "content": item.get("content"),
+            }
+            for item in _items(found)
+        ]
+    }
+
+
 # ------------------------------------------------------------- the dashboard's routes
 #
 # Two routes for the owner's dashboard, beside /mcp and never under it, so the
@@ -1750,6 +2169,20 @@ def _verdict_view(verdict: jev_gate.Verdict) -> dict[str, Any]:
     }
 
 
+def _found_text(found: list[dict[str, Any]]) -> str:
+    """A trial's found messages as the owner reads them: who and when, then what."""
+    return "\n\n".join(
+        f"{item.get('speaker') or '?'} · {item.get('at') or '?'}\n{item.get('content') or ''}"
+        for item in found
+    )
+
+
+#: The tool a trial goes through: what a teammate's question first runs.
+TRIAL_TOOL = "search_messages"
+#: The messages a trial's search finds, as a teammate's search finds by default.
+TRIAL_FOUND = 10
+
+
 def guard_trial(
     query: str,
     *,
@@ -1759,22 +2192,23 @@ def guard_trial(
 ) -> dict[str, Any]:
     """What a teammate asking `query` would get, step by step, for the owner to try.
 
-    The query is judged as a teammate's `chat` is. If it may go on, the answer is
-    `answer` as the owner wrote it, else Honcho's own from the conversations in
-    `folders` and those without a folder of the apps in `sources`, confined as a
-    teammate's chat is, and it is judged as a teammate's answer is. `outcome` is
-    "refused" (the query), "withheld" (the answer), "passed", or "no_answer" when
-    Honcho could not answer, or what is open holds no conversation or more than one
-    chat takes; with neither an answer nor folders or apps only the query is judged.
-    Nothing is recorded: a trial is not a teammate's call.
+    The query is judged as a teammate's question is. If it may go on, what they
+    would read is `answer` as the owner wrote it, else the messages a teammate's
+    search for it finds in the conversations in `folders` and those without a
+    folder of the apps in `sources` (`found`), and that is judged as what a
+    teammate reads is. `outcome` is "refused" (the query), "withheld" (what they
+    would read), "passed", or "no_answer" when the search could not run, or what is
+    open holds no conversation or more than one search covers; with neither an
+    answer nor folders or apps only the query is judged. Nothing is recorded: a
+    trial is not a teammate's call.
     """
     defaults = _resolve_defaults()
     workspace = defaults["workspace_id"]
     verdict = jev_gate.judge(
-        tool="chat", query=query, caller=TRIAL_CALLER, workspace_id=workspace
+        tool=TRIAL_TOOL, query=query, caller=TRIAL_CALLER, workspace_id=workspace
     )
     trial: dict[str, Any] = {
-        "gate": jev_gate.enabled_for("chat"),
+        "gate": jev_gate.enabled_for(TRIAL_TOOL),
         "message": jev_gate.MESSAGE,
         "query": _verdict_view(verdict),
         "answer": None,
@@ -1783,36 +2217,42 @@ def guard_trial(
     if not verdict.allowed:
         return {**trial, "outcome": "refused"}
     result: Any
+    found: list[dict[str, Any]] | None = None
     if answer is not None:
         result = answer
     elif folders is not None or sources is not None:
-        # Honcho is asked as a teammate's chat asks it: about the owner, from the
-        # sessions open, refused where a teammate's chat is refused.
-        subject = defaults["user_name"] or defaults["assistant_name"]
+        # Searched as a teammate's search_messages searches: the sessions open,
+        # refused where a teammate's search is refused.
         try:
             sessions = _open_sessions(workspace, folders or [], sources or [])
             refusal = _allowlist_refusal(sessions)
             if refusal is not None:
                 return {**trial, "outcome": "no_answer", "error": refusal}
-            result = _honcho(
+            searched = _honcho(
                 "POST",
-                f"/v3/workspaces/{workspace}/peers/{subject}/chat",
+                f"/v3/workspaces/{workspace}/search",
                 body={
                     "query": query,
-                    "reasoning_level": "low",
+                    "limit": TRIAL_FOUND,
                     "filters": {"session_id": {"in": sessions}},
                 },
             )
         except (RuntimeError, httpx.HTTPError, TypeError, ValueError) as exc:
             return {**trial, "outcome": "no_answer", "error": str(exc) or type(exc).__name__}
+        found = [
+            {"conversation_id": item.get("session_id"), **_said(item, SEARCH_MESSAGE_CHARS)}
+            for item in _items(searched)
+        ]
+        result = {"messages": found}
     else:
         return {**trial, "outcome": "passed"}
     checked = jev_gate.judge_answer(
-        tool="chat", query=query, result=result, caller=TRIAL_CALLER, workspace_id=workspace
+        tool=TRIAL_TOOL, query=query, result=result, caller=TRIAL_CALLER, workspace_id=workspace
     )
     return {
         **trial,
-        "answer": jev_gate.text_of(result),
+        "answer": jev_gate.text_of(result) if found is None else _found_text(found),
+        **({"found": found} if found is not None else {}),
         "answer_check": _verdict_view(checked),
         "outcome": "passed" if checked.allowed else "withheld",
     }

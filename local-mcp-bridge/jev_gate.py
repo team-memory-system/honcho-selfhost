@@ -1,10 +1,13 @@
 """Jev judgment gate for the Honcho MCP bridge.
 
-Teammates reach this memory through one tool (`chat`). The gate reads the query
+Teammates reach this memory through a few tools of their own: they list, search and
+read the conversations open to them, and their own agent writes the answer. The
+gate reads each call's words (the teammate's question and what they search for)
 before it is forwarded and refuses the ones that are not asking about shared work.
-Then it reads the answer before it leaves, because a harmless question can still
-draw private matters out of the memory: an answer that discloses them is withheld
-behind the same refusal, so the refusal says nothing about what the memory holds.
+Then it reads what the call found before it leaves, because a harmless question can
+still draw private matters out of the memory: a result that discloses them is
+withheld behind the same refusal, so the refusal says nothing about what the memory
+holds.
 
 It asks one of two backends:
 
@@ -72,10 +75,13 @@ GUARD_URL = os.environ.get("HONCHO_JEV_GUARD_URL", "").strip() or None
 #: This member's bearer token for the hub. Never logged, never in a reason.
 GUARD_TOKEN = os.environ.get("HONCHO_JEV_GUARD_TOKEN", "").strip() or None
 
+#: Tools the gate judges by default: the ones a teammate calls.
+TEAMMATE_TOOLS = "list_conversations,search_messages,read_conversation,search_conclusions"
+
 #: Tools the gate judges. Everything else passes untouched.
 GATED_TOOLS = frozenset(
     name.strip()
-    for name in os.environ.get("HONCHO_JEV_TOOLS", "chat").split(",")
+    for name in os.environ.get("HONCHO_JEV_TOOLS", TEAMMATE_TOOLS).split(",")
     if name.strip()
 )
 

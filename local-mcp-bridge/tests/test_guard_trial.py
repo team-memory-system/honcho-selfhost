@@ -1,10 +1,10 @@
 """The owner tries the Jev gate from the dashboard: POST /guard-trial.
 
-A trial goes the way a teammate's `chat` goes, the query judged, then the answer
-judged, written by the owner or Honcho's own from the conversations in the folders
-given, and says what the teammate would have got. It is a dashboard route beside
-/mcp: off without HONCHO_AUDIT_READ, only with the bridge's bearer token, and never
-recorded.
+A trial goes the way a teammate's search goes, the query judged, then what they
+would read judged, written by the owner or found by a search of the conversations in
+the folders given, and says what the teammate would have got. It is a dashboard
+route beside /mcp: off without HONCHO_AUDIT_READ, only with the bridge's bearer
+token, and never recorded.
 """
 
 from __future__ import annotations
@@ -21,6 +21,27 @@ import server
 
 FOLDERS = [{"path": "/Users/me/dev/flypiano", "subfolders": True}]
 QUERY = "flypiano 요즘 어떻게 돼 가?"
+
+
+def _said(content: str, session: str = "s-flypiano") -> dict[str, Any]:
+    """One message as Honcho's search finds it."""
+    return {
+        "id": "m1",
+        "session_id": session,
+        "peer_id": "me",
+        "content": content,
+        "created_at": "2026-10-09T01:00:00Z",
+    }
+
+
+def _found(content: str, session: str = "s-flypiano") -> dict[str, Any]:
+    """The same message as a teammate's search_messages shows it."""
+    return {
+        "conversation_id": session,
+        "at": "2026-10-09T01:00:00Z",
+        "speaker": "me",
+        "content": content,
+    }
 
 #: The sessions Honcho holds, by id, with the folder each started in (and the app,
 #: for one without a folder).
@@ -67,7 +88,7 @@ def _honcho(
     sessions: Any = SESSIONS,
     listing: Exception | None = None,
 ) -> list[dict[str, Any]]:
-    """Honcho listing `sessions` (or raising `listing`) and answering every chat
+    """Honcho listing `sessions` (or raising `listing`) and answering every search
     with `answer` (raised when an exception)."""
     calls: list[dict[str, Any]] = []
 
@@ -97,11 +118,11 @@ def _honcho(
     return calls
 
 
-def test_a_trial_judges_the_query_then_honchos_answer_from_the_folders(
+def test_a_trial_judges_the_query_then_what_a_search_finds_in_the_folders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     asked = _jev(monkeypatch)
-    calls = _honcho(monkeypatch, {"content": "학습 실험 두 개가 진행 중입니다."})
+    calls = _honcho(monkeypatch, [_said("학습 실험 두 개가 진행 중입니다.")])
 
     trial = server.guard_trial(QUERY, folders=FOLDERS)
 
@@ -109,7 +130,8 @@ def test_a_trial_judges_the_query_then_honchos_answer_from_the_folders(
         "gate": True,
         "message": jev_gate.MESSAGE,
         "query": {"allowed": True, "score": 0.03, "reason": "in scope", "unjudged": False},
-        "answer": "학습 실험 두 개가 진행 중입니다.",
+        "answer": "me · 2026-10-09T01:00:00Z\n학습 실험 두 개가 진행 중입니다.",
+        "found": [_found("학습 실험 두 개가 진행 중입니다.")],
         "answer_check": {
             "allowed": True,
             "score": 0.02,
@@ -118,8 +140,8 @@ def test_a_trial_judges_the_query_then_honchos_answer_from_the_folders(
         },
         "outcome": "passed",
     }
-    # Honcho is asked as a teammate's chat asks it: about the owner, from the
-    # sessions in the folders, in one call.
+    # Honcho is searched as a teammate's search_messages searches it: the sessions
+    # in the folders, in one call.
     workspace = server.DEFAULT_WORKSPACE_ID
     assert calls == [
         {
@@ -130,10 +152,10 @@ def test_a_trial_judges_the_query_then_honchos_answer_from_the_folders(
         },
         {
             "method": "POST",
-            "path": f"/v3/workspaces/{workspace}/peers/{server.DEFAULT_USER_NAME}/chat",
+            "path": f"/v3/workspaces/{workspace}/search",
             "body": {
                 "query": QUERY,
-                "reasoning_level": "low",
+                "limit": 10,
                 "filters": {"session_id": {"in": ["s-flypiano", "s-api"]}},
             },
         },
@@ -141,12 +163,12 @@ def test_a_trial_judges_the_query_then_honchos_answer_from_the_folders(
     assert [item["kind"] for item in asked] == ["query", "answer"]
     assert asked[0] == {
         "kind": "query",
-        "tool": "chat",
+        "tool": "search_messages",
         "query": QUERY,
         "caller": server.TRIAL_CALLER,
         "workspace_id": workspace,
     }
-    assert asked[1]["result"] == {"content": "학습 실험 두 개가 진행 중입니다."}
+    assert asked[1]["result"] == {"messages": [_found("학습 실험 두 개가 진행 중입니다.")]}
     assert asked[1]["caller"] == server.TRIAL_CALLER
 
 
@@ -175,12 +197,12 @@ def test_a_withheld_answer_is_shown_to_the_owner_with_its_verdict(
         monkeypatch,
         answer=jev_gate.Verdict(allowed=False, score=0.96, reason=jev_gate.ANSWER_REFUSED),
     )
-    _honcho(monkeypatch, {"content": "그는 요즘 병원 진료를 다닙니다."})
+    _honcho(monkeypatch, [_said("그는 요즘 병원 진료를 다닙니다.")])
 
     trial = server.guard_trial(QUERY, folders=FOLDERS)
 
     assert trial["outcome"] == "withheld"
-    assert trial["answer"] == "그는 요즘 병원 진료를 다닙니다."
+    assert trial["found"] == [_found("그는 요즘 병원 진료를 다닙니다.")]
     assert trial["answer_check"] == {
         "allowed": False,
         "score": 0.96,
@@ -214,7 +236,7 @@ def test_an_answer_left_unjudged_says_so(monkeypatch: pytest.MonkeyPatch) -> Non
     assert trial["answer_check"]["reason"] == jev_gate.ANSWER_SKIPPED
 
 
-@pytest.mark.parametrize("where", ["listing", "chat"])
+@pytest.mark.parametrize("where", ["listing", "search"])
 @pytest.mark.parametrize(
     "failure",
     [RuntimeError("Honcho API 503 for /v3/...: down"), server.httpx.ConnectError("refused")],
@@ -255,11 +277,11 @@ def test_folders_with_no_conversation_are_no_answer(
     assert trial["outcome"] == "no_answer"
     assert trial["error"] == server.NO_CONVERSATION
     assert trial["answer"] is None
-    assert not [call for call in calls if call["path"].endswith("/chat")]
+    assert not [call for call in calls if call["path"].endswith("/search")]
     assert [item["kind"] for item in asked] == ["query"]
 
 
-def test_folders_holding_more_than_one_chat_takes_are_no_answer(
+def test_folders_holding_more_than_one_search_covers_are_no_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _jev(monkeypatch)
@@ -270,7 +292,7 @@ def test_folders_holding_more_than_one_chat_takes_are_no_answer(
 
     assert trial["outcome"] == "no_answer"
     assert trial["error"].endswith("the owner has to open fewer folders")
-    assert not [call for call in calls if call["path"].endswith("/chat")]
+    assert not [call for call in calls if call["path"].endswith("/search")]
 
 
 def test_with_neither_answer_nor_folders_only_the_query_is_judged(
@@ -291,17 +313,17 @@ def test_with_neither_answer_nor_folders_only_the_query_is_judged(
 def test_a_trial_opens_the_apps_a_teammate_has_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ChatGPT conversations have no folder; a trial opens them as a teammate's chat does."""
+    """ChatGPT conversations have no folder; a trial opens them as a teammate's search does."""
     _jev(monkeypatch)
     sessions = (*SESSIONS, ("g-1", None, "chatgpt"), ("c-1", None, "claude"))
-    calls = _honcho(monkeypatch, {"content": "학습 실험"}, sessions=sessions)
+    calls = _honcho(monkeypatch, [_said("학습 실험")], sessions=sessions)
 
     trial = server.guard_trial(QUERY, folders=FOLDERS, sources=["chatgpt"])
     alone = server.guard_trial(QUERY, sources=["chatgpt"])
 
     assert (trial["outcome"], alone["outcome"]) == ("passed", "passed")
-    chats = [call for call in calls if call["path"].endswith("/chat")]
-    assert [chat["body"]["filters"]["session_id"]["in"] for chat in chats] == [
+    searches = [call for call in calls if call["path"].endswith("/search")]
+    assert [search["body"]["filters"]["session_id"]["in"] for search in searches] == [
         ["s-flypiano", "s-api", "g-1"],
         ["g-1"],
     ]
@@ -385,7 +407,7 @@ def test_the_route_is_the_dashboards_and_takes_the_bridge_token(
 ) -> None:
     client = _route(monkeypatch, read=True)
     _jev(monkeypatch)
-    calls = _honcho(monkeypatch, {"content": "학습 실험"})
+    calls = _honcho(monkeypatch, [_said("학습 실험")])
     recorded: list[dict[str, Any]] = []
     monkeypatch.setattr(audit, "record", lambda **row: recorded.append(row))
     body = {"query": QUERY, "folders": FOLDERS}
@@ -406,8 +428,8 @@ def test_the_route_is_the_dashboards_and_takes_the_bridge_token(
 
     assert tried.status_code == 200
     assert tried.json()["outcome"] == "passed"
-    assert tried.json()["answer"] == "학습 실험"
-    assert [call["path"].rsplit("/", 1)[-1] for call in calls] == ["list", "chat"]
+    assert tried.json()["found"] == [_found("학습 실험")]
+    assert [call["path"].rsplit("/", 1)[-1] for call in calls] == ["list", "search"]
     assert recorded == [], "a trial is not a teammate's call"
 
 
