@@ -1,0 +1,174 @@
+diff --git a/src/deriver/queue_manager.py b/src/deriver/queue_manager.py
+index 326bd1d..817c33a 100644
+--- a/src/deriver/queue_manager.py
++++ b/src/deriver/queue_manager.py
+@@ -69,6 +69,15 @@ MAX_RETRYABLE_ATTEMPTS = 3
+ RETRY_BACKOFF_SECONDS = 1.0
+ 
+ 
++def claim_refresh_seconds() -> float:
++    """How often a worker refreshes its claim while an item is still running.
++
++    Five refreshes fit in the stale timeout, so one slow database write does not
++    let the claim go stale.
++    """
++    return settings.DERIVER.STALE_SESSION_TIMEOUT_MINUTES * 60 / 5
++
++
+ class WorkerOwnership(NamedTuple):
+     """Represents the instance of a work unit that a worker is processing."""
+ 
+@@ -640,6 +649,12 @@ class QueueManager:
+         work_unit = parse_work_unit_key(work_unit_key)
+         async with self.semaphore:
+             queue_item_count = 0
++            claimed = self.worker_ownership.get(worker_id)
++            refresher = (
++                asyncio.create_task(self._refresh_claim(claimed.aqs_id, work_unit_key))
++                if claimed and claimed.work_unit_key == work_unit_key
++                else None
++            )
+             try:
+                 while not self.shutdown_event.is_set():
+                     # Get worker ownership info for verification
+@@ -760,6 +775,10 @@ class QueueManager:
+                         break
+ 
+             finally:
++                if refresher:
++                    refresher.cancel()
++                    with contextlib.suppress(asyncio.CancelledError):
++                        await refresher
+                 # Remove work unit from active_queue_sessions when done
+                 ownership: WorkerOwnership | None = self.worker_ownership.get(worker_id)
+                 if ownership and ownership.work_unit_key == work_unit_key:
+@@ -1227,6 +1246,40 @@ class QueueManager:
+             )
+             await db.commit()
+ 
++    async def _refresh_claim(self, aqs_id: str, work_unit_key: str) -> None:
++        """Keep this worker's claim fresh until the work unit is done.
++
++        A claim is otherwise refreshed only when an item finishes. One item that
++        runs longer than STALE_SESSION_TIMEOUT_MINUTES, such as a long dream,
++        then looked abandoned: stale cleanup deleted the claim and another worker
++        ran the same item again while this one was still on it.
++        """
++        while True:
++            await asyncio.sleep(claim_refresh_seconds())
++            try:
++                async with tracked_db("refresh_work_unit_claim") as db:
++                    result = cast(
++                        CursorResult[Any],
++                        await db.execute(
++                            update(models.ActiveQueueSession)
++                            .where(models.ActiveQueueSession.id == aqs_id)
++                            .values(last_updated=func.now())
++                        ),
++                    )
++                    await db.commit()
++            except Exception:
++                logger.exception(
++                    "Failed to refresh the claim on work unit %s", work_unit_key
++                )
++                continue
++            if result.rowcount == 0:
++                logger.warning(
++                    "Claim %s on work unit %s is gone; another worker may take it",
++                    aqs_id,
++                    work_unit_key,
++                )
++                return
++
+     async def _cleanup_work_unit(
+         self,
+         aqs_id: str,
+diff --git a/tests/deriver/test_queue_processing.py b/tests/deriver/test_queue_processing.py
+index 657c7cf..bcd5de1 100644
+--- a/tests/deriver/test_queue_processing.py
++++ b/tests/deriver/test_queue_processing.py
+@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
+ import pytest
+ from nanoid import generate as generate_nanoid
+ from pydantic import ValidationError
+-from sqlalchemy import select
++from sqlalchemy import select, update
+ from sqlalchemy.exc import OperationalError
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -299,6 +299,75 @@ class TestQueueProcessing:
+         ).scalar_one_or_none()
+         assert remaining is None
+ 
++    async def test_claim_stays_fresh_while_one_item_runs_long(
++        self,
++        db_session: AsyncSession,
++        sample_session_with_peers: tuple[models.Session, list[models.Peer]],
++        create_queue_payload: Callable[..., Any],
++        monkeypatch: pytest.MonkeyPatch,
++    ) -> None:
++        """An item running past the stale timeout keeps its claim, so no other worker runs it again."""
++        monkeypatch.setattr(
++            "src.deriver.queue_manager.claim_refresh_seconds", lambda: 0.05
++        )
++        work_unit_key, _queue_items = await self._add_representation_work_unit(
++            db_session=db_session,
++            sample_session_with_peers=sample_session_with_peers,
++            create_queue_payload=create_queue_payload,
++            token_counts=[10],
++        )
++        qm = QueueManager()
++        claimed = await qm.claim_work_units(db_session, [work_unit_key])
++        aqs_id = claimed[work_unit_key]
++        qm.worker_ownership["slow_worker"] = WorkerOwnership(
++            work_unit_key=work_unit_key, aqs_id=aqs_id
++        )
++        # The claim was last refreshed longer ago than the stale timeout.
++        long_ago = datetime.now(UTC) - timedelta(
++            minutes=settings.DERIVER.STALE_SESSION_TIMEOUT_MINUTES * 2
++        )
++        await db_session.execute(
++            update(models.ActiveQueueSession)
++            .where(models.ActiveQueueSession.id == aqs_id)
++            .values(last_updated=long_ago)
++        )
++        await db_session.commit()
++
++        seen: list[datetime | None] = []
++
++        async def slow_batch(*_args: Any, **_kwargs: Any) -> None:
++            await asyncio.sleep(0.3)
++            await qm.cleanup_stale_work_units()
++            seen.append(
++                await db_session.scalar(
++                    select(models.ActiveQueueSession.last_updated).where(
++                        models.ActiveQueueSession.id == aqs_id
++                    )
++                )
++            )
++
++        with patch(
++            "src.deriver.queue_manager.process_representation_batch",
++            side_effect=slow_batch,
++        ):
++            await qm.process_work_unit(work_unit_key, "slow_worker")
++
++        assert len(seen) == 1
++        assert seen[0] is not None, "stale cleanup took the claim of a running item"
++        assert seen[0] > long_ago
++
++    async def test_claim_refresh_stops_when_claim_is_gone(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(
++            "src.deriver.queue_manager.claim_refresh_seconds", lambda: 0.01
++        )
++        qm = QueueManager()
++        await asyncio.wait_for(
++            qm._refresh_claim("no-such-claim", "no-such-work-unit"),  # pyright: ignore[reportPrivateUsage]
++            timeout=2,
++        )
++
+     async def test_stale_work_unit_cleanup(
+         self,
+         sample_session_with_peers: tuple[models.Session, list[models.Peer]],

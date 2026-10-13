@@ -8,7 +8,8 @@
   },
   "patches": [
     "patches/0001-selfhost-core.patch",
-    "patches/0002-allowlist-chat-without-peer-card.patch"
+    "patches/0002-allowlist-chat-without-peer-card.patch",
+    "patches/0003-refresh-claim-while-item-runs.patch"
   ],
   "localPaths": [
     "local-dashboard",
