@@ -195,30 +195,31 @@ def test_a_work_answer_passes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert verdict.unjudged is False
 
 
-def test_a_resident_or_card_number_is_refused_before_jev_is_asked(
+def test_a_number_that_picks_out_one_person_is_refused_before_jev_is_asked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A bare number scored about 0.5 with Jev and went out; its form decides now.
+    # A teammate's answer has it hidden before this (redact.py); an answer that
+    # still holds one is withheld.
     client = _FakeClient(noul=0.01)
     _enable(monkeypatch, client)
 
     for text, held in [
-        ("900101-1234567", jev_gate.RESIDENT_NUMBER),
-        ("번호:9001011234567 입니다", jev_gate.RESIDENT_NUMBER),
-        ("051231 5123456", jev_gate.RESIDENT_NUMBER),
-        ("결제는 4111 1111 1111 1111로", jev_gate.CARD_NUMBER),
-        ("9410-1234-5678-9010", jev_gate.CARD_NUMBER),
-        ("378282246310005", jev_gate.CARD_NUMBER),
+        ("900101-1234567", "resident registration number"),
+        ("850315-5123456", "foreign registration number"),
+        ("여권 M12345678", "passport number"),
+        ("11-23-456789-01", "driver's license number"),
+        ("결제는 4111 1111 1111 1111로", "card number"),
     ]:
-        verdict = _check({"messages": [{"content": "배포 메모"}, {"content": text}]})
-        assert (verdict.allowed, verdict.score, verdict.reason) == (
+        asked = jev_gate.judge(tool="chat", query=text, caller="x", workspace_id="w")
+        assert (asked.allowed, asked.score, asked.reason) == (
             False,
             None,
-            jev_gate.ANSWER_HOLDS + held,
+            jev_gate.QUERY_HOLDS + held,
         ), text
-        asked = jev_gate.judge(tool="chat", query=text, caller="x", workspace_id="w")
-        assert (asked.allowed, asked.reason) == (False, jev_gate.QUERY_HOLDS + held), text
         assert asked.unjudged is False
+        verdict = _check({"messages": [{"content": "배포 메모"}, {"content": text}]})
+        assert (verdict.allowed, verdict.reason) == (False, jev_gate.ANSWER_HOLDS + held), text
     assert client.calls == []
 
 
@@ -227,17 +228,15 @@ def test_numbers_of_other_forms_go_on_to_jev(monkeypatch: pytest.MonkeyPatch) ->
     _enable(monkeypatch, client)
 
     for text in [
-        "010-1234-5678",  # a phone number
+        "010-1234-5678",  # a phone number: Jev judges it by what is around it
+        "minsu@example.com",
         "1760432400000",  # a time in milliseconds: month 60
-        "901301-1234567",  # month 13
-        "900101-9234567",  # 9 is no century digit
-        "90010112345678",  # one digit too many
         "4111 1111 1111 1112",  # the check digit is wrong
         "2026-10-14 12:34:56, PR #1234, build 20261014",
     ]:
-        assert jev_gate.id_number(text) is None, text
+        assert jev_gate.judge(tool="chat", query=text, caller="x", workspace_id="w").allowed
         assert _check({"content": text}).allowed is True, text
-    assert len(client.calls) == 7
+    assert len(client.calls) == 10
 
 
 def test_every_piece_of_text_in_a_result_is_read() -> None:

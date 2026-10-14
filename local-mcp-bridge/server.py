@@ -24,6 +24,7 @@ from fastmcp.server.dependencies import get_http_request
 
 import audit
 import jev_gate
+import redact
 
 logger = logging.getLogger("honcho.mcp.bridge")
 
@@ -486,6 +487,14 @@ def register_tool(*, name: str):
                     )
                     raise
 
+                # Numbers and secrets known by their form never reach a teammate,
+                # nor Jev: they are hidden in place, so the work around them still
+                # goes out, and the log says what was hidden.
+                if reach is not None:
+                    result, masked = redact.redact(result)
+                    if masked:
+                        arguments["masked"] = masked
+
                 # The answer is read before it leaves: a harmless question can
                 # still draw private matters out of the memory. A withheld answer
                 # gets the very refusal a refused question gets, so the refusal
@@ -493,7 +502,7 @@ def register_tool(*, name: str):
                 checked = jev_gate.judge_answer(
                     tool=name,
                     query=query,
-                    result=result,
+                    result=redact.unnamed(result),
                     caller=caller,
                     workspace_id=workspace_id,
                     teammate=reach is not None,
@@ -2554,10 +2563,14 @@ def guard_trial(
         result = {"messages": found}
     else:
         return {**trial, "outcome": "passed"}
+    # Hidden as a teammate's answer is, before it is judged and shown.
+    result, masked = redact.redact(result)
+    if found is not None:
+        found = result["messages"]
     checked = jev_gate.judge_answer(
         tool=TRIAL_TOOL,
         query=query,
-        result=result,
+        result=redact.unnamed(result),
         caller=TRIAL_CALLER,
         workspace_id=workspace,
         teammate=True,
@@ -2566,6 +2579,7 @@ def guard_trial(
         **trial,
         "answer": jev_gate.text_of(result) if found is None else _found_text(found),
         **({"found": found} if found is not None else {}),
+        "masked": masked,
         "answer_check": _verdict_view(checked),
         "outcome": "passed" if checked.allowed else "withheld",
     }

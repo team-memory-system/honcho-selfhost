@@ -138,6 +138,7 @@ def test_a_trial_judges_the_query_then_what_a_search_finds_in_the_folders(
             "reason": "answer in scope",
             "unjudged": False,
         },
+        "masked": {},
         "outcome": "passed",
     }
     # Honcho is searched as a teammate's search_messages searches it: the sessions
@@ -222,6 +223,27 @@ def test_a_written_answer_is_judged_as_written(monkeypatch: pytest.MonkeyPatch) 
     assert trial["answer"] == "계좌 비밀번호는 1234입니다."
     assert calls == [], "a written answer needs no Honcho"
     assert asked[1]["result"] == "계좌 비밀번호는 1234입니다."
+
+
+def test_a_number_known_by_its_form_is_hidden_before_it_is_judged_and_shown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked = _jev(monkeypatch)
+    _honcho(monkeypatch, [_said("등본에 870314-1234567로 적혀 있었다. OCR은 Apple Vision으로.")])
+
+    trial = server.guard_trial(QUERY, folders=FOLDERS)
+
+    hidden = "등본에 [주민등록번호 가림]로 적혀 있었다. OCR은 Apple Vision으로."
+    assert trial["outcome"] == "passed"
+    assert trial["masked"] == {"resident": 1}
+    assert trial["found"] == [_found(hidden)]
+    assert trial["answer"].endswith(hidden)
+    assert asked[1]["result"]["messages"][0]["content"] == (
+        "등본에 [가림]로 적혀 있었다. OCR은 Apple Vision으로."
+    ), "Jev reads neither the number nor what kind it was"
+
+    written = server.guard_trial(QUERY, answer="결제는 4111 1111 1111 1111로")
+    assert (written["answer"], written["masked"]) == ("결제는 [카드번호 가림]로", {"card": 1})
 
 
 def test_an_answer_left_unjudged_says_so(monkeypatch: pytest.MonkeyPatch) -> None:

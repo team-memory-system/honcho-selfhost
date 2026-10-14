@@ -175,10 +175,21 @@ a grant from before tools were chosen, the first kind is open. A list that is
 repeated or malformed refuses the call. A teammate's call names no other workspace,
 and every one of them is judged by the Jev gate, whatever the tool; each owner's
 tool takes an optional `question`, the teammate's own words, for the audit log and
-the gate. Before Jev is asked, the gate refuses a question, and withholds an answer,
-that holds a Korean resident registration number (a birth date, a digit 1–8, six
-more) or a payment card number (13 to 19 digits that pass the Luhn check): Jev
-reads meaning, and a bare number with nothing around it passed it.
+the gate.
+
+What a teammate reads never shows a number or a secret known by its form
+(`redact.py`): Korean resident, foreigner, passport and driver's license numbers,
+card numbers (Luhn), account numbers after a bank's name, coordinates, API keys and
+tokens by their prefix, private keys, and a password named before its value or in
+an address. Each is replaced in place by a mark such as `[주민등록번호 가림]`, so the
+work around it still goes out, and the Jev gate judges the answer with them already
+gone; the audit row's `masked` says how many of each. The memory keeps them as
+written: they are hidden on the way out, not on the way in, so the rules can
+change later. Phone numbers, e-mail addresses and car plates are what people work
+with, and go out as written, for the gate to judge by what is said around them. A
+question holding one of the numbers that pick out one person (resident, foreigner,
+passport, driver's license, card) is refused before Jev is asked: Jev reads
+meaning, and a bare resident number with nothing around it passed it.
 
 The four tools a teammate's agent called before it had the owner's still answer,
 each while the owner's tool it stands for is open: `list_conversations`

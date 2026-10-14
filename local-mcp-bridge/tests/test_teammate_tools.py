@@ -413,3 +413,39 @@ def test_the_teammates_question_is_logged_and_judged_with_the_search(
 
 def test_the_gate_judges_the_teammate_tools_by_default() -> None:
     assert set(jev_gate.TEAMMATE_TOOLS.split(",")) == set(server.TEAMMATE_TOOLS)
+
+
+# ------------------------------------------------------------ what is hidden
+
+
+def test_a_teammate_gets_numbers_hidden_and_the_owner_gets_them_as_written(
+    gate: Any, three: FakeHoncho, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows: list[dict[str, Any]] = []
+    judged: list[Any] = []
+    monkeypatch.setattr(server.audit, "record", lambda **row: rows.append(row))
+    monkeypatch.setattr(
+        server,
+        "jev_gate",
+        SimpleNamespace(
+            judge=lambda **_: jev_gate.Verdict(allowed=True, score=0.01, reason="in scope"),
+            judge_answer=lambda **kwargs: (
+                judged.append(kwargs["result"])
+                or jev_gate.Verdict(allowed=True, score=0.0, reason="ok")
+            ),
+            MESSAGE="refused",
+        ),
+    )
+    said = "결제는 4111 1111 1111 1111로, 담당자 010-2345-6789"
+    three.found = [{**_message(OWNER_PEER, said, "2026-10-11T00:00:00Z"), "session_id": "s-new"}]
+
+    gate(_teammate("/work"))
+    (message,) = server.search_messages("결제")["messages"]
+    assert message["content"] == "결제는 [카드번호 가림]로, 담당자 010-2345-6789"
+    assert judged[-1]["messages"][0]["content"] == "결제는 [가림]로, 담당자 010-2345-6789"
+    assert rows[-1]["arguments"]["masked"] == {"card": 1}
+
+    gate(OWNER)
+    (mine,) = server.search_messages("결제")["messages"]
+    assert mine["content"] == said
+    assert "masked" not in rows[-1]["arguments"]
