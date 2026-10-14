@@ -112,9 +112,9 @@ PEER_ARGUMENTS = frozenset(
 #: Take each caller's reach from the gate of a team server. The gate checks the
 #: caller's Cloudflare Access login, drops every x-honcho-* header the caller sent,
 #: and says who is calling: the server's owner (`all`), a teammate (`folders`, with
-#: the folders the owner opened to them and the apps whose conversations without a
-#: folder they opened), or a teammate the owner turned off for now (`off`).
-#: Anything else is refused.
+#: the folders the owner opened to them, the apps whose conversations without a
+#: folder they opened, and the owner's tools they may call), or a teammate the owner
+#: turned off for now (`off`). Anything else is refused.
 SCOPE_FROM_GATE = _env_flag("HONCHO_MCP_SCOPE_FROM_GATE")
 SCOPE_MODE_HEADER = "x-honcho-scope-mode"
 ALLOWED_FOLDERS_HEADER = "x-honcho-allowed-folders"
@@ -126,15 +126,53 @@ TURNED_OFF = (
     "once they turn it back on."
 )
 
-#: What a teammate may call. Their own agent lists, searches and reads the
-#: conversations open to them, and writes the answer itself; each tool answers only
-#: from those conversations.
-TEAMMATE_TOOLS = (
-    "list_conversations",
-    "search_messages",
-    "read_conversation",
-    "search_conclusions",
+ALLOWED_TOOLS_HEADER = "x-honcho-allowed-tools"
+
+#: The owner's tools the owner may open to a teammate, each one only to read, in
+#: three kinds. The first answer only from the conversations in the folders open to
+#: them: a session named that is not open is refused, and a search or list is held
+#: to the open ones.
+FOLDER_TOOLS = (
+    "search",
+    "list_sessions",
+    "get_session_messages",
+    "get_session_message",
+    "get_session_context",
+    "inspect_session",
+    "get_session_peers",
+    "query_conclusions",
+    "list_conclusions",
 )
+#: These answer from the whole memory, which no folder divides: what Honcho drew
+#: about a peer, and its model answering from all of it. Opened, they read past the
+#: folders, and only the Jev gate stands between them and private matters.
+WHOLE_MEMORY_TOOLS = (
+    "chat",
+    "get_representation",
+    "get_peer_context",
+    "get_peer_card",
+)
+#: These say how the server is set up and who is in it, no conversation.
+SERVER_INFO_TOOLS = (
+    "server_info",
+    "list_peers",
+    "get_metadata",
+    "inspect_workspace",
+    "list_workspaces",
+    "get_queue_status",
+)
+OPENABLE_TOOLS = FOLDER_TOOLS + WHOLE_MEMORY_TOOLS + SERVER_INFO_TOOLS
+#: Open to a teammate whose gate names none: a grant from before tools were chosen.
+DEFAULT_TEAMMATE_TOOLS = FOLDER_TOOLS
+
+#: The tools a teammate's agent called before it had the owner's: each open while
+#: the tool of the owner's it stands for is.
+TEAMMATE_TOOLS = {
+    "list_conversations": "list_sessions",
+    "search_messages": "search",
+    "read_conversation": "get_session_messages",
+    "search_conclusions": "query_conclusions",
+}
 
 #: The most sessions one search names in its `session_id` filter. Honcho caps that
 #: filter only on chat and representation (MAX_SESSION_ALLOWLIST_ENTRIES, 1000, in
@@ -407,7 +445,11 @@ def register_tool(*, name: str):
 
                 query = _judged_text(arguments)
                 verdict = jev_gate.judge(
-                    tool=name, query=query, caller=caller, workspace_id=workspace_id
+                    tool=name,
+                    query=query,
+                    caller=caller,
+                    workspace_id=workspace_id,
+                    teammate=reach is not None,
                 )
                 if not verdict.allowed:
                     audit.record(
@@ -454,6 +496,7 @@ def register_tool(*, name: str):
                     result=result,
                     caller=caller,
                     workspace_id=workspace_id,
+                    teammate=reach is not None,
                 )
                 if not checked.allowed:
                     audit.record(
@@ -698,6 +741,24 @@ def _decode_sources(raw: str | None) -> list[str]:
     return list(dict.fromkeys(_source_entry(item) for item in sources))
 
 
+def _decode_tools(raw: str | None) -> frozenset[str]:
+    """The owner's tools the gate opened, of OPENABLE_TOOLS; names past them are dropped.
+
+    The header is base64url, padded or not, of UTF-8 JSON ["search", ...]. A gate
+    from before it sends none, which opens DEFAULT_TEAMMATE_TOOLS. Raises ValueError
+    or TypeError for anything else.
+    """
+    if raw is None:
+        return frozenset(DEFAULT_TEAMMATE_TOOLS)
+    if not _BASE64URL.fullmatch(raw):
+        raise ValueError("not base64url")
+    text = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+    tools = json.loads(text)
+    if not isinstance(tools, list) or not all(isinstance(item, str) for item in tools):
+        raise TypeError("not a list of names")
+    return frozenset(tools) & frozenset(OPENABLE_TOOLS)
+
+
 class GateScope(NamedTuple):
     """What the gate opened to a teammate."""
 
@@ -707,6 +768,8 @@ class GateScope(NamedTuple):
     sources: list[str]
     #: The owner turned this teammate off for now: every call is refused.
     off: bool = False
+    #: The owner's tools open to them.
+    tools: frozenset[str] = frozenset(DEFAULT_TEAMMATE_TOOLS)
 
 
 def _gate_scope() -> GateScope | None:
@@ -747,7 +810,17 @@ def _gate_scope() -> GateScope | None:
             "This MCP server takes its scope from its gate, and "
             f"{ALLOWED_SOURCES_HEADER} is repeated or malformed"
         ) from exc
-    return GateScope(folders, sources)
+    sent = _gate_values(headers, ALLOWED_TOOLS_HEADER)
+    try:
+        if len(sent) > 1:
+            raise ValueError("repeated")
+        tools = _decode_tools(sent[0] if sent else None)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise RuntimeError(
+            "This MCP server takes its scope from its gate, and "
+            f"{ALLOWED_TOOLS_HEADER} is repeated or malformed"
+        ) from exc
+    return GateScope(folders, sources, tools=tools)
 
 
 #: A path that starts at a Windows drive, once its backslashes read as "/".
@@ -1006,40 +1079,55 @@ class TeammateReach(NamedTuple):
     failure: str | None = None
     #: The apps whose conversations without a folder the gate opened to them.
     sources: tuple[str, ...] = ()
+    #: The owner's tools open to them.
+    tools: frozenset[str] = frozenset()
 
 
 def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | None:
     """What one call may draw on, or None when it is not confined.
 
     Only a bridge behind a team server's gate confines calls, and only a teammate's:
-    they may call the TEAMMATE_TOOLS, each held to the sessions in the folders the
-    owner opened to them and those without a folder from the apps they opened. A
-    teammate the owner turned off is refused whatever they call. A gate header that
-    does not read raises RuntimeError. Once the folders are known, a refusal comes
-    back in the reach instead, so the audit log can say which folders and how many
-    conversations it was about.
+    they may call the owner's tools the gate opened to them (and TEAMMATE_TOOLS, each
+    while the tool it stands for is open), in the server's own workspace. A
+    FOLDER_TOOLS one, or one that names a session, is held to the sessions in the
+    folders the owner opened to them and those without a folder from the apps they
+    opened. A teammate the owner turned off is refused whatever they call. A gate
+    header that does not read raises RuntimeError. Once the folders are known, a
+    refusal comes back in the reach instead, so the audit log can say which folders
+    and how many conversations it was about.
     """
     scope = _gate_scope() if SCOPE_FROM_GATE else None
     if scope is None:
         return None
-    folders, sources = scope.folders, tuple(scope.sources)
+    folders, sources, tools = scope.folders, tuple(scope.sources), scope.tools
     if scope.off:
         return TeammateReach(folders, refusal=TURNED_OFF)
-    if tool not in TEAMMATE_TOOLS:
+    if TEAMMATE_TOOLS.get(tool, tool) not in tools:
+        opened = [name for name in OPENABLE_TOOLS if name in tools]
         return TeammateReach(
             folders,
             refusal=(
-                f"{tool} cannot be used with folders on this MCP server; use "
-                f"{', '.join(TEAMMATE_TOOLS)}"
+                f"{tool} is not open to you on this MCP server; "
+                + (f"use {', '.join(opened)}" if opened else "no tool is")
             ),
             sources=sources,
+            tools=tools,
         )
+    asked_workspace = arguments.get("workspace_id")
+    if asked_workspace and asked_workspace != DEFAULT_WORKSPACE_ID:
+        return TeammateReach(
+            folders,
+            refusal="workspace_id cannot be changed on this MCP server; omit it",
+            sources=sources,
+            tools=tools,
+        )
+    asked = arguments.get("conversation_id") or arguments.get("session_id")
+    if tool not in FOLDER_TOOLS and tool not in TEAMMATE_TOOLS and not asked:
+        # The whole memory, or the server's setup: no session to hold it to.
+        return TeammateReach(folders, sources=sources, tools=tools)
     # Listing the sessions is a Honcho call too, made only for a caller let in.
     _require_auth()
-    workspace_id = _resolve_defaults(workspace_id=arguments.get("workspace_id"))[
-        "workspace_id"
-    ]
-    asked = arguments.get("conversation_id")
+    workspace_id = DEFAULT_WORKSPACE_ID
     try:
         sessions = _open_sessions(workspace_id, folders, sources)
     except Exception as exc:  # noqa: BLE001 - refused and recorded, never a crash
@@ -1053,11 +1141,12 @@ def _teammate_reach(tool: str, arguments: dict[str, Any]) -> TeammateReach | Non
             ),
             failure=f"listing the sessions failed: {type(exc).__name__}: {exc}",
             sources=sources,
+            tools=tools,
         )
     refusal = _allowlist_refusal(sessions)
     if refusal is None and asked and asked not in sessions:
         refusal = NOT_OPEN
-    return TeammateReach(folders, sessions, refusal, sources=sources)
+    return TeammateReach(folders, sessions, refusal, sources=sources, tools=tools)
 
 
 def _require_card_access(path: str, params: dict[str, Any] | None) -> None:
@@ -1206,8 +1295,39 @@ def _coerce_messages(
     return out
 
 
+def _held(*filters: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Every filter given, all of them to hold: the caller's and a teammate's limits."""
+    parts = [item for item in filters if item]
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else {"AND": parts}
+
+
+def _clipped(answer: Any, size: int) -> Any:
+    """Messages as a teammate gets them: each one's content cut to `size`.
+
+    A long conversation read whole could outgrow what the Jev gate reads of an
+    answer, which withholds it; cut, it stays readable and says how much is left.
+    """
+    if isinstance(answer, dict) and isinstance(answer.get("items"), list):
+        return {**answer, "items": _clipped(answer["items"], size)}
+    if isinstance(answer, list):
+        return [_clipped(item, size) for item in answer]
+    if isinstance(answer, dict) and isinstance(answer.get("content"), str):
+        return {**answer, "content": _clip(answer["content"], size)}
+    return answer
+
+
+def _teammate_session(tool: str, session_id: str | None) -> TeammateReach | None:
+    """A teammate's reach, once the session they named is one open to them."""
+    reach = _reach_of(tool)
+    if reach is not None and session_id:
+        _open_conversation(reach, session_id)
+    return reach
+
+
 @register_tool(name="server_info")
-def server_info() -> dict[str, Any]:
+def server_info(question: str | None = None) -> dict[str, Any]:
     """Inspect local MCP/Honcho bridge defaults and upstream health."""
     defaults = _resolve_defaults()
     health = _request("GET", "/health")
@@ -1231,7 +1351,9 @@ def server_info() -> dict[str, Any]:
 
 
 @register_tool(name="inspect_workspace")
-def inspect_workspace(workspace_id: str | None = None) -> dict[str, Any]:
+def inspect_workspace(
+    workspace_id: str | None = None, question: str | None = None
+) -> dict[str, Any]:
     """Inspect one workspace by ID."""
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
     result = _request("POST", "/v3/workspaces/list", body={})
@@ -1239,10 +1361,21 @@ def inspect_workspace(workspace_id: str | None = None) -> dict[str, Any]:
 
 
 @register_tool(name="list_workspaces")
-def list_workspaces(filters: dict[str, Any] | None = None) -> dict[str, Any]:
-    """List all available workspaces."""
+def list_workspaces(
+    filters: dict[str, Any] | None = None, question: str | None = None
+) -> dict[str, Any]:
+    """List all available workspaces. A teammate sees only this server's own."""
+    reach = _reach_of("list_workspaces")
     body = _clean_none({"filters": filters})
-    return _request("POST", "/v3/workspaces/list", body=body)
+    listed = _request("POST", "/v3/workspaces/list", body=body)
+    if reach is not None and isinstance(listed, dict):
+        items = [
+            item
+            for item in listed.get("items") or []
+            if isinstance(item, dict) and item.get("id") == DEFAULT_WORKSPACE_ID
+        ]
+        return {**listed, "items": items, "total": len(items)}
+    return listed
 
 
 @register_tool(name="search")
@@ -1254,12 +1387,38 @@ def search(
     session_id: str | None = None,
     limit: int = 10,
     filters: dict[str, Any] | None = None,
+    question: str | None = None,
 ) -> Any:
-    """Search messages at workspace scope, or scope to a peer or session."""
+    """Search messages at workspace scope, or scope to a peer or session.
+
+    Words and meaning both: a message that holds the words, and one that says
+    something like them. A teammate searches the conversations open to them.
+    """
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
-    body = _clean_none(
-        {"query": query, "limit": int(_clamp(limit, 1, 100)), "filters": filters}
-    )
+    size = int(_clamp(limit, 1, 100))
+    reach = _teammate_session("search", session_id)
+    if reach is not None:
+        mine = _held(
+            filters,
+            {"peer_id": peer_id} if peer_id else None,
+        )
+
+        def ask(scope: dict[str, Any] | None) -> Any:
+            return _honcho(
+                "POST",
+                f"/v3/workspaces/{ws}/search",
+                body=_clean_none(
+                    {
+                        "query": query,
+                        "limit": size,
+                        "filters": _held(mine, {"session_id": scope or session_id}),
+                    }
+                ),
+            )
+
+        found = _scoped_items(None if session_id else _reach_sessions(reach), ask, size)
+        return _clipped(found, SEARCH_MESSAGE_CHARS)
+    body = _clean_none({"query": query, "limit": size, "filters": filters})
     if session_id:
         return _request(
             "POST", f"/v3/workspaces/{ws}/sessions/{session_id}/search", body=body
@@ -1278,8 +1437,10 @@ def get_metadata(
     workspace_id: str | None = None,
     peer_id: str | None = None,
     session_id: str | None = None,
+    question: str | None = None,
 ) -> dict[str, Any]:
     """Get metadata for a workspace, peer, or session."""
+    _teammate_session("get_metadata", session_id if scope == "session" else None)
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
     if scope == "workspace":
         item = inspect_workspace(workspace_id=ws)
@@ -1350,6 +1511,7 @@ def list_peers(
     *,
     workspace_id: str | None = None,
     filters: dict[str, Any] | None = None,
+    question: str | None = None,
 ) -> Any:
     """List peers in a workspace."""
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
@@ -1369,18 +1531,15 @@ def chat(
     session_id: str | None = None,
     reasoning_level: str = "low",
     workspace_id: str | None = None,
+    question: str | None = None,
 ) -> Any:
     """Ask Honcho what it knows about a peer using natural language.
 
-    A teammate on a team server cannot call it: their own agent searches and reads
-    the conversations open to them instead (TEAMMATE_TOOLS).
+    It answers from the whole memory, so a teammate the owner opened it to reads
+    past their folders (WHOLE_MEMORY_TOOLS); a session named is still one open to
+    them.
     """
-    reach = _call_reach.get()
-    if reach is _UNRESOLVED:
-        # Called outside the wrapper, which refuses a teammate's chat.
-        reach = _teammate_reach("chat", {})
-    if reach is not None:
-        raise RuntimeError(reach.refusal or "chat cannot be used on this MCP server")
+    _teammate_session("chat", session_id)
     defaults = _resolve_defaults(workspace_id=workspace_id)
     ws = defaults["workspace_id"]
     observer = peer_id or defaults["assistant_name"]
@@ -1401,6 +1560,7 @@ def get_peer_card(
     *,
     observer_id: str | None = None,
     workspace_id: str | None = None,
+    question: str | None = None,
 ) -> Any:
     """Get a peer card for a target peer, defaulting to the assistant's perspective."""
     defaults = _resolve_defaults(workspace_id=workspace_id)
@@ -1442,6 +1602,7 @@ def get_peer_context(
     search_max_distance: float | None = None,
     include_most_frequent: bool = True,
     max_conclusions: int | None = None,
+    question: str | None = None,
 ) -> Any:
     """Get representation + peer card for a target peer."""
     defaults = _resolve_defaults(workspace_id=workspace_id)
@@ -1474,8 +1635,10 @@ def get_representation(
     search_max_distance: float | None = None,
     include_most_frequent: bool | None = None,
     max_conclusions: int | None = None,
+    question: str | None = None,
 ) -> Any:
     """Get a textual representation for a target peer."""
+    _teammate_session("get_representation", session_id)
     defaults = _resolve_defaults(workspace_id=workspace_id)
     ws = defaults["workspace_id"]
     observer = observer_id or defaults["assistant_name"]
@@ -1521,13 +1684,28 @@ def list_sessions(
     *,
     workspace_id: str | None = None,
     filters: dict[str, Any] | None = None,
+    page: int | None = None,
+    size: int | None = None,
+    question: str | None = None,
 ) -> Any:
-    """List sessions in a workspace."""
+    """List sessions in a workspace, a page at a time. A teammate lists the open ones."""
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
+    reach = _reach_of("list_sessions")
+    if reach is not None:
+        # Past this many, the first share: one Postgres query takes no more ids.
+        opened = _reach_sessions(reach)[:MAX_SESSIONS_PER_SEARCH]
+        filters = _held(filters, {"id": {"in": opened}})
+    params = _clean_none(
+        {
+            "page": int(_clamp(page, 1, 1_000_000)) if page is not None else None,
+            "size": int(_clamp(size, 1, 100)) if size is not None else None,
+        }
+    )
     return _request(
         "POST",
         f"/v3/workspaces/{ws}/sessions/list",
         body=_clean_none({"filters": filters}),
+        params=params or None,
     )
 
 
@@ -1584,15 +1762,21 @@ def remove_peers_from_session(
 
 
 @register_tool(name="get_session_peers")
-def get_session_peers(session_id: str, *, workspace_id: str | None = None) -> Any:
+def get_session_peers(
+    session_id: str, *, workspace_id: str | None = None, question: str | None = None
+) -> Any:
     """List peers in a session."""
+    _teammate_session("get_session_peers", session_id)
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
     return _request("GET", f"/v3/workspaces/{ws}/sessions/{session_id}/peers")
 
 
 @register_tool(name="inspect_session")
-def inspect_session(session_id: str, *, workspace_id: str | None = None) -> Any:
+def inspect_session(
+    session_id: str, *, workspace_id: str | None = None, question: str | None = None
+) -> Any:
     """Inspect one session by ID."""
+    _teammate_session("inspect_session", session_id)
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
     result = _request("POST", f"/v3/workspaces/{ws}/sessions/list", body={})
     return _find_item_by_id(result.get("items", []), session_id)
@@ -1629,18 +1813,23 @@ def get_session_messages(
     page: int | None = None,
     size: int | None = None,
     reverse: bool = False,
+    question: str | None = None,
 ) -> Any:
     """List messages in a session."""
+    reach = _teammate_session("get_session_messages", session_id)
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
     normalized_filters, params = _normalize_message_list_options(
         filters, page=page, size=size, reverse=reverse
     )
-    return _request(
+    if reach is not None:
+        params["size"] = min(params.get("size", MAX_READ_MESSAGES), MAX_READ_MESSAGES)
+    listed = _request(
         "POST",
         f"/v3/workspaces/{ws}/sessions/{session_id}/messages/list",
         body=_clean_none({"filters": normalized_filters}),
         params=params,
     )
+    return listed if reach is None else _clipped(listed, READ_MESSAGE_CHARS)
 
 
 @register_tool(name="get_session_message")
@@ -1649,12 +1838,15 @@ def get_session_message(
     message_id: str,
     *,
     workspace_id: str | None = None,
+    question: str | None = None,
 ) -> Any:
     """Get one message from a session."""
+    reach = _teammate_session("get_session_message", session_id)
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
-    return _request(
+    found = _request(
         "GET", f"/v3/workspaces/{ws}/sessions/{session_id}/messages/{message_id}"
     )
+    return found if reach is None else _clipped(found, READ_MESSAGE_CHARS)
 
 
 @register_tool(name="get_session_context")
@@ -1672,8 +1864,23 @@ def get_session_context(
     search_max_distance: float | None = None,
     include_most_frequent: bool = False,
     max_conclusions: int | None = None,
+    question: str | None = None,
 ) -> Any:
-    """Get LLM-ready context for a session, optionally including peer representation/card."""
+    """Get LLM-ready context for a session, optionally including peer representation/card.
+
+    A peer's representation is drawn from the whole memory: a teammate gets it only
+    while get_representation is open to them too.
+    """
+    reach = _teammate_session("get_session_context", session_id)
+    if (
+        reach is not None
+        and (peer_target or peer_perspective)
+        and "get_representation" not in reach.tools
+    ):
+        raise RuntimeError(
+            "peer_target and peer_perspective draw on the whole memory, and "
+            "get_representation is not open to you on this MCP server; omit them"
+        )
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
     params = _clean_none(
         {
@@ -1700,9 +1907,18 @@ def list_conclusions(
     workspace_id: str | None = None,
     filters: dict[str, Any] | None = None,
     reverse: bool = False,
+    question: str | None = None,
 ) -> Any:
-    """List conclusions in a workspace."""
+    """List conclusions in a workspace.
+
+    A teammate gets only those drawn from one conversation open to them: one that
+    combines several could carry what is not open.
+    """
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
+    reach = _reach_of("list_conclusions")
+    if reach is not None:
+        opened = _reach_sessions(reach)[:MAX_SESSIONS_PER_SEARCH]
+        filters = _held(filters, {"level": "explicit"}, {"session_id": {"in": opened}})
     params = {"reverse": str(reverse).lower()}
     body = _clean_none({"filters": filters})
     return _request(
@@ -1720,12 +1936,49 @@ def query_conclusions(
     top_k: int = 10,
     distance: float | None = None,
     filters: dict[str, Any] | None = None,
+    question: str | None = None,
 ) -> Any:
-    """Semantic search across derived conclusions."""
+    """Semantic search across derived conclusions.
+
+    A teammate gets only those drawn from one conversation open to them: one that
+    combines several could carry what is not open.
+    """
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
     merged_filters = dict(filters or {})
     merged_filters.setdefault("observer", observer_id)
     merged_filters.setdefault("observed", observed_id)
+    reach = _reach_of("query_conclusions")
+    if reach is not None:
+        # Honcho reads the observer and observed at the top; the rest must all hold.
+        pair = {
+            key: merged_filters.pop(key)
+            for key in ("observer", "observed", "observer_id", "observed_id")
+            if key in merged_filters
+        }
+        size = int(_clamp(top_k, 1, MAX_FOUND_CONCLUSIONS))
+
+        def ask(scope: dict[str, Any] | None) -> Any:
+            return _honcho(
+                "POST",
+                f"/v3/workspaces/{ws}/conclusions/query",
+                body=_clean_none(
+                    {
+                        "query": query,
+                        "top_k": size,
+                        "distance": distance,
+                        "filters": {
+                            **pair,
+                            **_held(
+                                merged_filters or None,
+                                {"level": "explicit"},
+                                {"session_id": scope},
+                            ),
+                        },
+                    }
+                ),
+            )
+
+        return _scoped_items(_reach_sessions(reach), ask, size)
     body = _clean_none(
         {
             "query": query,
@@ -1786,6 +2039,7 @@ def get_queue_status(
     observer_id: str | None = None,
     sender_id: str | None = None,
     session_id: str | None = None,
+    question: str | None = None,
 ) -> Any:
     """Inspect the Honcho derivation queue."""
     ws = _resolve_defaults(workspace_id=workspace_id)["workspace_id"]
@@ -2255,10 +2509,14 @@ def guard_trial(
     defaults = _resolve_defaults()
     workspace = defaults["workspace_id"]
     verdict = jev_gate.judge(
-        tool=TRIAL_TOOL, query=query, caller=TRIAL_CALLER, workspace_id=workspace
+        tool=TRIAL_TOOL,
+        query=query,
+        caller=TRIAL_CALLER,
+        workspace_id=workspace,
+        teammate=True,
     )
     trial: dict[str, Any] = {
-        "gate": jev_gate.enabled_for(TRIAL_TOOL),
+        "gate": jev_gate.enabled_for(TRIAL_TOOL, teammate=True),
         "message": jev_gate.MESSAGE,
         "query": _verdict_view(verdict),
         "answer": None,
@@ -2297,7 +2555,12 @@ def guard_trial(
     else:
         return {**trial, "outcome": "passed"}
     checked = jev_gate.judge_answer(
-        tool=TRIAL_TOOL, query=query, result=result, caller=TRIAL_CALLER, workspace_id=workspace
+        tool=TRIAL_TOOL,
+        query=query,
+        result=result,
+        caller=TRIAL_CALLER,
+        workspace_id=workspace,
+        teammate=True,
     )
     return {
         **trial,

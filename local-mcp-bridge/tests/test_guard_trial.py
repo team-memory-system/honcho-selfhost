@@ -167,6 +167,7 @@ def test_a_trial_judges_the_query_then_what_a_search_finds_in_the_folders(
         "query": QUERY,
         "caller": server.TRIAL_CALLER,
         "workspace_id": workspace,
+        "teammate": True,
     }
     assert asked[1]["result"] == {"messages": [_found("학습 실험 두 개가 진행 중입니다.")]}
     assert asked[1]["caller"] == server.TRIAL_CALLER

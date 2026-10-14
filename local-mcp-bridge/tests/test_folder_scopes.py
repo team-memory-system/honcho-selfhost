@@ -121,6 +121,7 @@ class FakeHoncho:
             if self.listing is not None:
                 return self.listing
             items = self.workspaces.get(path.split("/")[3], [])
+            params = params or {"page": 1, "size": 50}
             page, size = params["page"], params["size"]
             return {
                 "items": items[(page - 1) * size : page * size],
@@ -359,18 +360,24 @@ def test_a_teammates_search_is_one_search_confined_to_the_open_folders(
     assert row["arguments"]["question"] == "지난주 배포 어땠어?"
 
 
-def test_a_teammate_cannot_chat(
+def test_a_teammate_chats_only_once_the_owner_opened_chat(
     gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
 ) -> None:
-    """Their own agent searches and answers; the owner's model never runs for them."""
+    """chat answers from the whole memory: closed unless the owner opened it."""
     honcho.add("s1", "/work")
     gate(_teammate(_folder("/work")))
 
-    with pytest.raises(RuntimeError, match="^chat cannot be used with folders"):
+    with pytest.raises(RuntimeError, match="^chat is not open to you on this MCP server; use search, "):
         server.chat("q")
-
     assert honcho.calls == []
     assert audited[0]["status"] == "denied"
+
+    gate(_with_tools(_teammate(_folder("/work")), ["search", "chat"]))
+    assert server.chat("q") == honcho.answer
+    # The whole memory: no session list to hold it to.
+    assert honcho.listings == []
+    assert [call["path"] for call in honcho.chats] == [_chat_path(server.DEFAULT_ASSISTANT_NAME)]
+    assert audited[1]["status"] == "ok"
 
 
 def test_every_page_of_sessions_is_read(gate: Any, honcho: FakeHoncho) -> None:
@@ -518,8 +525,8 @@ def test_a_tool_outside_the_wrapper_still_confines_a_teammate(
 
     server.search_messages.__wrapped__("q")
     assert _allowlist(honcho.searches[0]) == ["s1"]
-    with pytest.raises(RuntimeError, match="^chat cannot be used with folders"):
-        server.chat.__wrapped__("q")
+    with pytest.raises(RuntimeError, match="^chat is not open to you"):
+        server.chat.__wrapped__("q", session_id="s1")
 
     gate(_teammate(_folder("/nothing-here")))
     with pytest.raises(RuntimeError, match=f"^{NO_CONVERSATION}$"):
@@ -1159,22 +1166,18 @@ def test_no_session_is_listed_for_a_caller_without_the_token(
     assert _allowlist(honcho.searches[0]) == ["s1"]
 
 
-def test_a_teammate_may_only_use_their_own_tools(
+def test_a_teammate_may_only_use_the_tools_opened_to_them(
     gate: Any, audited: list[dict[str, Any]], honcho: FakeHoncho
 ) -> None:
-    """Any other tool would read past the folders, whatever the tool list says."""
+    """A tool not opened is refused before Honcho, whatever the tool list says."""
     opened = [_folder("/work", True)]
-    gate(_teammate(*opened))
+    gate(_with_tools(_teammate(*opened), ["search"]))
 
     with pytest.raises(
         RuntimeError,
-        match=(
-            "^search cannot be used with folders on this MCP server; use "
-            "list_conversations, search_messages, read_conversation, "
-            "search_conclusions$"
-        ),
+        match="^list_sessions is not open to you on this MCP server; use search$",
     ):
-        server.search("q")
+        server.list_sessions()
 
     assert honcho.calls == []
     row = audited[0]
@@ -1321,3 +1324,219 @@ def test_a_real_tool_call_reads_the_gate_headers(
     assert audited[0]["caller"] == "mate@example.com"
     assert audited[0]["arguments"]["sessions"] == 1
     assert audited[0]["arguments"]["question"] == "배포 언제 했어?"
+
+
+# --------------------------------------------- the owner's tools, opened to a teammate
+
+
+def _with_tools(headers: dict[str, str], tools: Any) -> dict[str, str]:
+    return {**headers, "x-honcho-allowed-tools": tools if isinstance(tools, str) else _encoded(tools)}
+
+
+def _two(honcho: FakeHoncho) -> None:
+    honcho.add("s1", "/work")
+    honcho.add("s2", "/elsewhere")
+
+
+def test_a_grant_from_before_tools_opens_the_folder_tools(gate: Any, honcho: FakeHoncho) -> None:
+    _two(honcho)
+    gate(_teammate(_folder("/work")))
+
+    server.search("q")
+    assert honcho.searches[0]["path"] == SEARCH_PATH
+    assert _allowlist(honcho.searches[0]) == ["s1"]
+    for call in (lambda: server.chat("q"), server.list_peers, lambda: server.get_peer_card("me")):
+        with pytest.raises(RuntimeError, match="is not open to you"):
+            call()
+
+
+def test_an_older_tool_follows_the_one_it_stands_for(gate: Any, honcho: FakeHoncho) -> None:
+    """An older plugin's search_messages works while search is open, and not after."""
+    _two(honcho)
+    gate(_with_tools(_teammate(_folder("/work")), ["search"]))
+    server.search_messages("q")
+    assert _allowlist(honcho.searches[0]) == ["s1"]
+    with pytest.raises(RuntimeError, match="^read_conversation is not open to you"):
+        server.read_conversation("s1")
+
+    gate(_with_tools(_teammate(_folder("/work")), ["list_sessions"]))
+    with pytest.raises(RuntimeError, match="^search_messages is not open to you"):
+        server.search_messages("q")
+
+
+def test_a_teammate_search_names_only_open_conversations(gate: Any, honcho: FakeHoncho) -> None:
+    _two(honcho)
+    gate(_teammate(_folder("/work")))
+
+    with pytest.raises(RuntimeError, match=f"^{server.NOT_OPEN}$"):
+        server.search("q", session_id="s2")
+    server.search("q", session_id="s1")
+    server.search("q", peer_id="me", filters={"created_at": {"gte": "2026-10-01"}})
+
+    assert honcho.searches[0]["path"] == SEARCH_PATH
+    assert honcho.searches[0]["body"]["filters"] == {"session_id": "s1"}
+    assert honcho.searches[1]["body"]["filters"] == {
+        "AND": [
+            {"AND": [{"created_at": {"gte": "2026-10-01"}}, {"peer_id": "me"}]},
+            {"session_id": {"in": ["s1"]}},
+        ]
+    }
+
+
+def test_a_teammate_search_shows_long_messages_cut(gate: Any, honcho: FakeHoncho) -> None:
+    _two(honcho)
+    honcho.found = [{"id": "m1", "session_id": "s1", "content": "가" * 2000}]
+    gate(_teammate(_folder("/work")))
+
+    found = server.search("q")
+    assert found[0]["content"].startswith("가" * server.SEARCH_MESSAGE_CHARS + " …[")
+    assert server.search.__wrapped__ is not None
+
+
+def test_a_teammate_lists_and_reads_only_open_sessions(gate: Any, honcho: FakeHoncho) -> None:
+    _two(honcho)
+    gate(_teammate(_folder("/work")))
+
+    server.list_sessions(page=2, size=10)
+    asked = honcho.listings[-1]
+    assert asked["body"] == {"filters": {"id": {"in": ["s1"]}}}
+    assert asked["params"] == {"page": 2, "size": 10}
+
+    for read in (
+        lambda: server.get_session_messages("s2"),
+        lambda: server.get_session_message("s2", "m1"),
+        lambda: server.get_session_context("s2"),
+        lambda: server.inspect_session("s2"),
+        lambda: server.get_session_peers("s2"),
+    ):
+        with pytest.raises(RuntimeError, match=f"^{server.NOT_OPEN}$"):
+            read()
+    before = len(honcho.calls)
+    server.get_session_messages("s1", size=100)
+    read = honcho.calls[-1]
+    assert read["path"].endswith("/sessions/s1/messages/list")
+    assert read["params"]["size"] == server.MAX_READ_MESSAGES
+    assert len(honcho.calls) > before
+
+
+def test_the_owner_lists_sessions_as_before(gate: Any, honcho: FakeHoncho) -> None:
+    _two(honcho)
+    gate({"x-honcho-scope-mode": "all"})
+
+    server.list_sessions()
+    assert honcho.calls[-1]["body"] == {}
+    assert honcho.calls[-1]["params"] is None
+
+
+def test_a_session_context_with_a_peer_needs_the_representation_open(
+    gate: Any, honcho: FakeHoncho
+) -> None:
+    _two(honcho)
+    gate(_teammate(_folder("/work")))
+    with pytest.raises(RuntimeError, match="^peer_target and peer_perspective draw on the whole memory"):
+        server.get_session_context("s1", peer_target="me")
+    server.get_session_context("s1")
+
+    gate(_with_tools(_teammate(_folder("/work")), ["get_session_context", "get_representation"]))
+    server.get_session_context("s1", peer_target="me")
+    assert honcho.calls[-1]["params"]["peer_target"] == "me"
+
+
+def test_a_teammate_gets_conclusions_of_one_open_conversation(
+    gate: Any, honcho: FakeHoncho
+) -> None:
+    _two(honcho)
+    gate(_teammate(_folder("/work")))
+
+    server.query_conclusions("q", observer_id="me", observed_id="me", top_k=100)
+    asked = honcho.calls[-1]
+    assert asked["path"].endswith("/conclusions/query")
+    assert asked["body"]["top_k"] == server.MAX_FOUND_CONCLUSIONS
+    assert asked["body"]["filters"] == {
+        "observer": "me",
+        "observed": "me",
+        "AND": [{"level": "explicit"}, {"session_id": {"in": ["s1"]}}],
+    }
+
+    server.list_conclusions(filters={"observer": "me"})
+    assert honcho.calls[-1]["body"]["filters"] == {
+        "AND": [{"observer": "me"}, {"level": "explicit"}, {"session_id": {"in": ["s1"]}}]
+    }
+
+
+def test_the_whole_memory_tools_list_no_sessions(gate: Any, honcho: FakeHoncho) -> None:
+    _two(honcho)
+    gate(_with_tools(_teammate(_folder("/work")), ["get_representation", "get_peer_card"]))
+
+    server.get_representation("me")
+    server.get_peer_card("me")
+    assert honcho.listings == []
+    with pytest.raises(RuntimeError, match=f"^{server.NOT_OPEN}$"):
+        server.get_representation("me", session_id="s2")
+
+
+def test_a_teammate_sees_only_this_servers_workspace(gate: Any, honcho: FakeHoncho, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate(_with_tools(_teammate(_folder("/work")), ["list_workspaces", "search"]))
+    real = honcho.__call__
+
+    def listed(method: str, path: str, **kwargs: Any) -> Any:
+        if path == "/v3/workspaces/list":
+            return {"items": [{"id": server.DEFAULT_WORKSPACE_ID}, {"id": "other"}], "total": 2}
+        return real(method, path, **kwargs)
+
+    monkeypatch.setattr(server, "_honcho", listed)
+    assert server.list_workspaces() == {"items": [{"id": server.DEFAULT_WORKSPACE_ID}], "total": 1}
+    with pytest.raises(RuntimeError, match="^workspace_id cannot be changed"):
+        server.search("q", workspace_id="other")
+
+
+def test_the_tools_header_must_read(gate: Any, honcho: FakeHoncho) -> None:
+    _two(honcho)
+    gate(_with_tools(_teammate(_folder("/work")), "not json!"))
+    with pytest.raises(RuntimeError, match="x-honcho-allowed-tools is repeated or malformed"):
+        server.search("q")
+
+    # Names past the owner's read tools open nothing, so a write tool never does.
+    gate(_with_tools(_teammate(_folder("/work")), ["delete_session", "search"]))
+    server.search("q")
+    assert server._decode_tools(_encoded(["delete_session", "chat"])) == frozenset({"chat"})
+    assert honcho.searches
+
+
+def test_every_openable_tool_is_one_that_only_reads() -> None:
+    writes = {
+        "set_metadata", "create_peer", "set_peer_card", "create_session", "delete_session",
+        "clone_session", "add_peers_to_session", "remove_peers_from_session",
+        "add_messages_to_session", "create_conclusions", "delete_conclusion", "schedule_dream",
+    }
+    assert not writes & set(server.OPENABLE_TOOLS)
+    assert len(set(server.OPENABLE_TOOLS)) == len(server.OPENABLE_TOOLS) == 19
+    for name in server.OPENABLE_TOOLS:
+        assert "question" in inspect.signature(getattr(server, name)).parameters, name
+
+
+def test_jev_judges_every_call_of_a_teammate(
+    gate: Any, honcho: FakeHoncho, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whatever the tool: the owner opened theirs, and HONCHO_JEV_TOOLS lists the older four."""
+    _two(honcho)
+    monkeypatch.setattr(jev_gate, "ENABLED", True)
+    monkeypatch.setattr(jev_gate, "GATED_TOOLS", frozenset({"search_messages"}))
+    assert jev_gate.enabled_for("search", teammate=True)
+    assert not jev_gate.enabled_for("search")
+    judged: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        jev_gate,
+        "judge",
+        lambda **kwargs: judged.append(kwargs) or jev_gate.Verdict(True, 0.1, "ok"),
+    )
+    monkeypatch.setattr(
+        jev_gate, "judge_answer", lambda **kwargs: jev_gate.Verdict(True, 0.1, "ok")
+    )
+
+    gate(_teammate(_folder("/work")))
+    server.search("배포 언제 했어?")
+    gate({"x-honcho-scope-mode": "all"})
+    server.search("배포 언제 했어?")
+
+    assert [item["teammate"] for item in judged] == [True, False]

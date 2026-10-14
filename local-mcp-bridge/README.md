@@ -118,7 +118,7 @@ and sends its own. With `HONCHO_MCP_SCOPE_FROM_GATE=1` every tool call reads the
 | `x-honcho-scope-mode` | Caller | The bridge |
 |---|---|---|
 | `all` | the server's owner | works as without the setting |
-| `folders` | a teammate | answers the four teammate tools only, from the conversations in the folders in `x-honcho-allowed-folders` and of the apps in `x-honcho-allowed-sources` |
+| `folders` | a teammate | answers only the owner's tools named in `x-honcho-allowed-tools`, from the conversations in the folders in `x-honcho-allowed-folders` and of the apps in `x-honcho-allowed-sources` |
 | `off` | a teammate the owner turned off for now | refuses every call, saying the owner turned their access off and that they can ask again once it is back on |
 | missing, repeated or anything else | | refuses every call |
 
@@ -149,9 +149,39 @@ malformed, or holds anything but such a name, refuses the call. An app opens onl
 its conversations in no folder: a session with a folder is open by its folder
 alone.
 
-A teammate's own agent reads those conversations and writes the answer itself; the
-owner's model never runs for them. They have four tools, each held to the open
-conversations:
+`x-honcho-allowed-tools` is base64url, with or without padding, of a UTF-8 JSON
+list of the owner's tools the owner opened to that teammate, only ones that read,
+in three kinds:
+
+- held to the open conversations: `search`, `list_sessions`,
+  `get_session_messages`, `get_session_message`, `get_session_context`,
+  `inspect_session`, `get_session_peers`, `query_conclusions`, `list_conclusions`.
+  A search or list names the open sessions in its filter, beside the caller's own
+  (`{"AND": [...]}`); a session named that is not open is refused. Conclusions are
+  only `explicit` ones, each drawn from one conversation: one that combines several
+  could carry what is not open. Messages come with each one's content cut, 1,500
+  characters in a search and 3,000 in a read, so an answer stays one the Jev gate
+  reads whole, and a read is 50 messages at most. `get_session_context` takes
+  `peer_target` or `peer_perspective` only while `get_representation` is open too.
+- the whole memory, which no folder divides: `chat`, `get_representation`,
+  `get_peer_context`, `get_peer_card`. Opened, they read past the folders; a session
+  named is still one that must be open.
+- the server's setup, no conversation: `server_info`, `list_peers`, `get_metadata`,
+  `inspect_workspace`, `list_workspaces` (this server's workspace alone),
+  `get_queue_status`.
+
+Names past these open nothing, so no tool that writes ever does. Without the header,
+a grant from before tools were chosen, the first kind is open. A list that is
+repeated or malformed refuses the call. A teammate's call names no other workspace,
+and every one of them is judged by the Jev gate, whatever the tool; each owner's
+tool takes an optional `question`, the teammate's own words, for the audit log and
+the gate.
+
+The four tools a teammate's agent called before it had the owner's still answer,
+each while the owner's tool it stands for is open: `list_conversations`
+(`list_sessions`), `search_messages` (`search`), `read_conversation`
+(`get_session_messages`) and `search_conclusions` (`query_conclusions`). Each is
+held to the open conversations:
 
 - `list_conversations`: the open conversations, the most recently active first,
   with when each started and last ran, how many messages it has, its folder, app,
@@ -177,7 +207,7 @@ sessions in its filter (each a bound parameter of one Postgres query), and more 
 searched a share at a time, at once, the answers merged each share's best first,
 since Honcho returns no score. A conversation named by id
 that is not open is refused in the same words whether it is closed or does not
-exist. Every other tool, `chat` among them, is refused.
+exist. A tool not opened is refused, saying which are.
 
 The bridge lists the workspace's sessions (`POST
 /v3/workspaces/{ws}/sessions/list`, 100 to a page) and keeps the list for 60
@@ -191,9 +221,9 @@ Honcho. A session list that cannot be read is recorded as `error`, with its caus
 while the teammate is told only that it could not be listed. The arguments of a
 teammate's call record the folders and apps as the gate sent them, as `folders`
 and `sources`, and how many conversations the call was confined to, as
-`sessions`. The setting does not pin the workspace or the peers; the team server's
-bridge also sets `HONCHO_MCP_PIN_DEFAULTS=1` and `HONCHO_MCP_ENABLED_TOOLS` to the
-four teammate tools.
+`sessions`. The setting does not pin the peers; the team server's bridge also sets
+`HONCHO_MCP_PIN_DEFAULTS=1` and `HONCHO_MCP_ENABLED_TOOLS` to the owner's tools that
+read and the four older ones.
 
 ## Upstream maintenance
 

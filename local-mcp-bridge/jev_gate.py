@@ -75,10 +75,12 @@ GUARD_URL = os.environ.get("HONCHO_JEV_GUARD_URL", "").strip() or None
 #: This member's bearer token for the hub. Never logged, never in a reason.
 GUARD_TOKEN = os.environ.get("HONCHO_JEV_GUARD_TOKEN", "").strip() or None
 
-#: Tools the gate judges by default: the ones a teammate calls.
+#: Tools the gate judges by default whoever calls: the ones a teammate called before
+#: the owner could open their own tools. A teammate's call is judged whatever the tool.
 TEAMMATE_TOOLS = "list_conversations,search_messages,read_conversation,search_conclusions"
 
-#: Tools the gate judges. Everything else passes untouched.
+#: Tools the gate judges for any caller. Everything else passes untouched, but for a
+#: teammate's call.
 GATED_TOOLS = frozenset(
     name.strip()
     for name in os.environ.get("HONCHO_JEV_TOOLS", TEAMMATE_TOOLS).split(",")
@@ -158,8 +160,8 @@ class Verdict:
         return self.failed or self.no_key or self.skipped
 
 
-def enabled_for(tool: str) -> bool:
-    return ENABLED and tool in GATED_TOOLS
+def enabled_for(tool: str, *, teammate: bool = False) -> bool:
+    return ENABLED and (teammate or tool in GATED_TOOLS)
 
 
 def _get_client() -> Any:
@@ -201,9 +203,16 @@ def reset() -> None:
         _guard_client = None
 
 
-def judge(*, tool: str, query: str, caller: str, workspace_id: str | None) -> Verdict:
+def judge(
+    *,
+    tool: str,
+    query: str,
+    caller: str,
+    workspace_id: str | None,
+    teammate: bool = False,
+) -> Verdict:
     """Decide whether one query may be forwarded to Honcho."""
-    if not enabled_for(tool):
+    if not enabled_for(tool, teammate=teammate):
         return Verdict(allowed=True, score=None, reason="gate off")
     if not query.strip():
         return Verdict(allowed=True, score=None, reason="no query text")
@@ -220,7 +229,13 @@ def judge(*, tool: str, query: str, caller: str, workspace_id: str | None) -> Ve
 
 
 def judge_answer(
-    *, tool: str, query: str, result: Any, caller: str, workspace_id: str | None
+    *,
+    tool: str,
+    query: str,
+    result: Any,
+    caller: str,
+    workspace_id: str | None,
+    teammate: bool = False,
 ) -> Verdict:
     """Decide whether a tool's result may go back to the teammate who asked.
 
@@ -228,7 +243,7 @@ def judge_answer(
     part of it leaves unjudged. A long answer is judged in overlapping pieces, and
     the first piece refused or left unjudged decides.
     """
-    if not enabled_for(tool):
+    if not enabled_for(tool, teammate=teammate):
         return Verdict(allowed=True, score=None, reason="gate off")
     try:
         answer = text_of(result)
