@@ -175,7 +175,10 @@ a grant from before tools were chosen, the first kind is open. A list that is
 repeated or malformed refuses the call. A teammate's call names no other workspace,
 and every one of them is judged by the Jev gate, whatever the tool; each owner's
 tool takes an optional `question`, the teammate's own words, for the audit log and
-the gate.
+the gate. Before Jev is asked, the gate refuses a question, and withholds an answer,
+that holds a Korean resident registration number (a birth date, a digit 1–8, six
+more) or a payment card number (13 to 19 digits that pass the Luhn check): Jev
+reads meaning, and a bare number with nothing around it passed it.
 
 The four tools a teammate's agent called before it had the owner's still answer,
 each while the owner's tool it stands for is open: `list_conversations`

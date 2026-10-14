@@ -195,6 +195,51 @@ def test_a_work_answer_passes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert verdict.unjudged is False
 
 
+def test_a_resident_or_card_number_is_refused_before_jev_is_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A bare number scored about 0.5 with Jev and went out; its form decides now.
+    client = _FakeClient(noul=0.01)
+    _enable(monkeypatch, client)
+
+    for text, held in [
+        ("900101-1234567", jev_gate.RESIDENT_NUMBER),
+        ("번호:9001011234567 입니다", jev_gate.RESIDENT_NUMBER),
+        ("051231 5123456", jev_gate.RESIDENT_NUMBER),
+        ("결제는 4111 1111 1111 1111로", jev_gate.CARD_NUMBER),
+        ("9410-1234-5678-9010", jev_gate.CARD_NUMBER),
+        ("378282246310005", jev_gate.CARD_NUMBER),
+    ]:
+        verdict = _check({"messages": [{"content": "배포 메모"}, {"content": text}]})
+        assert (verdict.allowed, verdict.score, verdict.reason) == (
+            False,
+            None,
+            jev_gate.ANSWER_HOLDS + held,
+        ), text
+        asked = jev_gate.judge(tool="chat", query=text, caller="x", workspace_id="w")
+        assert (asked.allowed, asked.reason) == (False, jev_gate.QUERY_HOLDS + held), text
+        assert asked.unjudged is False
+    assert client.calls == []
+
+
+def test_numbers_of_other_forms_go_on_to_jev(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(noul=0.01)
+    _enable(monkeypatch, client)
+
+    for text in [
+        "010-1234-5678",  # a phone number
+        "1760432400000",  # a time in milliseconds: month 60
+        "901301-1234567",  # month 13
+        "900101-9234567",  # 9 is no century digit
+        "90010112345678",  # one digit too many
+        "4111 1111 1111 1112",  # the check digit is wrong
+        "2026-10-14 12:34:56, PR #1234, build 20261014",
+    ]:
+        assert jev_gate.id_number(text) is None, text
+        assert _check({"content": text}).allowed is True, text
+    assert len(client.calls) == 7
+
+
 def test_every_piece_of_text_in_a_result_is_read() -> None:
     result = {
         "content": "학습 실험",

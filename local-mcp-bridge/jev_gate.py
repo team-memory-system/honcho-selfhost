@@ -128,6 +128,46 @@ ANSWER_TOO_LONG = "answer too long to judge"
 ANSWER_REFUSED = "answer withheld: it discloses private matters"
 ANSWER_SKIPPED = "answer not judged: the team hub does not judge answers"
 
+#: Reasons for a question or an answer that holds a number whose form alone says what
+#: it is. Jev reads meaning, so a bare 13-digit number with nothing around it scored
+#: about 0.5 and went out; these are refused before Jev is asked.
+HOLDS = "it holds a "
+QUERY_HOLDS = f"out of scope: {HOLDS}"
+ANSWER_HOLDS = f"answer withheld: {HOLDS}"
+RESIDENT_NUMBER = "resident registration number"
+CARD_NUMBER = "card number"
+
+# A Korean resident (or foreigner) registration number: birth date, then a digit
+# 1–8 for the century and sex, then six more, with or without the dash. Numbers
+# given since October 2020 carry no check digit, so none is tested.
+_RESIDENT = re.compile(r"(?<!\d)\d{2}(\d{2})(\d{2})[- ]?[1-8]\d{6}(?!\d)")
+# A payment card: 13 to 19 digits, in groups or not, starting as the card networks
+# do (3 Amex/JCB/Diners, 4 Visa, 5 Mastercard, 6 Discover/UnionPay, 9 Korean
+# domestic), with a valid Luhn check digit.
+_CARD = re.compile(r"(?<!\d)[345693](?:[ -]?\d){12,18}(?!\d)")
+
+
+def _luhn(digits: str) -> bool:
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = int(char) * (2 if index % 2 else 1)
+        total += value - 9 if value > 9 else value
+    return total % 10 == 0
+
+
+def id_number(text: str) -> str | None:
+    """What kind of identifying number `text` holds, or None."""
+    for match in _RESIDENT.finditer(text):
+        month, day = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return RESIDENT_NUMBER
+    for match in _CARD.finditer(text):
+        digits = re.sub(r"[ -]", "", match.group(0))
+        if 13 <= len(digits) <= 19 and _luhn(digits):
+            return CARD_NUMBER
+    return None
+
+
 # Error codes the hub sends are copied into reasons; anything else is dropped.
 _ERROR_CODE = re.compile(r"[a-z0-9_]{1,64}")
 
@@ -218,6 +258,9 @@ def judge(
         return Verdict(allowed=True, score=None, reason="no query text")
     if len(query) > TEXT_LIMIT:
         return Verdict(allowed=False, score=None, reason=QUERY_TOO_LONG)
+    held = id_number(query)
+    if held:
+        return Verdict(allowed=False, score=None, reason=QUERY_HOLDS + held)
 
     state = {
         "tool": tool,
@@ -251,6 +294,9 @@ def judge_answer(
         return _on_failure(f"unreadable result: {type(exc).__name__}", "answer")
     if not answer.strip():
         return Verdict(allowed=True, score=None, reason="no answer text")
+    held = id_number(answer)
+    if held:
+        return Verdict(allowed=False, score=None, reason=ANSWER_HOLDS + held)
     pieces = _pieces(answer)
     if len(pieces) > ANSWER_PIECES:
         return Verdict(allowed=False, score=None, reason=ANSWER_TOO_LONG)
