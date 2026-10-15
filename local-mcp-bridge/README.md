@@ -179,14 +179,19 @@ the gate.
 
 What a teammate reads never shows a number or a secret known by its form
 (`redact.py`): Korean resident, foreigner, passport and driver's license numbers,
-card numbers (Luhn), account numbers after a bank's name, coordinates, API keys and
-tokens by their prefix, private keys, and a password named before its value or in
-an address. Each is replaced in place by a mark such as `[주민등록번호 가림]`, so the
-work around it still goes out, and the Jev gate judges the answer with them already
-gone; the audit row's `masked` says how many of each. The memory keeps them as
-written: they are hidden on the way out, not on the way in, so the rules can
-change later. Phone numbers, e-mail addresses and car plates are what people work
-with, and go out as written, for the gate to judge by what is said around them. A
+card numbers (Luhn), account numbers after a bank's name (on the same line or up to
+two lines above, as one is pasted from a banking app), Korean mobile numbers, e-mail
+addresses, coordinates, API keys and tokens by their prefix, private keys, and a
+password named before its value or in an address. A run of base64 whose decoded
+text holds one of these is hidden whole. Each is replaced in place by a mark such
+as `[주민등록번호 가림]`, so the work around it still goes out, and the Jev gate
+judges the answer with them already gone; the audit row's `masked` says how many of
+each. The memory keeps them as written: they are hidden on the way out, not on the
+way in, so the rules can change later. Mobile numbers and e-mail addresses were
+once left to the Jev gate, and one inside an application form read as work and went
+out. An e-mail address at a domain in `HONCHO_REDACT_KEEP_EMAIL_DOMAINS` (a comma
+list, such as the team's own) goes out as written; so do office numbers (02-,
+1588-) and car plates, for the gate to judge by what is said around them. A
 question holding one of the numbers that pick out one person (resident, foreigner,
 passport, driver's license, card) is refused before Jev is asked: Jev reads
 meaning, and a bare resident number with nothing around it passed it.

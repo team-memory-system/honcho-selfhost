@@ -441,9 +441,9 @@ def test_a_teammate_gets_numbers_hidden_and_the_owner_gets_them_as_written(
 
     gate(_teammate("/work"))
     (message,) = server.search_messages("결제")["messages"]
-    assert message["content"] == "결제는 [카드번호 가림]로, 담당자 010-2345-6789"
-    assert judged[-1]["messages"][0]["content"] == "결제는 [가림]로, 담당자 010-2345-6789"
-    assert rows[-1]["arguments"]["masked"] == {"card": 1}
+    assert message["content"] == "결제는 [카드번호 가림]로, 담당자 [휴대폰 번호 가림]"
+    assert judged[-1]["messages"][0]["content"] == "결제는 [가림]로, 담당자 [가림]"
+    assert rows[-1]["arguments"]["masked"] == {"card": 1, "phone": 1}
 
     gate(OWNER)
     (mine,) = server.search_messages("결제")["messages"]

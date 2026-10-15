@@ -3,6 +3,8 @@ its form is hidden in place, and what people work with goes out as written."""
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 import redact
@@ -82,6 +84,40 @@ import redact
         ),
         ("password=hunter2", "password=[비밀번호 가림]", "password"),
         ('"token": "abc123def456"', '"token": "[비밀번호 가림]"', "password"),
+        # An account pasted from a banking app: the bank on its own line.
+        (
+            "우리은행\n1002-111-222333\n홍길동",
+            "우리은행\n[계좌번호 가림]\n홍길동",
+            "account",
+        ),
+        (
+            "| 은행 | 우리 |\n| 번호 | 1002-111-222333 |",
+            "| 은행 | 우리 |\n| 번호 | [계좌번호 가림] |",
+            "account",
+        ),
+        ("우리 1002-111-222333 (홍길동)", "우리 [계좌번호 가림] (홍길동)", "account"),
+        ("입금처: 카카오 3333 01 2345678", "입금처: 카카오 [계좌번호 가림]", "account"),
+        (
+            "예금주 홍길동 / 1002 111 222333",
+            "예금주 홍길동 / [계좌번호 가림]",
+            "account",
+        ),
+        # A mobile number and a personal address, even inside work: an application
+        # form read as work to the Jev gate and went out.
+        ("김민수 휴대폰 010-2345-6789", "김민수 휴대폰 [휴대폰 번호 가림]", "phone"),
+        ("| 연락처 | 01023456789 |", "| 연락처 | [휴대폰 번호 가림] |", "phone"),
+        ("+82 10-2345-6789로 연락", "[휴대폰 번호 가림]로 연락", "phone"),
+        ("토스 010-2345-6789", "토스 [휴대폰 번호 가림]", "phone"),
+        (
+            "결과는 minsu.kim87@gmail.com으로",
+            "결과는 [이메일 가림]으로",
+            "email",
+        ),
+        (
+            "| 이메일 | gil.dong@company.co.kr |",
+            "| 이메일 | [이메일 가림] |",
+            "email",
+        ),
     ],
 )
 def test_each_kind_is_hidden_in_place(text: str, shown: str, kind: str) -> None:
@@ -90,12 +126,50 @@ def test_each_kind_is_hidden_in_place(text: str, shown: str, kind: str) -> None:
     assert counts == {kind: 1}
 
 
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ["우리은행 1002-111-222333", "연락처 010-2345-6789", "870314-1234567"],
+)
+def test_a_number_in_base64_is_hidden_with_its_run(secret: str) -> None:
+    for token in (_b64(secret), base64.urlsafe_b64encode(secret.encode()).decode()):
+        hidden, counts = redact.redact(f"설정값 {token} 이다")
+        assert hidden == "설정값 [인코딩된 값 가림] 이다"
+        assert counts == {"encoded": 1}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "설정값 " + _b64("배포는 금요일 오후에 한다") + " 이다",  # work, decoded
+        "sha256 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+        "local-mcp-bridge/tests/test_redact.py",
+        "honcho_agent_bridge_backup_schedule",
+    ],
+)
+def test_base64_without_a_number_goes_out_as_written(text: str) -> None:
+    assert redact.redact(text) == (text, {})
+
+
+def test_an_address_at_a_kept_domain_goes_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(redact, "KEEP_EMAIL_DOMAINS", frozenset({"example.co.kr"}))
+    kept = "담당은 kim@example.co.kr, dev@mail.example.co.kr"
+    assert redact.redact(kept) == (kept, {})
+    assert redact.redact("개인은 kim@gmail.com") == (
+        "개인은 [이메일 가림]",
+        {"email": 1},
+    )
+
+
 @pytest.mark.parametrize(
     "text",
     [
         # What people work with, which the Jev gate judges by what is said around it.
-        "김민수 휴대폰 010-2345-6789",
-        "결과는 minsu.kim87@gmail.com으로",
+        "git@github.com:team-memory-system/honcho-selfhost.git",
+        "npm i @scope/pkg@1.2.3",
         "주차 등록은 12가 3456으로 했다.",
         "고객센터 1588-1234, 본사 02-1234-5678",
         "부산 지사 051-123-4567",

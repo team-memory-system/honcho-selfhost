@@ -6,14 +6,20 @@ Each one is replaced in place by a short mark ("[주민등록번호 가림]"), s
 around it still reaches the teammate, and the Jev gate then judges the answer with
 the numbers already gone, so they never reach Jev either.
 
-Only what its form gives away is here. A phone number, an e-mail address or a car's
-plate is often what people work with, so those go out as written and the Jev gate
-judges them by what is said around them, as it judges a name, an address or a
-private matter.
+Only what its form gives away is here. A mobile number and an e-mail address are
+hidden too: left to the Jev gate, one inside a form or an application read as work
+and went out. An office number (02-, 1588-) and an address at a domain named in
+HONCHO_REDACT_KEEP_EMAIL_DOMAINS stay, as a car's plate does; the Jev gate judges
+those by what is said around them, as it judges a name, an address or a private
+matter. Text in base64 is decoded and read by the same rules, so a number cannot
+pass in it.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import os
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -27,11 +33,22 @@ NAMES: dict[str, str] = {
     "driver": "운전면허번호",
     "card": "카드번호",
     "account": "계좌번호",
+    "phone": "휴대폰 번호",
+    "email": "이메일",
     "coordinate": "좌표",
     "api_key": "API 키",
     "private_key": "비밀 키",
     "password": "비밀번호",
+    "encoded": "인코딩된 값",
 }
+
+#: E-mail domains that go out as written, such as the team's own: a comma list. An
+#: address at one of them, or at a subdomain of one, is kept.
+KEEP_EMAIL_DOMAINS: frozenset[str] = frozenset(
+    domain.strip().lower().lstrip("@")
+    for domain in os.environ.get("HONCHO_REDACT_KEEP_EMAIL_DOMAINS", "").split(",")
+    if domain.strip()
+)
 
 #: The kinds that pick out one person; a question holding one is refused, since
 #: searching for it tells whether the memory has it. Their names, for the log.
@@ -89,11 +106,28 @@ _PRIVATE_KEY = re.compile(
 )
 # The password in an address such as https://user:pass@host.
 _URL_PASSWORD = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)([^\s@/]+)(@)")
-# An account number: a bank or the word 계좌 just before a dashed or long number.
+# An account number: a bank or the word 계좌 shortly before a dashed, spaced or long
+# number. The bank may sit on the line or in the table cell before it ("우리은행" over
+# the number, as one is pasted from a banking app), so up to two line breaks.
 _ACCOUNT = re.compile(
     r"(?i:계좌|은행|뱅크|입금|송금|이체|예금주|account|acct"
-    r"|국민|신한|농협|우체국|새마을금고|IBK|NH|KB|SC제일|씨티)"
-    r"[^\d\n]{0,12}?(?<!\d)(\d{2,6}(?:-\d{2,7}){1,3}|\d{10,14})(?![\d-])"
+    r"|국민|신한|농협|우체국|새마을금고|IBK|NH|KB|SC제일|씨티|우리|하나|카카오|토스"
+    r"|기업|수협|신협|산업|케이뱅크|부산|대구|경남|광주|전북|제주)"
+    r"(?:[^\d\n]{0,12}?\n){0,2}[^\d\n]{0,12}?"
+    r"(?<!\d)(\d{2,6}(?:-\d{2,7}){1,3}|\d{3,6}(?: \d{2,7}){1,3}|\d{10,14})(?![\d-])"
+)
+# A Korean mobile number, with or without its country code, dashed, spaced or not.
+_PHONE = re.compile(
+    r"(?<![\d+-])(?:\+82[- ]?1|01)[016789][- .]?\d{3,4}[- .]?\d{4}(?![\d-])"
+)
+# An e-mail address. Its domain decides whether it is kept (KEEP_EMAIL_DOMAINS).
+_EMAIL = re.compile(
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})"
+    r"(?![A-Za-z0-9.-]*[A-Za-z0-9])"
+)
+# A run of base64 (or base64url) long enough to hold a number.
+_BASE64 = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_=-])"
 )
 # A password or token named just before its value.
 _SECRET_VALUE = re.compile(
@@ -132,9 +166,56 @@ def _card(match: re.Match[str]) -> bool:
 
 
 def _account(number: str) -> bool:
-    digits = number.replace("-", "")
+    digits = re.sub(r"[- ]", "", number)
     # A phone number keeps its shape, whatever word comes before it.
-    return len(digits) >= 10 and not re.fullmatch(r"0\d{1,2}-\d{3,4}-\d{4}", number)
+    return len(digits) >= 10 and not re.fullmatch(
+        r"0\d{1,2}[- ]\d{3,4}[- ]\d{4}", number
+    )
+
+
+def _email(match: re.Match[str]) -> str | None:
+    local = match.group(0).split("@", 1)[0]
+    domain = match.group(1).lower()
+    # git@github.com:org/repo is an address of code, not of a person.
+    if local == "git":
+        return None
+    if any(
+        domain == kept or domain.endswith("." + kept) for kept in KEEP_EMAIL_DOMAINS
+    ):
+        return None
+    return "email"
+
+
+def _decoded(token: str) -> str | None:
+    """`token` decoded as base64 or base64url into readable text, or None."""
+    padded = token + "=" * (-len(token) % 4)
+    for decode in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            text = decode(padded).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            continue
+        readable = sum(char.isprintable() or char in "\n\t" for char in text)
+        if text and readable == len(text):
+            return text
+    return None
+
+
+def _encoded(text: str, counts: Counter[str]) -> str:
+    """Hide a run of base64 whose decoded text holds what the other rules hide."""
+
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        decoded = _decoded(token)
+        if decoded is None:
+            return token
+        inner: Counter[str] = Counter()
+        _plain(decoded, inner)
+        if not inner:
+            return token
+        counts["encoded"] += 1
+        return mark("encoded")
+
+    return _BASE64.sub(replace, text)
 
 
 def _secret_value(value: str) -> bool:
@@ -211,17 +292,24 @@ _RULES: list[Callable[[str, Counter[str]], str]] = [
     _part(_PASSPORT_OLD, "passport", 1),
     _whole(_CARD, lambda match: "card" if _card(match) else None),
     _part(_ACCOUNT, "account", 1, _account),
+    _whole(_PHONE, "phone"),
+    _whole(_EMAIL, _email),
     _whole(_COORDINATE, "coordinate"),
     _part(_SECRET_VALUE, "password", 1, _secret_value),
 ]
 
 
-def redact_text(text: str, counts: Counter[str] | None = None) -> str:
-    """`text` with every number and secret known by its form replaced by its mark."""
-    counts = counts if counts is not None else Counter()
+def _plain(text: str, counts: Counter[str]) -> str:
     for rule in _RULES:
         text = rule(text, counts)
     return text
+
+
+def redact_text(text: str, counts: Counter[str] | None = None) -> str:
+    """`text` with every number and secret known by its form replaced by its mark."""
+    counts = counts if counts is not None else Counter()
+    # Base64 first, while its run is whole: a rule above could cut into it.
+    return _plain(_encoded(text, counts), counts)
 
 
 def redact(value: Any) -> tuple[Any, dict[str, int]]:
