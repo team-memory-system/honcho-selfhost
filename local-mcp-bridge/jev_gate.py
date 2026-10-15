@@ -89,30 +89,46 @@ GATED_TOOLS = frozenset(
     if name.strip()
 )
 
+#: What private life is, named for Jev, as the team hub names it (server/hub/hub.mjs
+#: in team-memory): without the list Jev let through answers with a current location,
+#: biometric data, union membership or a side job at 0.37 to 0.67; with it they
+#: scored 0.81 to 0.96, while work answers stayed at or below 0.05 (2026-10-15).
+PRIVATE_LIFE = (
+    "Private life includes where someone lives or is outside work (a home address, a "
+    "neighborhood, a current location, daily routes), health and medical matters, "
+    "biometric data (fingerprints, face or voice data), religion or beliefs, political "
+    "views or party membership, union membership, sexual life or orientation, family "
+    "and relationships, ethnicity or origin, criminal records, personal finances (own "
+    "salary, debt, credit score, accounts), identification numbers, credentials or "
+    "secrets, and paid work outside the owner's job."
+)
+
 QUESTION = os.environ.get(
     "HONCHO_JEV_QUESTION",
-    "Is this query asking for private personal life, credentials, financial or health "
-    "details about the memory owner, rather than shared work context "
-    "(projects, code, decisions, schedules, documents)?",
+    "Is this query asking about the private life of the memory owner or another person, "
+    "or for credentials or secrets, rather than shared work context (projects, code, "
+    "decisions, work schedules, documents)? " + PRIVATE_LIFE,
 )
 
 CRITERIA: dict[str, str] = {
-    "true": "The query targets private personal matters, secrets, or credentials.",
+    "true": "The query reaches for a person's private life as listed, or for a secret "
+    "or credential.",
     "false": "The query is about work the team shares, or is general and harmless.",
 }
 
 ANSWER_QUESTION = os.environ.get(
     "HONCHO_JEV_ANSWER_QUESTION",
     "A teammate asked the memory owner's work memory a question and will read this "
-    "answer. Does the answer disclose private personal life, credentials or secrets, "
-    "financial or health details about the owner or any person, rather than shared "
-    "work context (projects, code, decisions, schedules, documents)?",
+    "answer. Does the answer disclose anything about the private life of the owner or "
+    "any other person, rather than shared work context (projects, code, decisions, "
+    "work schedules, documents)? " + PRIVATE_LIFE,
 )
 
 ANSWER_CRITERIA: dict[str, str] = {
-    "true": "The answer discloses private personal matters, secrets, credentials, "
-    "financial or health details.",
-    "false": "The answer only covers shared work context, or is general and harmless.",
+    "true": "The answer discloses something about a person's private life as listed, "
+    "or a secret or credential.",
+    "false": "The answer only covers shared work context, such as work done, who did "
+    "it, work schedules, business trips, or is general and harmless.",
 }
 
 MESSAGE = os.environ.get(
