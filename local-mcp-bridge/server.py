@@ -24,6 +24,7 @@ from fastmcp.server.dependencies import get_http_request
 
 import audit
 import jev_gate
+import provenance
 import redact
 
 logger = logging.getLogger("honcho.mcp.bridge")
@@ -491,6 +492,11 @@ def register_tool(*, name: str):
                 # nor Jev: they are hidden in place, so the work around them still
                 # goes out, and the log says what was hidden.
                 if reach is not None:
+                    # Where each conversation and message came from on the owner's
+                    # computer (the transcript file and its line, the turn's hash,
+                    # the folder's path) stays here too: a teammate reads the
+                    # memory, not the owner's disk.
+                    result = provenance.hidden(result)
                     result, masked = redact.redact(result)
                     if masked:
                         arguments["masked"] = masked
@@ -2160,6 +2166,14 @@ def _said(item: dict[str, Any], size: int) -> dict[str, Any]:
     }
 
 
+def _folder_shown(cwd: str | None, reach: TeammateReach | None) -> str | None:
+    """A conversation's folder as the caller reads it: its path for the owner, its
+    name alone for a teammate (provenance.folder_name)."""
+    if cwd is None or reach is None:
+        return cwd
+    return provenance.folder_name(cwd)
+
+
 _heads_lock = threading.Lock()
 #: Each conversation's start as last looked up, by (workspace, session):
 #: (the session's last_at then, the start). A session that brings in more
@@ -2265,7 +2279,12 @@ def list_conversations(
             if end is not None and started is not None and started > end:
                 return False
             said = " ".join(
-                [session.cwd or "", session.project or "", session.branch or "", head["opening"]]
+                [
+                    _folder_shown(session.cwd, reach) or "",
+                    session.project or "",
+                    session.branch or "",
+                    head["opening"],
+                ]
             ).casefold()
             return all(word in said for word in words)
 
@@ -2281,7 +2300,7 @@ def list_conversations(
                 "started_at": heads[session.id]["started_at"],
                 "last_at": session.last_at,
                 "messages": heads[session.id]["messages"],
-                "folder": session.cwd,
+                "folder": _folder_shown(session.cwd, reach),
                 "app": session.app,
                 "project": session.project,
                 "branch": session.branch,
@@ -2393,7 +2412,7 @@ def read_conversation(
     page_of = listed if isinstance(listed, dict) else {}
     return {
         "id": conversation_id,
-        "folder": session.cwd if session else None,
+        "folder": _folder_shown(session.cwd if session else None, reach),
         "app": session.app if session else None,
         "total": page_of.get("total"),
         "page": page_of.get("page"),

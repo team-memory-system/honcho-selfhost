@@ -160,7 +160,7 @@ def test_a_teammate_lists_the_open_conversations_latest_first(
             "started_at": "2026-10-11T00:00:00Z",
             "last_at": "2026-10-12T03:00:00Z",
             "messages": 1,
-            "folder": "/work/web",
+            "folder": "web",
             "app": "unknown",
             "project": None,
             "branch": None,
@@ -171,7 +171,7 @@ def test_a_teammate_lists_the_open_conversations_latest_first(
             "started_at": "2026-10-01T00:00:00Z",
             "last_at": "2026-10-02T09:00:00Z",
             "messages": 2,
-            "folder": "/work/api",
+            "folder": "api",
             "app": "unknown",
             "project": "api",
             "branch": "main",
@@ -311,7 +311,7 @@ def test_a_teammate_reads_an_open_conversation_a_page_at_a_time(
 
     assert first == {
         "id": "s-old",
-        "folder": "/work/api",
+        "folder": "api",
         "app": "unknown",
         "total": 2,
         "page": 1,
@@ -449,3 +449,88 @@ def test_a_teammate_gets_numbers_hidden_and_the_owner_gets_them_as_written(
     (mine,) = server.search_messages("결제")["messages"]
     assert mine["content"] == said
     assert "masked" not in rows[-1]["arguments"]
+
+
+# -------------------------------------------------- where a conversation came from
+
+
+def test_a_teammate_reads_a_folder_by_its_name_and_the_owner_by_its_path(
+    gate: Any, three: FakeHoncho
+) -> None:
+    gate(_teammate("/work"))
+    listed = server.list_conversations()
+    assert [item["folder"] for item in listed["conversations"]] == ["web", "api"]
+    assert server.read_conversation("s-old")["folder"] == "api"
+    # `contains` matches the name a teammate reads, not the path above it.
+    assert server.list_conversations(contains="work")["total"] == 0
+    assert server.list_conversations(contains="api")["total"] == 1
+
+    gate(OWNER)
+    listed = server.list_conversations()
+    assert [item["folder"] for item in listed["conversations"]][:2] == [
+        "/private",
+        "/work/web",
+    ]
+    assert server.read_conversation("s-old")["folder"] == "/work/api"
+    assert server.list_conversations(contains="work")["total"] == 2
+
+
+def test_a_teammate_reads_no_paths_in_metadata_and_the_owner_reads_them(
+    gate: Any, honcho: FakeHoncho, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    judged: list[Any] = []
+    monkeypatch.setattr(
+        server,
+        "jev_gate",
+        SimpleNamespace(
+            judge=lambda **_: jev_gate.Verdict(allowed=True, score=0.01, reason="in scope"),
+            judge_answer=lambda **kwargs: (
+                judged.append(kwargs["result"])
+                or jev_gate.Verdict(allowed=True, score=0.0, reason="ok")
+            ),
+            MESSAGE="refused",
+        ),
+    )
+    said = {
+        **_message(OWNER_PEER, "폴더 정리하자", "2026-10-16T00:00:00Z"),
+        "session_id": "s-work",
+        "metadata": {
+            "source": "claude",
+            "claude_role": "user",
+            "direct_user": True,
+            "transcript_path": "/Users/chenjing/.claude/projects/-Users-laonpeople-dev-x/ab.jsonl",
+            "source_turn_hash": "6dc919848fe0761d7fa369363baf02cf",
+            "claude_line_index": 750,
+        },
+    }
+    honcho.add(
+        "s-work",
+        "/Users/laonpeople/dev/x",
+        [said],
+        source="claude",
+        file_path="/Users/chenjing/.claude/projects/-Users-laonpeople-dev-x/ab.jsonl",
+        original_session_id="ab",
+        project_name="x",
+    )
+    honcho.found = [said]
+
+    gate(_teammate("/Users/laonpeople"))
+    (session,) = server.list_sessions()["items"]
+    assert session["metadata"] == {"cwd": "x", "source": "claude", "project_name": "x"}
+    (message,) = server.get_session_messages("s-work", page=1, size=20)["items"]
+    assert message["metadata"] == {
+        "source": "claude",
+        "claude_role": "user",
+        "direct_user": True,
+    }
+    (found,) = server.search("폴더")
+    assert found["metadata"] == message["metadata"]
+    # Jev reads what the teammate reads: no path and no hash to mistake for a number.
+    assert judged[-1][0]["metadata"] == message["metadata"]
+
+    gate(OWNER)
+    (mine,) = server.list_sessions()["items"]
+    assert mine["metadata"]["file_path"].endswith("ab.jsonl")
+    assert mine["metadata"]["cwd"] == "/Users/laonpeople/dev/x"
+    (message,) = server.get_session_messages("s-work", page=1, size=20)["items"]
+    assert message["metadata"]["transcript_path"].endswith("ab.jsonl")

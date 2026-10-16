@@ -217,6 +217,17 @@ held to the open conversations:
   and only from open sessions; facts that combine several conversations could carry
   what is not open.
 
+What a teammate reads of where a conversation came from is cut (`provenance.py`),
+whichever tool they call: of a session's, message's, peer's or workspace's
+`metadata` only the keys in `provenance.KEPT` go out (the app and the model, who
+spoke and whether a person did, when, the project and its branch, a title), and a
+folder (`cwd`, and `folder` in `list_conversations` and `read_conversation`) goes
+out as its name alone: `agrune` for `/Users/me/dev/agrune`, `~` for a home folder,
+and `contains` matches that name. The transcript file and its line, the turn's
+hash, the ids of the originals, the computer and its account never leave the
+server. The owner reads everything as it is stored. On 2026-10-16 a teammate's
+agent rebuilt the owner's folder layout and account names from the paths alone.
+
 Each takes `question`, the teammate's own words: the audit log keeps it as the
 call's query, and the Jev gate judges it with the words searched for. Times are
 Honcho's, in UTC; a bare date is a whole UTC day. A call is refused when the open
