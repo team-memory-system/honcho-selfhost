@@ -7,7 +7,9 @@ before it is forwarded and refuses the ones that are not asking about shared wor
 Then it reads what the call found before it leaves, because a harmless question can
 still draw private matters out of the memory: a result that discloses them is
 withheld behind the same refusal, so the refusal says nothing about what the memory
-holds.
+holds. A result is read message by message (each conversation, each conclusion),
+not as one text: judged whole, a salary among ten work messages thinned out to a
+pass.
 
 It asks one of two backends:
 
@@ -30,6 +32,7 @@ import math
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,11 +68,23 @@ ANSWER_FAIL_MODE = (
 
 #: The longest query or answer judged in one piece, in characters; the team hub
 #: refuses longer ones. A longer query is refused unjudged, since padding a
-#: question past the limit must not walk it past the gate. A longer answer is
-#: judged in overlapping pieces, at most ANSWER_PIECES of them.
+#: question past the limit must not walk it past the gate. A longer item of an
+#: answer is judged in overlapping pieces; an answer longer than ANSWER_PIECES
+#: pieces in all is withheld unjudged.
 TEXT_LIMIT = 16_000
 ANSWER_OVERLAP = 400
 ANSWER_PIECES = 8
+
+#: An answer is judged item by item (units_of): each message, conversation or
+#: conclusion is its own question to Jev, ANSWER_WORKERS at a time. At most
+#: ANSWER_UNITS questions: a longer list is judged in that many groups of
+#: neighbours. Judged whole, a result of ten messages with the owner's salary in
+#: six of them passed at 0.25 and one with their tax refund at 0.24 (2026-10-16);
+#: message by message those lines scored 0.80 to 0.95 while 50 work messages all
+#: stayed under 0.7, and ten messages asked at once take as long as one (0.2 to
+#: 0.4 s) for about twice the tokens.
+ANSWER_UNITS = 50
+ANSWER_WORKERS = 8
 
 #: The team hub's guard endpoint. Set, the gate asks the hub instead of Jev.
 GUARD_URL = os.environ.get("HONCHO_JEV_GUARD_URL", "").strip() or None
@@ -98,50 +113,49 @@ GATED_TOOLS = frozenset(
 #: 0.68: with purchases, hobbies, job hunting, side work and the owner's own devices
 #: named, those questions scored 0.79 to 0.95 and the answers 0.70 to 0.81, while
 #: 31 work answers stayed under 0.7 (168 calibration items and 24 real calls).
+#: In Korean since 2026-10-17, the language of the memory, judging by the most
+#: private line: of the 20 messages that leaked that day (the owner's salary and tax
+#: refund among tax explanations), the English questions held 5 and these 12 to 13,
+#: with the 7 that carry the real figures at 0.82 to 0.95; 84 of 84 calibration
+#: answers (82 before), 30 of 32 questions (28), and 0 of 113 work texts.
 PRIVATE_LIFE = (
-    "Private life includes where someone lives or is outside work (a home address, a "
-    "neighborhood, a current location, daily routes, and shops, cafes, restaurants or "
-    "other places they went to), hobbies, leisure and daily life outside work, personal "
-    "purchases and possessions (what they bought or are choosing to buy, and the prices "
-    "they paid or compared), personal finances (own salary, debt, credit score, bank "
-    "accounts, cards and card limits, automatic transfers, bill payments and budgeting), "
-    "paid work outside the owner's job (freelancing, consulting, research for another "
-    "organization, a side business or selling products, including plans or ideas for "
-    "one), job hunting, applications or interviews with other employers and career moves, "
-    "health and medical matters, biometric data (fingerprints, face or voice data), "
-    "religion or beliefs, political views or party membership, union membership, sexual "
-    "life or orientation, family and relationships, ethnicity or origin, criminal "
-    "records, identification numbers, credentials or secrets (passwords, keys and tokens, "
-    "even in part), and the owner's own computers and home network (hardware specs, local "
-    "IP addresses, machine names, account names and folder layout)."
+    "사생활에는 이런 것이 들어간다: 사는 곳과 업무 밖에서 있는 곳(집 주소, 동네, 지금 위치, "
+    "매일 다니는 길, 다녀온 가게·카페·식당), 취미·여가·업무 밖 일상, 개인 구매와 소유물(산 "
+    "것이나 사려고 고르는 것, 낸 값이나 비교한 값), 개인 재정(본인 연봉·급여·실수령액, "
+    "연말정산·세금·환급, 빚, 신용점수, 계좌, 카드와 한도, 자동이체, 공과금, 가계부), 본업 "
+    "밖의 돈 버는 일(프리랜서, 자문, 다른 기관 연구, 부업·판매, 그 계획이나 아이디어 포함), "
+    "이직·지원·다른 회사 면접, 건강과 진료, 생체정보(지문, 얼굴, 목소리), 종교·신념, 정치 "
+    "성향·정당, 노조 가입, 성생활·성적 지향, 가족과 연애, 인종·출신, 범죄 경력, 사람을 "
+    "가리키는 번호(주민번호, 휴대폰 번호, 차량번호 같은 것), 비밀번호·키·토큰(일부라도), "
+    "주인의 개인 컴퓨터와 집 네트워크(사양, 내부 IP, 기기 이름, 계정 이름, 폴더 구조)."
 )
+
+#: What work context is, as the questions name it.
+WORK_CONTEXT = "업무 맥락(프로젝트, 코드, 결정, 업무 일정, 출장, 문서)"
 
 QUESTION = os.environ.get(
     "HONCHO_JEV_QUESTION",
-    "Is this query asking about the private life of the memory owner or another person, "
-    "or for credentials or secrets, rather than shared work context (projects, code, "
-    "decisions, work schedules, documents)? " + PRIVATE_LIFE,
+    "이 질문이 기억 주인이나 다른 사람의 사생활, 또는 비밀번호·키 같은 비밀을 묻는가? "
+    f"{WORK_CONTEXT}을 묻는 것이면 아니다. " + PRIVATE_LIFE,
 )
 
 CRITERIA: dict[str, str] = {
-    "true": "The query reaches for a person's private life as listed, or for a secret "
-    "or credential.",
-    "false": "The query is about work the team shares, or is general and harmless.",
+    "true": "질문이 위 목록의 사생활이나 비밀을 묻는다.",
+    "false": "질문이 팀이 함께하는 업무를 묻거나, 일반적이고 해가 없다.",
 }
 
 ANSWER_QUESTION = os.environ.get(
     "HONCHO_JEV_ANSWER_QUESTION",
-    "A teammate asked the memory owner's work memory a question and will read this "
-    "answer. Does the answer disclose anything about the private life of the owner or "
-    "any other person, rather than shared work context (projects, code, decisions, "
-    "work schedules, documents)? " + PRIVATE_LIFE,
+    "팀원이 이 사람의 업무 기억에 질문했고 이 답을 읽는다. 이 답에 기억 주인이나 다른 사람의 "
+    "사생활이 한 줄이라도 드러나는가? 전체 주제가 아니라 가장 사적인 문장 하나로 판단한다. "
+    "대부분이 업무여도 메시지 하나, 문장 하나가 사생활이면 드러난 것이다. "
+    f"{WORK_CONTEXT}이면 아니다. " + PRIVATE_LIFE,
 )
 
 ANSWER_CRITERIA: dict[str, str] = {
-    "true": "The answer discloses something about a person's private life as listed, "
-    "or a secret or credential.",
-    "false": "The answer only covers shared work context, such as work done, who did "
-    "it, work schedules, business trips, or is general and harmless.",
+    "true": "답에 위 목록의 사생활이나 비밀이 한 줄이라도 드러난다.",
+    "false": "답이 누가 무슨 일을 했는지, 업무 일정, 출장 같은 팀의 업무 맥락만 다루거나, "
+    "일반적이고 해가 없다.",
 }
 
 MESSAGE = os.environ.get(
@@ -285,39 +299,75 @@ def judge_answer(
 ) -> Verdict:
     """Decide whether a tool's result may go back to the teammate who asked.
 
-    Every piece of text in the result is read, however deep it is nested, so no
-    part of it leaves unjudged. A long answer is judged in overlapping pieces, and
-    the first piece refused or left unjudged decides.
+    The result is judged item by item (units_of), every item asked at once: one
+    private message among work does not thin out into a pass. Every piece of text
+    in the result is read, however deep it is nested, so no part of it leaves
+    unjudged. One refused item withholds the whole answer, with its score; else
+    one left unjudged decides; else the highest score is the answer's.
     """
     if not enabled_for(tool, teammate=teammate):
         return Verdict(allowed=True, score=None, reason="gate off")
     try:
-        answer = text_of(result)
+        texts = [text for text in map(text_of, _grouped(units_of(result))) if text.strip()]
     except Exception as exc:  # noqa: BLE001 - the gate must not crash a tool call
         return _on_failure(f"unreadable result: {type(exc).__name__}", "answer")
-    if not answer.strip():
+    if not texts:
         return Verdict(allowed=True, score=None, reason="no answer text")
+    answer = "\n".join(texts)
     held = redact.identifier(answer)
     if held:
         return Verdict(allowed=False, score=None, reason=ANSWER_HOLDS + held)
-    pieces = _pieces(answer)
-    if len(pieces) > ANSWER_PIECES:
+    if len(answer) > TEXT_LIMIT * ANSWER_PIECES:
         return Verdict(allowed=False, score=None, reason=ANSWER_TOO_LONG)
+    # A stretch of blanks says nothing, and the hub turns away a blank answer.
+    pieces = [piece for text in texts for piece in _pieces(text) if piece.strip()]
 
     state = {"tool": tool, "caller": caller, "workspace": workspace_id or ""}
     if query.strip():
         state["query"] = query[:TEXT_LIMIT]
-    highest: Verdict | None = None
-    for piece in pieces:
-        if not piece.strip():
-            # A stretch of blanks says nothing, and the hub turns away a blank answer.
-            continue
-        verdict = _ask({**state, "answer": piece}, "answer")
-        if not verdict.allowed or verdict.unjudged:
+    verdicts = _ask_each([{**state, "answer": piece} for piece in pieces], "answer")
+    refused = [verdict for verdict in verdicts if not verdict.allowed]
+    if refused:
+        return max(refused, key=lambda verdict: verdict.score or 0.0)
+    for verdict in verdicts:
+        if verdict.unjudged:
             return verdict
-        if highest is None or (verdict.score or 0.0) > (highest.score or 0.0):
-            highest = verdict
-    return highest or Verdict(allowed=True, score=None, reason="no answer text")
+    return max(verdicts, key=lambda verdict: verdict.score or 0.0)
+
+
+def units_of(result: Any) -> list[Any]:
+    """What a result is judged in: each message, conversation or conclusion alone.
+
+    A list is its items. A dict that carries one list (messages, items,
+    conversations, conclusions) is those items, then the rest of the dict as one
+    more item when it says anything, such as a folder's name. Anything else is
+    judged whole.
+    """
+    if isinstance(result, (list, tuple)):
+        return list(result)
+    if isinstance(result, dict):
+        listed = [key for key, value in result.items() if isinstance(value, (list, tuple))]
+        if len(listed) == 1:
+            key = listed[0]
+            rest = {name: value for name, value in result.items() if name != key}
+            return list(result[key]) + ([rest] if text_of(rest).strip() else [])
+    return [result]
+
+
+def _grouped(units: list[Any]) -> list[Any]:
+    """`units`, or past ANSWER_UNITS of them, that many groups of neighbours."""
+    if len(units) <= ANSWER_UNITS:
+        return units
+    size = -(-len(units) // ANSWER_UNITS)
+    return [units[start : start + size] for start in range(0, len(units), size)]
+
+
+def _ask_each(states: list[dict[str, str]], kind: str) -> list[Verdict]:
+    """One verdict per state, in order, asked ANSWER_WORKERS at a time."""
+    if len(states) <= 1 or ANSWER_WORKERS <= 1:
+        return [_ask(state, kind) for state in states]
+    with ThreadPoolExecutor(max_workers=min(ANSWER_WORKERS, len(states))) as pool:
+        return list(pool.map(lambda state: _ask(state, kind), states))
 
 
 def text_of(result: Any) -> str:

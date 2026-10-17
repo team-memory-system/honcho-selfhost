@@ -44,11 +44,13 @@ def _reset() -> Any:
     jev_gate.reset()
 
 
-def _enable(monkeypatch: pytest.MonkeyPatch, client: _FakeClient) -> None:
+def _enable(monkeypatch: pytest.MonkeyPatch, client: _FakeClient, workers: int = 1) -> None:
     monkeypatch.setattr(jev_gate, "ENABLED", True)
     monkeypatch.setattr(jev_gate, "GATED_TOOLS", frozenset({"chat"}))
     monkeypatch.setattr(jev_gate, "GUARD_URL", None)
     monkeypatch.setattr(jev_gate, "_get_client", lambda: client)
+    # One at a time unless a test is about asking at once, so calls keep their order.
+    monkeypatch.setattr(jev_gate, "ANSWER_WORKERS", workers)
 
 
 def test_the_gate_is_off_by_default() -> None:
@@ -303,26 +305,176 @@ def test_a_blank_piece_of_a_long_answer_is_not_sent(monkeypatch: pytest.MonkeyPa
     assert [call["state"]["answer"].strip() for call in client.calls] == ["배포 결과 정리"]
 
 
+class _Scoring(_FakeClient):
+    """Jev scoring each answer by the text it holds: `scores` maps a snippet to a score."""
+
+    def __init__(self, scores: dict[str, float], default: float = 0.02) -> None:
+        super().__init__()
+        self._scores = scores
+        self._default = default
+
+    def system_one(self, *, state: Any, questions: dict[str, Any]) -> Any:
+        self.calls.append({"state": state, "questions": questions})
+        score = next(
+            (score for snippet, score in self._scores.items() if snippet in state["answer"]),
+            self._default,
+        )
+        return SimpleNamespace(answers={name: _FakeAnswer(score) for name in questions})
+
+
 def test_one_refused_piece_withholds_the_whole_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scores = iter([0.02, 0.96, 0.01])
-
-    class Scoring(_FakeClient):
-        def system_one(self, *, state: Any, questions: dict[str, Any]) -> Any:
-            self.calls.append({"state": state, "questions": questions})
-            score = next(scores)
-            return SimpleNamespace(answers={name: _FakeAnswer(score) for name in questions})
-
-    client = Scoring()
+    client = _Scoring({"연봉": 0.96})
     _enable(monkeypatch, client)
-    answer = "업무 " * (jev_gate.TEXT_LIMIT // 2)
+    step = jev_gate.TEXT_LIMIT - jev_gate.ANSWER_OVERLAP
+    answer = "업무 " * (step // 2) + "연봉은 7천" + " 업무" * (step // 3)
 
     verdict = _check({"content": answer})
 
     assert verdict.allowed is False
     assert verdict.score == pytest.approx(0.96)
-    assert len(client.calls) == 2, "the first refused piece decides"
+    assert len(client.calls) == len(jev_gate._pieces(answer)) == 3, "every piece is judged"
+
+
+# --------------------------------------------------- an answer, item by item
+
+
+def _search_result() -> list[dict[str, Any]]:
+    return [
+        {"conversation_id": "s1", "speaker": "chen", "content": "결제 모듈 배포는 금요일"},
+        {"conversation_id": "s2", "speaker": "chen", "content": "내 연봉은 5,400이야"},
+        {"conversation_id": "s3", "speaker": "codex", "content": "스프린트 리뷰는 수요일"},
+    ]
+
+
+def test_a_result_is_judged_message_by_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(noul=0.04)
+    _enable(monkeypatch, client)
+
+    verdict = _check(_search_result())
+
+    assert verdict.allowed is True
+    assert verdict.score == pytest.approx(0.04)
+    assert [call["state"]["answer"] for call in client.calls] == [
+        jev_gate.text_of(message) for message in _search_result()
+    ]
+    assert all(call["state"]["query"] == "지난주 배포 어땠어?" for call in client.calls)
+
+
+def test_a_private_message_among_work_withholds_the_answer_with_its_score(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Judged whole, the salary thinned out among work messages and passed."""
+    client = _Scoring({"연봉": 0.91, "스프린트": 0.3})
+    _enable(monkeypatch, client)
+
+    verdict = _check(_search_result())
+
+    assert verdict.allowed is False
+    assert verdict.score == pytest.approx(0.91)
+    assert verdict.reason == jev_gate.ANSWER_REFUSED
+    assert len(client.calls) == 3, "every message is judged, in one round"
+
+
+def test_a_dict_with_one_list_is_judged_by_its_items_and_then_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(noul=0.05)
+    _enable(monkeypatch, client)
+
+    read = {
+        "folder": "agrune",
+        "app": "codex",
+        "total": 2,
+        "newest_first": False,
+        "messages": [{"content": "배포 메모"}, {"content": "회의 일정"}],
+    }
+    assert _check(read).allowed is True
+    assert [call["state"]["answer"] for call in client.calls] == [
+        "배포 메모",
+        "회의 일정",
+        "agrune\ncodex",
+    ]
+
+    client.calls.clear()
+    listed = {"items": [{"id": "s1", "cwd": "~"}, {"id": "s2", "cwd": "agrune"}], "total": 2}
+    assert _check(listed).allowed is True
+    assert [call["state"]["answer"] for call in client.calls] == ["s1\n~", "s2\nagrune"]
+
+    assert jev_gate.units_of("그대로") == ["그대로"]
+    assert jev_gate.units_of({"a": [1], "b": [2]}) == [{"a": [1], "b": [2]}]
+    assert jev_gate.units_of({"content": "x", "evidence": {"messages": ["y"]}}) == [
+        {"content": "x", "evidence": {"messages": ["y"]}}
+    ]
+
+
+def test_a_long_list_is_judged_in_groups_of_neighbours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(noul=0.01)
+    _enable(monkeypatch, client)
+    monkeypatch.setattr(jev_gate, "ANSWER_UNITS", 4)
+    messages = [{"content": f"메시지 {index}"} for index in range(10)]
+
+    assert _check(messages).allowed is True
+
+    asked = [call["state"]["answer"] for call in client.calls]
+    assert asked == [
+        "메시지 0\n메시지 1\n메시지 2",
+        "메시지 3\n메시지 4\n메시지 5",
+        "메시지 6\n메시지 7\n메시지 8",
+        "메시지 9",
+    ]
+
+
+def test_messages_are_asked_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    class Slow(_FakeClient):
+        def system_one(self, *, state: Any, questions: dict[str, Any]) -> Any:
+            time.sleep(0.15)
+            return super().system_one(state=state, questions=questions)
+
+    client = Slow(noul=0.02)
+    _enable(monkeypatch, client, workers=8)
+    messages = [{"content": f"메시지 {index}"} for index in range(8)]
+
+    started = time.monotonic()
+    verdict = _check(messages)
+    elapsed = time.monotonic() - started
+
+    assert verdict.allowed is True
+    assert len(client.calls) == 8
+    assert elapsed < 0.15 * 4, f"eight messages took {elapsed:.2f}s one after another"
+
+
+def test_a_message_jev_cannot_judge_withholds_the_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typesafe_sdk import TypeSafeAPIConnectionError
+
+    class Flaky(_FakeClient):
+        def system_one(self, *, state: Any, questions: dict[str, Any]) -> Any:
+            if "연봉" in state["answer"]:
+                self.calls.append({"state": state, "questions": questions})
+                raise TypeSafeAPIConnectionError("no route")
+            return super().system_one(state=state, questions=questions)
+
+    client = Flaky(noul=0.02)
+    _enable(monkeypatch, client)
+    assert jev_gate.ANSWER_FAIL_MODE == "closed"
+
+    verdict = _check(_search_result())
+
+    assert verdict.allowed is False
+    assert verdict.failed is True
+    assert len(client.calls) == 3
+
+    monkeypatch.setattr(jev_gate, "ANSWER_FAIL_MODE", "open")
+    let_through = _check(_search_result())
+    assert let_through.allowed is True
+    assert let_through.unjudged is True
 
 
 def test_an_answer_too_long_to_judge_is_withheld(monkeypatch: pytest.MonkeyPatch) -> None:
