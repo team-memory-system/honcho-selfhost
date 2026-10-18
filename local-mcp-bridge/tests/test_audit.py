@@ -41,12 +41,13 @@ def test_record_keeps_the_query_text_verbatim(monkeypatch: pytest.MonkeyPatch) -
         duration_ms=12,
         jev_score=0.91,
         answer_score=0.04,
+        jev_model="jev-1.13.0",
     )
 
     assert len(rows) == 1
     (
         _bridge, caller, source, tool, ws, query, args_json, status, error, ms, score,
-        answer_score,
+        answer_score, model,
     ) = rows[0]
     assert tool == "chat"
     assert caller == "teammate@example.com"
@@ -59,15 +60,22 @@ def test_record_keeps_the_query_text_verbatim(monkeypatch: pytest.MonkeyPatch) -
     assert ms == 12
     assert score == pytest.approx(0.91)
     assert answer_score == pytest.approx(0.04)
+    assert model == "jev-1.13.0"
 
 
 def test_the_answer_score_is_a_column_an_older_log_gains() -> None:
     """A table made before answers were judged has no answer_score; the DDL run on
     every connection adds it, so the insert does not fail on an older log."""
     assert "ADD COLUMN IF NOT EXISTS answer_score" in audit._DDL
-    assert audit._INSERT.count("%s") == 12
-    assert audit._COLUMNS[-1] == "answer_score"
+    assert audit._INSERT.count("%s") == 13
+    assert audit._COLUMNS[-2:] == ("answer_score", "jev_model")
     assert "answer_score" in audit._SELECT
+
+
+def test_the_jev_version_is_a_column_an_older_log_gains() -> None:
+    """A table made before the version that judged was kept gains it in place."""
+    assert "ADD COLUMN IF NOT EXISTS jev_model text" in audit._DDL
+    assert "jev_model" in audit._SELECT
 
 
 def test_query_text_can_be_withheld(monkeypatch: pytest.MonkeyPatch) -> None:

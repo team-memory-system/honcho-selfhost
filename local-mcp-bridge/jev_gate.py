@@ -51,7 +51,11 @@ def _flag(name: str, *, default: bool = False) -> bool:
 
 
 ENABLED = _flag("HONCHO_JEV_GATE")
-MODEL = os.environ.get("HONCHO_JEV_MODEL", "").strip() or None
+#: The Jev version asked when the bridge asks Jev itself. A version, not the
+#: jev-latest alias, which moves when TypeSafe ships a new Jev: the threshold and
+#: questions were measured on 1.13, and on 1.14 the same questions refuse far more
+#: work. The team hub asks the same version.
+MODEL = os.environ.get("HONCHO_JEV_MODEL", "").strip() or "jev-1.13.0"
 TIMEOUT_SECONDS = float(os.environ.get("HONCHO_JEV_TIMEOUT", "10"))
 
 #: Refuse at or above this probability that the query is out of scope.
@@ -201,7 +205,8 @@ class Verdict:
     whichever way the fail mode then decided. `no_key` is True when the hub let the
     call through without asking Jev because the team has no Jev key. `skipped` is
     True when an answer went out unjudged because the team hub does not judge
-    answers yet.
+    answers yet. `model` is the Jev version that judged, as Jev or the hub names
+    it, and None when none did or none was named.
     """
 
     allowed: bool
@@ -210,6 +215,7 @@ class Verdict:
     failed: bool = False
     no_key: bool = False
     skipped: bool = False
+    model: str | None = None
 
     @property
     def unjudged(self) -> bool:
@@ -227,9 +233,7 @@ def _get_client() -> Any:
         if _client is None:
             from typesafe_sdk import TypeSafeClient
 
-            kwargs: dict[str, Any] = {"timeout": TIMEOUT_SECONDS}
-            if MODEL:
-                kwargs["model"] = MODEL
+            kwargs: dict[str, Any] = {"timeout": TIMEOUT_SECONDS, "model": MODEL}
             _client = TypeSafeClient(**kwargs)
         return _client
 
@@ -426,20 +430,26 @@ def _ask_jev(state: dict[str, str], kind: str) -> Verdict:
             questions={name: Noul(instructions=question, criteria=criteria)},
         )
         score = float(dict(response.answers)[name].noul)
+        model = _model_named(getattr(response, "model", None))
     except TypeSafeError as exc:
         return _on_failure(f"{type(exc).__name__}: {exc}", kind)
     except Exception as exc:  # noqa: BLE001 - the gate must not crash a tool call
         return _on_failure(f"{type(exc).__name__}: {exc}", kind)
 
-    return _decided(score >= THRESHOLD, score, kind)
+    return _decided(score >= THRESHOLD, score, kind, model)
 
 
-def _decided(refused: bool, score: float, kind: str) -> Verdict:
+def _model_named(value: Any) -> str | None:
+    """The Jev version an answer names, or None when it names none."""
+    return value[:64] if isinstance(value, str) and value else None
+
+
+def _decided(refused: bool, score: float, kind: str, model: str | None = None) -> Verdict:
     if kind == "answer":
         reason = ANSWER_REFUSED if refused else "answer in scope"
     else:
         reason = "out of scope" if refused else "in scope"
-    return Verdict(allowed=not refused, score=score, reason=reason)
+    return Verdict(allowed=not refused, score=score, reason=reason, model=model)
 
 
 def _ask_team_guard(url: str, state: dict[str, str], kind: str = "query") -> Verdict:
@@ -492,7 +502,7 @@ def _ask_team_guard(url: str, state: dict[str, str], kind: str = "query") -> Ver
         # the answer, so its verdict says nothing about what is about to go out.
         return Verdict(allowed=True, score=None, reason=ANSWER_SKIPPED, skipped=True)
 
-    return _decided(not allowed, float(score), kind)
+    return _decided(not allowed, float(score), kind, _model_named(answer.get("model")))
 
 
 def _error_code(response: httpx.Response) -> str:

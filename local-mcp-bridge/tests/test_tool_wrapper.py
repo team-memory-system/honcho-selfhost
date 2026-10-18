@@ -481,8 +481,8 @@ def test_the_answer_judged_is_what_honcho_gave_for_that_question(
     answer = {"content": "배포는 금요일에 했습니다.", "evidence": None}
     monkeypatch.setattr(server, "_request", lambda *args, **kwargs: answer)
     gate, asked = _gate(
-        jev_gate.Verdict(allowed=True, score=0.02, reason="in scope"),
-        jev_gate.Verdict(allowed=True, score=0.05, reason="answer in scope"),
+        jev_gate.Verdict(allowed=True, score=0.02, reason="in scope", model="jev-1.13.0"),
+        jev_gate.Verdict(allowed=True, score=0.05, reason="answer in scope", model="jev-1.13.0"),
     )
     monkeypatch.setattr(server, "jev_gate", gate)
     _no_request(monkeypatch)
@@ -496,6 +496,7 @@ def test_the_answer_judged_is_what_honcho_gave_for_that_question(
     assert audited[0]["error"] is None
     assert audited[0]["jev_score"] == pytest.approx(0.02)
     assert audited[0]["answer_score"] == pytest.approx(0.05)
+    assert audited[0]["jev_model"] == "jev-1.13.0"
 
 
 def test_a_refused_query_or_a_failed_call_has_no_answer_to_judge(

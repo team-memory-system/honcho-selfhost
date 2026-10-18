@@ -30,7 +30,8 @@ class _FakeClient:
             raise self._error
         # Jev answers every question it is asked, under the name it was asked by.
         return SimpleNamespace(
-            answers={name: _FakeAnswer(self._noul) for name in questions}
+            answers={name: _FakeAnswer(self._noul) for name in questions},
+            model="jev-1.13.0",
         )
 
     def close(self) -> None:
@@ -92,6 +93,28 @@ def test_a_work_query_passes(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert verdict.allowed is True
     assert verdict.score == pytest.approx(0.05)
+
+
+def test_jev_is_asked_by_its_version_not_the_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    """jev-latest moves when TypeSafe ships a new Jev; the threshold was measured on 1.13."""
+    made: dict[str, Any] = {}
+
+    class _Client:
+        def __init__(self, **kwargs: Any) -> None:
+            made.update(kwargs)
+
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", SimpleNamespace(TypeSafeClient=_Client))
+    jev_gate._get_client()
+    assert jev_gate.MODEL == "jev-1.13.0"
+    assert made["model"] == "jev-1.13.0"
+
+
+def test_the_version_that_answered_goes_with_the_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, _FakeClient(noul=0.1))
+    verdict = jev_gate.judge(tool="chat", query="지난주 배포", caller="t", workspace_id="w")
+    assert (verdict.allowed, verdict.model) == (True, "jev-1.13.0")
 
 
 def test_the_threshold_is_inclusive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -639,6 +662,21 @@ def test_the_hub_allowing_a_query_lets_it_through(
     assert verdict.score == pytest.approx(0.12)
     assert verdict.reason == "in scope"
     assert verdict.failed is False
+
+
+def test_the_version_the_hub_names_goes_with_the_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _hub(
+        monkeypatch,
+        _answer(judged=True, allowed=True, score=0.1, threshold=0.7, model="jev-1.13.0"),
+    )
+    assert _ask().model == "jev-1.13.0"
+    jev_gate.reset()
+    # A hub from before it named the version: the verdict stands, with no version.
+    _hub(monkeypatch, _answer(judged=True, allowed=True, score=0.1, threshold=0.7))
+    verdict = _ask()
+    assert (verdict.allowed, verdict.model) == (True, None)
 
 
 def test_the_hub_refusing_a_query_refuses_it(monkeypatch: pytest.MonkeyPatch) -> None:

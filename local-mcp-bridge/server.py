@@ -464,6 +464,7 @@ def register_tool(*, name: str):
                         error=verdict.reason,
                         duration_ms=elapsed_ms(),
                         jev_score=verdict.score,
+                        jev_model=verdict.model,
                     )
                     raise RuntimeError(jev_gate.MESSAGE)
 
@@ -485,6 +486,7 @@ def register_tool(*, name: str):
                         error=f"{failure}; {unjudged}" if unjudged else failure,
                         duration_ms=elapsed_ms(),
                         jev_score=verdict.score,
+                        jev_model=verdict.model,
                     )
                     raise
 
@@ -525,6 +527,7 @@ def register_tool(*, name: str):
                         duration_ms=elapsed_ms(),
                         jev_score=verdict.score,
                         answer_score=checked.score,
+                        jev_model=checked.model or verdict.model,
                     )
                     raise RuntimeError(jev_gate.MESSAGE)
                 audit.record(
@@ -538,6 +541,7 @@ def register_tool(*, name: str):
                     duration_ms=elapsed_ms(),
                     jev_score=verdict.score,
                     answer_score=checked.score,
+                    jev_model=checked.model or verdict.model,
                 )
                 return result
             finally:

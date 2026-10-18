@@ -66,7 +66,10 @@ itself through `typesafe_sdk` with `TYPESAFE_API_KEY`, imported on first use.
 Either way the gate reads the whole query, not the audit log's 8000-character
 copy, `HONCHO_JEV_FAIL_MODE` decides whether an outage, or a refusal of the
 token, forwards the query or refuses it, and a query forwarded without a judgment
-keeps the reason on its audit row. A query longer than 16,000 characters, which
+keeps the reason on its audit row. Called directly, Jev is asked as `jev-1.13.0`
+(`HONCHO_JEV_MODEL` to change it), a version and not the `jev-latest` alias,
+which moves when TypeSafe ships a new Jev: the threshold and questions were
+measured on 1.13, and the hub asks the same one. A query longer than 16,000 characters, which
 the hub would not take, is refused unjudged, so padding cannot walk it past the
 gate.
 
@@ -79,7 +82,8 @@ refusal does not say the memory held anything. `HONCHO_JEV_ANSWER_FAIL_MODE`
 (closed unless set) decides what an outage does to an answer. A hub that does not
 answer `checked: "answer"` predates answer checks; the answer then goes out
 unjudged and its row says so. The audit row keeps both scores, `jev_score` for the
-query and `answer_score` for the answer.
+query and `answer_score` for the answer, and `jev_model`, the Jev version that
+judged, as Jev or the hub names it.
 
 The owner can try the gate from the dashboard. `POST /api/dashboard/guard-trial`
 goes to the bridge's `POST /guard-trial`, beside `/audit`, with the same token and
