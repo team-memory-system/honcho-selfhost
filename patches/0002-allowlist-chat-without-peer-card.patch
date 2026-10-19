@@ -31,7 +31,7 @@ index 16e8df6..4735042 100644
                  db, workspace_name, observer=observer, observed=observer
              )
 diff --git a/src/dialectic/core.py b/src/dialectic/core.py
-index 4b4540f..c1a440d 100644
+index 4b4540f..85b0dec 100644
 --- a/src/dialectic/core.py
 +++ b/src/dialectic/core.py
 @@ -39,6 +39,7 @@ from src.telemetry.logging import (
@@ -42,38 +42,39 @@ index 4b4540f..c1a440d 100644
      DIALECTIC_TOOLS,
      DIALECTIC_TOOLS_MINIMAL,
      create_tool_executor,
-@@ -397,6 +398,12 @@ class DialecticAgent:
+@@ -397,6 +398,15 @@ class DialecticAgent:
      async def _create_tool_executor(self) -> Callable[[str, dict[str, Any]], Any]:
          """Build the tool executor. Subclasses override to change tool scoping
          (e.g. WorkspaceDialecticAgent uses the workspace executor)."""
 +        # The default lookup runs any name in the shared handler table, offered
 +        # or not, and the tool loop passes on whatever name the model emits.
-+        # Some of those handlers ignore an allowlist (get_recent_observations,
-+        # get_most_derived_observations, extract_preferences), so under one only
-+        # the pair loadout runs: each of its handlers honors it or refuses.
-+        pair_tools = {tool.get("name") for tool in DIALECTIC_TOOLS}
++        # That table holds writes (update_peer_card, delete_observations,
++        # create_observations*) and reads that ignore an allowlist
++        # (get_recent_observations, get_most_derived_observations,
++        # extract_preferences), so only the tools offered to the model run,
++        # with or without an allowlist: a question can steer the model, and
++        # chat only reads. Each offered handler honors an allowlist.
++        offered = {tool.get("name") for tool in self._select_tools()}
          return await create_tool_executor(
              workspace_name=self.workspace_name,
              session_name=self.session_name,
-@@ -408,6 +415,11 @@ class DialecticAgent:
+@@ -408,6 +418,9 @@ class DialecticAgent:
              agent_type="dialectic",
              parent_category="dialectic",
              evidence=self.evidence,
 +            handler_resolver=(
-+                lambda name: _TOOL_HANDLERS.get(name) if name in pair_tools else None
-+            )
-+            if self.session_allowlist is not None
-+            else None,
++                lambda name: _TOOL_HANDLERS.get(name) if name in offered else None
++            ),
          )
  
      def _prefetch_heading(self) -> str:
 diff --git a/tests/dialectic/test_allowlist_confinement.py b/tests/dialectic/test_allowlist_confinement.py
 new file mode 100644
-index 0000000..115d8de
+index 0000000..6ecd6fe
 --- /dev/null
 +++ b/tests/dialectic/test_allowlist_confinement.py
-@@ -0,0 +1,300 @@
-+"""What a session allowlist keeps out of the pair dialectic.
+@@ -0,0 +1,346 @@
++"""What a session allowlist keeps out of the pair dialectic, and what no chat runs.
 +
 +A peer card is one aggregate over every session its observer has seen, with no
 +session dimension, so under an allowlist the chat entry points must neither read
@@ -81,9 +82,11 @@ index 0000000..115d8de
 +(`mock_llm_call_functions` in tests/conftest.py), so these call the entry points
 +directly, as tests/dialectic/test_scope_preflight.py does.
 +
-+The allowlist bounds the tools as well: the tool loop hands the executor any name
-+the model emits, so the executor must not run a handler outside the pair loadout,
-+several of which ignore the allowlist.
++The tools are bounded with or without an allowlist: the tool loop hands the
++executor any name the model emits, and the shared handler table holds writes and
++reads that ignore the allowlist, so the executor runs only the tools offered to
++the model. Chat is a read, whoever asks; a question that talks the model into a
++write must change nothing.
 +"""
 +
 +from collections.abc import AsyncIterator, Callable, Mapping
@@ -96,7 +99,7 @@ index 0000000..115d8de
 +from sqlalchemy.ext.asyncio import AsyncSession
 +
 +from src import crud, models, schemas
-+from src.config import settings
++from src.config import ReasoningLevel, settings
 +from src.dialectic.chat import agentic_chat, agentic_chat_stream
 +from src.dialectic.core import DialecticAgent
 +from src.llm import (
@@ -156,17 +159,16 @@ index 0000000..115d8de
 +        )
 +    )
 +    await db_session.flush()
-+    db_session.add(
-+        models.Document(
-+            workspace_name=workspace.name,
-+            observer=observer.name,
-+            observed=observed.name,
-+            content=OUTSIDER,
-+            embedding=[0.1] * 1536,
-+            session_name=outside.name,
-+            level="deductive",
-+        )
++    conclusion = models.Document(
++        workspace_name=workspace.name,
++        observer=observer.name,
++        observed=observed.name,
++        content=OUTSIDER,
++        embedding=[0.1] * 1536,
++        session_name=outside.name,
++        level="deductive",
 +    )
++    db_session.add(conclusion)
 +    await db_session.commit()
 +
 +    for card, subject in (
@@ -182,6 +184,7 @@ index 0000000..115d8de
 +        observer=observer.name,
 +        observed=observed.name,
 +        inside=inside.name,
++        conclusion=conclusion.id,
 +    )
 +
 +
@@ -310,7 +313,9 @@ index 0000000..115d8de
 +
 +
 +async def executor_handed_to_the_model(
-+    pair: SimpleNamespace, session_allowlist: list[str] | None
++    pair: SimpleNamespace,
++    session_allowlist: list[str] | None,
++    reasoning_level: ReasoningLevel = "low",
 +) -> Callable[[str, dict[str, Any]], Any]:
 +    """The tool executor a real agent passes to the tool loop."""
 +    agent = DialecticAgent(
@@ -319,6 +324,7 @@ index 0000000..115d8de
 +        observer=pair.observer,
 +        observed=pair.observed,
 +        session_allowlist=session_allowlist,
++        reasoning_level=reasoning_level,
 +    )
 +    llm_call = AsyncMock(return_value=llm_response())
 +    with patch("src.dialectic.core.honcho_llm_call", new=llm_call):
@@ -339,37 +345,78 @@ index 0000000..115d8de
 +    "get_peer_card",
 +)
 +
++SCOPES = pytest.mark.parametrize(
++    "scoped", [True, False], ids=["allowlist", "no-allowlist"]
++)
++
 +
 +@pytest.mark.asyncio
-+async def test_allowlisted_executor_refuses_tools_outside_the_pair_loadout(
-+    pair: SimpleNamespace,
++@SCOPES
++async def test_executor_refuses_tools_the_model_was_not_offered(
++    pair: SimpleNamespace, scoped: bool
 +):
-+    executor = await executor_handed_to_the_model(pair, [pair.inside])
++    executor = await executor_handed_to_the_model(
++        pair, [pair.inside] if scoped else None
++    )
 +
 +    for name in UNOFFERED_TOOLS:
 +        assert await executor(name, {}) == f"Unknown tool: {name}"
 +
 +
 +@pytest.mark.asyncio
-+async def test_allowlisted_executor_still_runs_the_pair_loadout(
-+    pair: SimpleNamespace,
++@SCOPES
++async def test_a_write_the_model_was_not_offered_changes_nothing(
++    pair: SimpleNamespace, db_session: AsyncSession, scoped: bool
 +):
-+    """Its handlers honor the allowlist, or refuse with their own explanation."""
-+    executor = await executor_handed_to_the_model(pair, [pair.inside])
++    """Each write is handed what it would act on: an entry of the card's form,
++    and the id of a conclusion the observer holds."""
++    executor = await executor_handed_to_the_model(
++        pair, [pair.inside] if scoped else None
++    )
 +
-+    chain = await executor("get_reasoning_chain", {"observation_id": "any"})
-+    assert chain.startswith("Reasoning-chain traversal is unavailable")
-+    recalled = await executor("search_memory", {"query": "job offer"})
-+    assert not recalled.startswith("Unknown tool")
-+    assert OUTSIDER not in recalled
++    await executor("update_peer_card", {"content": ["IDENTITY: Someone else"]})
++    await executor("delete_observations", {"observation_ids": [pair.conclusion]})
++
++    db_session.expire_all()
++    card = await crud.get_peer_card(
++        db_session, pair.workspace, observer=pair.observer, observed=pair.observed
++    )
++    conclusion = await db_session.get(models.Document, pair.conclusion)
++    assert conclusion is not None
++    assert (card, conclusion.deleted_at) == (OBSERVED_CARD, None)
 +
 +
 +@pytest.mark.asyncio
-+async def test_executor_without_allowlist_keeps_the_whole_handler_table(
++async def test_minimal_reasoning_runs_only_its_own_tools(pair: SimpleNamespace):
++    """What runs is what this query offered, not the whole pair loadout."""
++    executor = await executor_handed_to_the_model(pair, None, reasoning_level="minimal")
++
++    assert await executor("grep_messages", {}) == "Unknown tool: grep_messages"
++    assert OUTSIDER in await executor("search_memory", {"query": "job offer"})
++
++
++@pytest.mark.asyncio
++async def test_allowlisted_executor_still_runs_the_pair_loadout(
 +    pair: SimpleNamespace,
 +):
-+    """Unscoped dispatch is upstream's. It is also the read an allowlisted
-+    executor must refuse: this handler takes no allowlist."""
++    """Its handlers honor the allowlist. get_reasoning_chain, which cannot be
++    scoped, is not offered under one, so it does not run either."""
++    executor = await executor_handed_to_the_model(pair, [pair.inside])
++
++    recalled = await executor("search_memory", {"query": "job offer"})
++    assert not recalled.startswith("Unknown tool")
++    assert OUTSIDER not in recalled
++    chain = await executor("get_reasoning_chain", {"observation_id": "any"})
++    assert chain == "Unknown tool: get_reasoning_chain"
++
++
++@pytest.mark.asyncio
++async def test_executor_without_allowlist_reads_the_whole_memory(
++    pair: SimpleNamespace,
++):
++    """Unscoped, the offered tools read every session, as upstream's do."""
 +    executor = await executor_handed_to_the_model(pair, None)
 +
-+    assert OUTSIDER in await executor("get_most_derived_observations", {})
++    assert OUTSIDER in await executor("search_memory", {"query": "job offer"})
++    chain = await executor("get_reasoning_chain", {"observation_id": pair.conclusion})
++    assert not chain.startswith("Unknown tool")
