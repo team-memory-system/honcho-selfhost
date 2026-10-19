@@ -107,6 +107,15 @@ judged as a teammate's, then the answer the owner wrote or what a teammate's sea
 for it finds in the conversations in the given folders, judged as what a teammate
 reads, with nothing recorded.
 
+A teammate reads each message without what Claude Code and Codex put into a
+person's turn (`inserted.said`): the CLAUDE.md and AGENTS.md files, reminders, word
+of a finished task, environment blocks and what a command printed are cut out
+before a message is cut to `SEARCH_MESSAGE_CHARS` or `READ_MESSAGE_CHARS`, and a
+turn an app wrote whole (a compact summary, a skill's instructions, another
+session's message, a tool's result) does not come at all. The collector has left
+Codex's text out since 2026-10-05 and Claude Code's since team-memory 0.8.15; what
+it stored before stays in the memory, and the owner reads it as stored.
+
 ## Open items an agent should know about
 
 - **Auth is off.** `AUTH_USE_AUTH=false`, so `upstream/honcho/src/security.py` returns admin for every

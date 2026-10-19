@@ -534,3 +534,60 @@ def test_a_teammate_reads_no_paths_in_metadata_and_the_owner_reads_them(
     assert mine["metadata"]["cwd"] == "/Users/laonpeople/dev/x"
     (message,) = server.get_session_messages("s-work", page=1, size=20)["items"]
     assert message["metadata"]["transcript_path"].endswith("ab.jsonl")
+
+
+# ------------------------------------------------- what an app put into a turn
+
+
+def test_a_teammate_reads_the_owners_words_without_what_an_app_put_in(
+    gate: Any, honcho: FakeHoncho, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reminder = (
+        "<system-reminder>\nContents of /Users/me/.claude/CLAUDE.md:\n"
+        "- This machine is the user's home computer.\n</system-reminder>"
+    )
+    summary = "This session is being continued from a previous conversation that ran out of context."
+    messages = [
+        _message(OWNER_PEER, f"{reminder}\n\n{summary}", "2026-10-19T00:00:00Z"),
+        _message(
+            OWNER_PEER, f"{reminder}\n\nAPI 응답이 느려요", "2026-10-19T00:00:05Z"
+        ),
+        _message("assistant_claude", "캐시를 보겠습니다.", "2026-10-19T00:00:09Z"),
+    ]
+    honcho.add("s-work", "/work/api", messages, last_turn_at="2026-10-19T00:00:09Z")
+    honcho.found = [{**message, "session_id": "s-work"} for message in messages]
+    answer = honcho.__call__
+
+    def with_context(
+        method: str, path: str, *, body: Any = None, params: Any = None
+    ) -> Any:
+        if path.endswith("/context"):
+            return {"id": "s-work", "messages": messages, "summary": None}
+        return answer(method, path, body=body, params=params)
+
+    monkeypatch.setattr(server, "_honcho", with_context)
+    words = ["API 응답이 느려요", "캐시를 보겠습니다."]
+
+    gate(_teammate("/work"))
+    (listed,) = server.list_conversations()["conversations"]
+    assert listed["opening"] == "API 응답이 느려요"
+    assert [found["content"] for found in server.search("API")] == words
+    page = server.get_session_messages("s-work", page=1, size=20)
+    assert [message["content"] for message in page["items"]] == words
+    context = server.get_session_context("s-work")
+    assert [message["content"] for message in context["messages"]] == words
+    assert [
+        found["content"] for found in server.search_messages("API")["messages"]
+    ] == words
+    assert [
+        said["content"] for said in server.read_conversation("s-work")["messages"]
+    ] == words
+
+    gate(OWNER)
+    page = server.get_session_messages("s-work", page=1, size=20)
+    assert [message["content"] for message in page["items"]] == [
+        m["content"] for m in messages
+    ]
+    assert [found["content"] for found in server.search("API")] == [
+        m["content"] for m in messages
+    ]

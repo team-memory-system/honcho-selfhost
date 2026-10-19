@@ -23,6 +23,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_request
 
 import audit
+import inserted
 import jev_gate
 import provenance
 import redact
@@ -1322,18 +1323,23 @@ def _held(*filters: dict[str, Any] | None) -> dict[str, Any] | None:
     return parts[0] if len(parts) == 1 else {"AND": parts}
 
 
-def _clipped(answer: Any, size: int) -> Any:
-    """Messages as a teammate gets them: each one's content cut to `size`.
+def _clipped(answer: Any, size: int | None) -> Any:
+    """Messages as a teammate gets them: what each says (inserted.said), cut to `size`.
 
     A long conversation read whole could outgrow what the Jev gate reads of an
     answer, which withholds it; cut, it stays readable and says how much is left.
+    What an app put into a turn goes before the cut, so the person's words after it
+    stay, and a message that held nothing else is left out.
     """
     if isinstance(answer, dict) and isinstance(answer.get("items"), list):
         return {**answer, "items": _clipped(answer["items"], size)}
     if isinstance(answer, list):
-        return [_clipped(item, size) for item in answer]
+        clipped = [_clipped(item, size) for item in answer]
+        return [
+            item for item in clipped if not (isinstance(item, dict) and item.get("content") == "")
+        ]
     if isinstance(answer, dict) and isinstance(answer.get("content"), str):
-        return {**answer, "content": _clip(answer["content"], size)}
+        return {**answer, "content": _clip(inserted.said(answer), size)}
     return answer
 
 
@@ -1915,9 +1921,15 @@ def get_session_context(
             "max_conclusions": _clamp(max_conclusions, 1, 100),
         }
     )
-    return _request(
+    context = _request(
         "GET", f"/v3/workspaces/{ws}/sessions/{session_id}/context", params=params
     )
+    messages = context.get("messages") if isinstance(context, dict) else None
+    if reach is None or not isinstance(messages, list):
+        return context
+    # What each message says, as it says it in a read, uncut: the context is held to
+    # its tokens already.
+    return {**context, "messages": _clipped(messages, None)}
 
 
 @register_tool(name="list_conclusions")
@@ -2101,9 +2113,9 @@ _EPOCH = datetime.min.replace(tzinfo=UTC)
 _DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
-def _clip(text: Any, size: int) -> str:
+def _clip(text: Any, size: int | None) -> str:
     flat = "" if text is None else str(text)
-    if len(flat) <= size:
+    if size is None or len(flat) <= size:
         return flat
     return f"{flat[:size]} …[{len(flat) - size} more characters]"
 
@@ -2161,12 +2173,16 @@ def _items(answer: Any) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
 
-def _said(item: dict[str, Any], size: int) -> dict[str, Any]:
-    """One message as a teammate reads it: when, who, and what, cut to `size`."""
+def _said(item: dict[str, Any], size: int) -> dict[str, Any] | None:
+    """One message as a teammate reads it: when, who, and what it says
+    (inserted.said), cut to `size`; None for one that held only what an app put in."""
+    content = inserted.said(item)
+    if not content:
+        return None
     return {
         "at": item.get("created_at"),
         "speaker": item.get("peer_id"),
-        "content": _clip(item.get("content"), size),
+        "content": _clip(content, size),
     }
 
 
@@ -2206,15 +2222,15 @@ def _conversation_head(
         logger.warning("conversation start not read: %s", type(exc).__name__)
         return {"started_at": None, "messages": None, "opening": ""}
     items = _items(page)
-    opening = next((item for item in items if item.get("peer_id") == owner), None)
-    opening = opening or (items[0] if items else None)
+    # The owner's first words, past what an app put in front of them (inserted.said).
+    said = [(item.get("peer_id"), inserted.said(item)) for item in items]
+    opening = next((text for peer, text in said if text and peer == owner), None)
+    opening = opening or next((text for _, text in said if text), "")
     total = page.get("total") if isinstance(page, dict) else None
     head = {
         "started_at": items[0].get("created_at") if items else None,
         "messages": total if isinstance(total, int) else None,
-        "opening": _clip(" ".join(str(opening.get("content") or "").split()), OPENING_CHARS)
-        if opening
-        else "",
+        "opening": _clip(" ".join(opening.split()), OPENING_CHARS),
     }
     with _heads_lock:
         if len(_heads) >= MAX_KEPT_HEADS:
@@ -2371,11 +2387,9 @@ def search_messages(
     found = _scoped_items(None if conversation_id else _reach_sessions(reach), ask, size)
     return {
         "messages": [
-            {
-                "conversation_id": item.get("session_id"),
-                **_said(item, SEARCH_MESSAGE_CHARS),
-            }
+            {"conversation_id": item.get("session_id"), **said}
             for item in found
+            if (said := _said(item, SEARCH_MESSAGE_CHARS))
         ]
     }
 
@@ -2422,7 +2436,9 @@ def read_conversation(
         "page": page_of.get("page"),
         "pages": page_of.get("pages"),
         "newest_first": bool(newest_first),
-        "messages": [_said(item, READ_MESSAGE_CHARS) for item in _items(listed)],
+        "messages": [
+            said for item in _items(listed) if (said := _said(item, READ_MESSAGE_CHARS))
+        ],
     }
 
 
@@ -2580,8 +2596,9 @@ def guard_trial(
         except (RuntimeError, httpx.HTTPError, TypeError, ValueError) as exc:
             return {**trial, "outcome": "no_answer", "error": str(exc) or type(exc).__name__}
         found = [
-            {"conversation_id": item.get("session_id"), **_said(item, SEARCH_MESSAGE_CHARS)}
+            {"conversation_id": item.get("session_id"), **said}
             for item in searched
+            if (said := _said(item, SEARCH_MESSAGE_CHARS))
         ]
         result = {"messages": found}
     else:

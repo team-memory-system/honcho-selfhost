@@ -10,7 +10,7 @@ COPY pyproject.toml uv.lock ./
 # HONCHO_JEV_GUARD_URL, so the gate can be switched on with an environment variable
 # instead of a rebuild.
 RUN uv sync --frozen --no-group dev --extra jev
-COPY server.py audit.py jev_gate.py provenance.py redact.py ./
+COPY server.py audit.py inserted.py jev_gate.py provenance.py redact.py ./
 
 RUN addgroup --system app && adduser --system --group app \
     && mkdir -p /data && chown -R app:app /app /data
