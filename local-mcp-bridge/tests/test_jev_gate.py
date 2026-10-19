@@ -161,6 +161,33 @@ def test_an_unexpected_error_does_not_escape(monkeypatch: pytest.MonkeyPatch) ->
     assert jev_gate.judge(tool="chat", query="q", caller="x", workspace_id="w").allowed
 
 
+def test_a_jev_error_reaches_the_reason_and_the_log_by_its_name_and_status_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from typesafe_sdk import TypeSafeAPIConnectionError, TypeSafeAPIError
+
+    caplog.set_level(logging.DEBUG)
+    key = "ts_test_" + "k" * 32
+    monkeypatch.setattr(jev_gate, "FAIL_MODE", "open")
+    for error, reason in (
+        (
+            TypeSafeAPIConnectionError(f"Connection error: Bearer {key}"),
+            "jev unavailable: TypeSafeAPIConnectionError",
+        ),
+        (
+            TypeSafeAPIError(402, {"detail": f"no credits for {key}"}, {}),
+            "jev unavailable: TypeSafeAPIError 402",
+        ),
+        (ValueError(f"something about {key}"), "jev unavailable: ValueError"),
+    ):
+        jev_gate.reset()
+        _enable(monkeypatch, _FakeClient(error=error))
+        verdict = jev_gate.judge(tool="chat", query="q", caller="x", workspace_id="w")
+        assert verdict.reason == reason
+        assert verdict.failed is True
+    assert key not in caplog.text
+
+
 def test_the_question_names_both_outcomes() -> None:
     assert set(jev_gate.CRITERIA) == {"true", "false"}
     assert set(jev_gate.ANSWER_CRITERIA) == {"true", "false"}

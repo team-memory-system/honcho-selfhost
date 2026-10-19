@@ -413,9 +413,14 @@ def _ask(state: dict[str, str], kind: str) -> Verdict:
 
 
 def _ask_jev(state: dict[str, str], kind: str) -> Verdict:
-    """Ask Jev itself, through the official SDK, about a query or an answer."""
+    """Ask Jev itself, through the official SDK, about a query or an answer.
+
+    Reasons carry only an error's type name and HTTP status, as the team guard's do:
+    an error's text holds what the server sent back, and typesafe_sdk's changelog
+    says only 0.7.1 took key values out of the errors it logs (this pins 0.6.0).
+    """
     try:
-        from typesafe_sdk import Noul, TypeSafeError
+        from typesafe_sdk import Noul
     except ImportError as exc:
         return _on_failure(f"typesafe_sdk unavailable: {exc}", kind)
 
@@ -431,10 +436,10 @@ def _ask_jev(state: dict[str, str], kind: str) -> Verdict:
         )
         score = float(dict(response.answers)[name].noul)
         model = _model_named(getattr(response, "model", None))
-    except TypeSafeError as exc:
-        return _on_failure(f"{type(exc).__name__}: {exc}", kind)
     except Exception as exc:  # noqa: BLE001 - the gate must not crash a tool call
-        return _on_failure(f"{type(exc).__name__}: {exc}", kind)
+        status = getattr(exc, "status", None)
+        name = type(exc).__name__
+        return _on_failure(f"{name} {status}" if isinstance(status, int) else name, kind)
 
     return _decided(score >= THRESHOLD, score, kind, model)
 
